@@ -401,3 +401,171 @@ Kubernetes can later become an optional deployment layer for large clusters rath
 PersonaOS should manage an AI workforce across multiple machines, GPUs, models, cloud providers, and execution runtimes while preserving the same worker identity and accumulated experience.
 
 **Core principle: compute is replaceable; the worker is persistent.**
+
+# AI-Native Security & Governance
+
+PersonaOS should treat security as a first-class operating-system capability, not as an optional add-on. Because PersonaOS controls persistent AI workers, their identity, memory, skills, tools, secrets, workload, and execution, it must control what those workers are allowed to do.
+
+## Three AI Threat Directions
+
+### 1. AI attacking the organization
+
+Protect the organization from AI-enabled attacks:
+
+- AI-aware identity and access control
+- Zero-trust worker and application access
+- Bot and automation detection
+- AI phishing awareness and email security integration
+- DLP for AI interactions
+- Data classification
+- Approved AI / shadow-AI governance
+- AI usage auditing
+
+### 2. People or AI tools misusing organizational data
+
+PersonaOS should provide policy enforcement between users/workers and AI systems:
+
+- Public / Internal / Confidential / Secret classification
+- Prevent sensitive data from reaching unapproved AI providers
+- Approved-model/provider policies
+- Prompt and response auditing where policy permits
+- Secret and credential detection
+- Vendor/model trust policies
+
+### 3. Attacks against AI workers and AI infrastructure
+
+Protect PersonaOS itself and its workers:
+
+- Worker identity
+- Node authentication
+- RBAC and least privilege
+- Tool allowlists
+- Secret isolation
+- Skill verification
+- Model/provider policies
+- Resource quotas
+- Audit trails
+- Anomaly detection
+- Worker quarantine
+- Emergency kill switch
+
+## AI Worker Firewall
+
+A core PersonaOS capability should be an **AI Action Firewall**. It evaluates an action before a worker executes it.
+
+```
+Worker wants to perform an action
+            ↓
+      AI Action Firewall
+            ↓
+ ┌────────────────────────────┐
+ │ WHO?       Worker identity │
+ │ WHAT?      Requested action │
+ │ WHERE?     Target resource  │
+ │ WHY?       Task/objective   │
+ │ WITH WHAT? Tool/credential  │
+ │ RISK?      Action risk      │
+ │ AUTHORITY? Worker policy    │
+ └──────────────┬─────────────┘
+                ↓
+       ┌────────┴────────┐
+       │                 │
+    Allowed          Approval/Block
+       │                 │
+       ↓                 ↓
+    Execute          Human review
+```
+
+Example:
+
+```
+DevOps Worker
+
+CAN:
+✓ SSH staging
+✓ Read GitLab
+✓ Deploy Kubernetes
+✓ Restart services
+
+CANNOT:
+✗ Read production database passwords
+✗ Delete production cluster
+✗ Access finance systems
+✗ Send unrestricted external email
+✗ Create unlimited cloud resources
+```
+
+The policy engine should evaluate identity, requested action, target, task context, tool, credential, risk, and authority before execution.
+
+## Security Architecture
+
+```
+                         PersonaOS
+┌──────────────────────────────────────────────────────────┐
+│                                                          │
+│  Identity       Workers        Skills       Memory       │
+│                                                          │
+│  Workload       Scheduling     Simulation   Experience   │
+│                                                          │
+│  Security       Policy         DLP          Audit        │
+│                                                          │
+│  Tool Gateway   Secrets        Quotas       Kill Switch  │
+│                                                          │
+│  Cluster        Nodes          Monitoring   Recovery     │
+│                                                          │
+└──────────────────────────┬───────────────────────────────┘
+                           │
+                     Runtime Layer
+                           │
+                       OpenClaw
+                           │
+                ┌──────────┼──────────┐
+                │          │          │
+              LLMs       Tools      APIs
+```
+
+## Security as an OS Primitive
+
+PersonaOS core primitives should now be:
+
+1. **Worker** — persistent digital employee identity
+2. **Workload** — tasks, priorities, capacity, dependencies
+3. **Memory** — persistent knowledge and experience
+4. **Execution** — runtime and tool execution
+5. **Simulation** — workforce and scenario modeling
+6. **Security** — identity, policy, permissions, isolation, governance
+
+This makes PersonaOS more than an agent framework. It becomes an operating system for persistent, distributed, governed AI labor.
+
+## Security MVP
+
+Security should be built into the first usable version, but the initial implementation should remain small:
+
+1. Worker identity
+2. RBAC / permissions
+3. Tool allow/deny policies
+4. Secret isolation
+5. Task-level audit log
+6. Human approval for high-risk actions
+7. Worker quarantine / kill switch
+8. Node authentication
+
+Later capabilities:
+
+- DLP
+- AI gateway
+- Prompt-injection detection
+- Shadow-AI detection
+- SIEM integration
+- Anomaly detection
+- AI red teaming
+- Compliance controls
+
+## Core Thesis
+
+> **PersonaOS is an operating system for persistent AI workers, managing identity, skills, memory, workload, execution, security, and coordination across a distributed AI workforce.**
+> 
+
+The key advantage is that the worker remains persistent while the underlying compute, model, runtime, or node can change.
+
+**Core principle: compute is replaceable; the worker is persistent; every action is governed.**
