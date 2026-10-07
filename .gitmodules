@@ -1,0 +1,6 @@
+[submodule "oc-tools"]
+	path = oc-tools
+	url = https://github.com/joseph118789-max/oc-tools
+[submodule "SkillSpector"]
+	path = SkillSpector
+	url = https://github.com/NVIDIA/SkillSpector.git
