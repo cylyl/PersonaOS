@@ -1,0 +1,87 @@
+{
+  "_comment": "PPT Creation Workflow - Business Process Pipeline",
+  "name": "ppt-creation",
+  "version": "1.0.0",
+  "description": "Business presentation creation pipeline: Plan → Content → Format → Review → Approve",
+
+  "settings": {
+    "loop": true,
+    "max_iterations": 3,
+    "stop_on": ["finalize"]
+  },
+
+  "pipeline": [
+    { "step": "plan", "agent": "cto", "emits": "outline_ready" },
+    { "step": "content", "agent": "ba", "receives": "outline_ready", "emits": "content_ready" },
+    { "step": "format", "agent": "devops", "receives": "content_ready", "emits": "formatted" },
+    { "step": "review", "agent": "qa", "receives": "formatted", "emits": ["approved", "changes"] },
+    { "step": "revision", "agent": "devops", "receives": "changes", "emits": "formatted" },
+    { "step": "finalize", "agent": "cto", "receives": "approved", "emits": "ppt_ready" }
+  ],
+
+  "events": [
+    {
+      "name": "outline_ready",
+      "emit_by": "cto",
+      "consumed_by": ["ba"],
+      "description": "Slide outline and structure created"
+    },
+    {
+      "name": "content_ready",
+      "emit_by": "ba",
+      "consumed_by": ["devops"],
+      "description": "Full content created for each slide"
+    },
+    {
+      "name": "formatted",
+      "emit_by": "devops",
+      "consumed_by": ["qa"],
+      "description": "Content formatted into PPT-ready structure"
+    },
+    {
+      "name": "approved",
+      "emit_by": "qa",
+      "consumed_by": ["cto"],
+      "description": "QA approved the deck"
+    },
+    {
+      "name": "changes",
+      "emit_by": "qa",
+      "consumed_by": ["devops"],
+      "description": "Changes requested, needs revision"
+    },
+    {
+      "name": "ppt_ready",
+      "emit_by": "cto",
+      "consumed_by": ["ba", "qa"],
+      "description": "PPT finalized and ready for delivery"
+    }
+  ],
+
+  "agents": {
+    "cto": {
+      "role": "Planner",
+      "skills": ["strategy", "planning", "task-breakdown"],
+      "receives_from": ["qa"],
+      "sends_to": ["ba"]
+    },
+    "ba": {
+      "role": "Business Analyst",
+      "skills": ["business-analysis", "content-creation", "financial-planning"],
+      "receives_from": ["cto"],
+      "sends_to": ["devops"]
+    },
+    "devops": {
+      "role": "Formatter",
+      "skills": ["document-formatting", "presentation-creation"],
+      "receives_from": ["ba", "qa"],
+      "sends_to": ["qa"]
+    },
+    "qa": {
+      "role": "Reviewer",
+      "skills": ["quality-assurance", "communication", "analytics"],
+      "receives_from": ["devops"],
+      "sends_to": ["cto", "devops"]
+    }
+  }
+}

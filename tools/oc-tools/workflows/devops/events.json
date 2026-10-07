@@ -1,0 +1,82 @@
+{
+  "events": [
+    {
+      "name": "spec_ready",
+      "emit_by": "cto",
+      "consumed_by": ["software_engineer"],
+      "description": "Architectural spec is ready for implementation"
+    },
+    {
+      "name": "code_review_requested",
+      "emit_by": "software_engineer",
+      "consumed_by": ["cto"],
+      "description": "Code ready for architecture review"
+    },
+    {
+      "name": "build_done",
+      "emit_by": "software_engineer",
+      "consumed_by": ["devops"],
+      "description": "Build artifact ready for deployment"
+    },
+    {
+      "name": "db_review_requested",
+      "emit_by": "software_engineer",
+      "consumed_by": ["dba"],
+      "description": "Database changes need review"
+    },
+    {
+      "name": "db_approved",
+      "emit_by": "dba",
+      "consumed_by": ["software_engineer"],
+      "description": "Database changes approved"
+    },
+    {
+      "name": "deploy_ready",
+      "emit_by": "devops",
+      "consumed_by": ["qa"],
+      "description": "Deployed to staging, ready for testing"
+    },
+    {
+      "name": "tests_passed",
+      "emit_by": "qa",
+      "consumed_by": ["operations", "cto"],
+      "description": "All tests passed, ready for production"
+    },
+    {
+      "name": "tests_failed",
+      "emit_by": "qa",
+      "consumed_by": ["software_engineer"],
+      "description": "Tests failed, needs fixes"
+    },
+    {
+      "name": "qa_approved",
+      "emit_by": "qa",
+      "consumed_by": ["operations"],
+      "description": "QA gate passed, cleared for deployment"
+    },
+    {
+      "name": "deployed_to_staging",
+      "emit_by": "operations",
+      "consumed_by": ["qa"],
+      "description": "Deployed to staging environment"
+    },
+    {
+      "name": "deployed_to_production",
+      "emit_by": "operations",
+      "consumed_by": ["cto"],
+      "description": "Successfully deployed to production"
+    },
+    {
+      "name": "hotfix_requested",
+      "emit_by": "operations",
+      "consumed_by": ["devops"],
+      "description": "Production issue requires hotfix"
+    },
+    {
+      "name": "hotfix_deployed",
+      "emit_by": "devops",
+      "consumed_by": ["qa", "operations"],
+      "description": "Hotfix deployed, needs verification"
+    }
+  ]
+}

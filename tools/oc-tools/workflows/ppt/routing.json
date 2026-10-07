@@ -1,0 +1,32 @@
+[
+  {
+    "from": "cto",
+    "to": "ba",
+    "description": "cto sends slide outline to ba for content creation"
+  },
+  {
+    "from": "ba",
+    "to": "devops",
+    "description": "ba sends content to devops for formatting"
+  },
+  {
+    "from": "devops",
+    "to": "qa",
+    "description": "devops sends formatted deck to qa for review"
+  },
+  {
+    "from": "qa",
+    "to": "cto",
+    "description": "qa sends approval (or changes) to cto"
+  },
+  {
+    "from": "qa",
+    "to": "devops",
+    "description": "qa sends changes back to devops for revision"
+  },
+  {
+    "from": "cto",
+    "to": "qa",
+    "description": "cto finalizes and notifies qa when ppt_ready"
+  }
+]

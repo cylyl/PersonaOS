@@ -1,0 +1,464 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for the AWS Bedrock provider.
+
+Bedrock authenticates via SigV4, not API keys, so ``resolve_credentials``
+returns ``None`` and the provider implements ``ChatModelProvider.create_chat_model``
+to construct ``ChatBedrockConverse`` directly.  These tests stub
+``boto3.Session`` and ``ChatBedrockConverse`` so no AWS calls are made.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from skillspector.providers import (
+    get_metadata_provider,
+    registry,
+    resolve_provider_credentials,
+)
+from skillspector.providers.bedrock import (
+    BEDROCK_DEFAULT_MODEL,
+    BEDROCK_DEFAULT_REGION,
+    BEDROCK_SDK_TOTAL_MAX_ATTEMPTS,
+    BedrockProvider,
+)
+from skillspector.providers.structured_output import claude_model_from_bedrock_id
+
+# A real application-inference-profile ARN shape for testing ARN-specific
+# behavior.  Account ID and profile ID are placeholders — no live resource.
+_TEST_ARN = "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/abc123def456"
+
+
+@pytest.fixture(autouse=True)
+def _clean_provider_env(monkeypatch: pytest.MonkeyPatch):
+    """Isolate provider-related env vars and the YAML cache for each test."""
+    monkeypatch.delenv("SKILLSPECTOR_PROVIDER", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_MODEL", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_MODEL_REGISTRY", raising=False)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_TEMPERATURE", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_SEED", raising=False)
+    monkeypatch.delenv("SKILLSPECTOR_STRUCTURED_OUTPUT_METHOD", raising=False)
+    registry._load.cache_clear()
+    yield
+    registry._load.cache_clear()
+
+
+class TestBedrockProviderCredentials:
+    """Bedrock has no API key — resolve_credentials always returns None."""
+
+    def test_resolve_credentials_returns_none(self) -> None:
+        assert BedrockProvider().resolve_credentials() is None
+
+    def test_resolve_credentials_returns_none_even_with_aws_env_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AWS_PROFILE", "some-profile")
+        monkeypatch.setenv("AWS_REGION", "eu-west-1")
+        assert BedrockProvider().resolve_credentials() is None
+
+
+class TestBedrockProviderMetadata:
+    """Token-budget metadata is read from the bundled model_registry.yaml."""
+
+    def test_metadata_known_default_model(self) -> None:
+        provider = BedrockProvider()
+        assert provider.get_context_length(BEDROCK_DEFAULT_MODEL) == 1_000_000
+        assert provider.get_max_output_tokens(BEDROCK_DEFAULT_MODEL) == 128_000
+
+    def test_metadata_known_inference_profile_id(self) -> None:
+        provider = BedrockProvider()
+        model = "us.anthropic.claude-opus-4-6-20250915-v1:0"
+        assert provider.get_context_length(model) == 1_000_000
+        assert provider.get_max_output_tokens(model) == 128_000
+
+    def test_metadata_unknown_model_returns_none(self) -> None:
+        provider = BedrockProvider()
+        assert provider.get_context_length("unknown.model") is None
+        assert provider.get_max_output_tokens("unknown.model") is None
+
+
+class TestBedrockProviderResolveModel:
+    """resolve_model: SKILLSPECTOR_MODEL env > slot > DEFAULT_MODEL."""
+
+    def test_default_model_is_public_cross_region_inference_profile(self) -> None:
+        # The default must be a public Bedrock model ID, not a private ARN —
+        # this is checked in the OSS PR review and is load-bearing.
+        assert BEDROCK_DEFAULT_MODEL == "us.anthropic.claude-sonnet-4-6-20250915-v1:0"
+        assert not BEDROCK_DEFAULT_MODEL.startswith("arn:")
+        assert BedrockProvider().resolve_model() == BEDROCK_DEFAULT_MODEL
+
+    def test_env_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "us.anthropic.claude-opus-4-6-20250915-v1:0")
+        assert BedrockProvider().resolve_model() == "us.anthropic.claude-opus-4-6-20250915-v1:0"
+
+    def test_env_applies_to_every_slot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_MODEL", "user/override")
+        assert BedrockProvider().resolve_model("meta_analyzer") == "user/override"
+
+    def test_unknown_slot_falls_back_to_default(self) -> None:
+        assert BedrockProvider().resolve_model("mcp_least_privilege") == BEDROCK_DEFAULT_MODEL
+
+
+class TestBedrockProviderCreateChatModel:
+    """create_chat_model wires boto3 + ChatBedrockConverse with the right config."""
+
+    @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
+    @patch("skillspector.providers.bedrock.provider.boto3.Session")
+    def test_returns_none_when_no_aws_credentials(
+        self, mock_session: MagicMock, mock_chat: MagicMock
+    ) -> None:
+        """No AWS credentials in any chain → return None so the orchestrator falls through."""
+        mock_session.return_value.get_credentials.return_value = None
+
+        result = BedrockProvider().create_chat_model(
+            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            max_tokens=1024,
+            timeout=60,
+        )
+
+        assert result is None
+        mock_chat.assert_not_called()
+
+    @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
+    @patch("skillspector.providers.bedrock.provider.boto3.Session")
+    def test_omits_profile_when_aws_profile_unset(
+        self, mock_session: MagicMock, mock_chat: MagicMock
+    ) -> None:
+        """No AWS_PROFILE → boto3.Session called without profile_name.
+
+        Defers to the standard boto3 credential chain (env vars, instance
+        metadata, SSO).  This is the OSS-default behavior; hardcoding a
+        named profile is a footgun for external users.
+        """
+        mock_session.return_value.get_credentials.return_value = MagicMock()
+        mock_session.return_value.client.return_value = MagicMock()
+
+        BedrockProvider().create_chat_model(
+            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            max_tokens=1024,
+            timeout=60,
+        )
+
+        session_kwargs = mock_session.call_args.kwargs
+        assert "profile_name" not in session_kwargs
+        assert session_kwargs["region_name"] == BEDROCK_DEFAULT_REGION
+
+    @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
+    @patch("skillspector.providers.bedrock.provider.boto3.Session")
+    def test_env_overrides_profile_and_region(
+        self,
+        mock_session: MagicMock,
+        mock_chat: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("AWS_PROFILE", "custom-profile")
+        monkeypatch.setenv("AWS_REGION", "eu-central-1")
+        mock_session.return_value.get_credentials.return_value = MagicMock()
+        mock_session.return_value.client.return_value = MagicMock()
+
+        BedrockProvider().create_chat_model(
+            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            max_tokens=1024,
+            timeout=60,
+        )
+
+        mock_session.assert_called_once_with(
+            profile_name="custom-profile",
+            region_name="eu-central-1",
+        )
+
+    @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
+    @patch("skillspector.providers.bedrock.provider.boto3.Session")
+    def test_timeout_applied_to_botocore_config(
+        self, mock_session: MagicMock, mock_chat: MagicMock
+    ) -> None:
+        """The ``timeout`` argument flows through to the boto3 client.
+
+        Without this, long Bedrock calls hang indefinitely instead of
+        respecting the caller's timeout budget.
+        """
+        mock_session.return_value.get_credentials.return_value = MagicMock()
+        mock_session.return_value.client.return_value = MagicMock()
+
+        BedrockProvider().create_chat_model(
+            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            max_tokens=1024,
+            timeout=90,
+        )
+
+        client_call = mock_session.return_value.client.call_args
+        config = client_call.kwargs["config"]
+        # botocore.config.Config exposes timeouts as attributes.
+        assert config.read_timeout == 90
+        assert config.connect_timeout == 10
+        assert config.retries == {
+            "mode": "standard",
+            "total_max_attempts": BEDROCK_SDK_TOTAL_MAX_ATTEMPTS,
+        }
+
+    @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
+    @patch("skillspector.providers.bedrock.provider.boto3.Session")
+    def test_arn_pins_provider_to_anthropic(
+        self, mock_session: MagicMock, mock_chat: MagicMock
+    ) -> None:
+        """ChatBedrockConverse requires explicit provider= when model is an ARN."""
+        mock_session.return_value.get_credentials.return_value = MagicMock()
+        mock_session.return_value.client.return_value = MagicMock()
+
+        BedrockProvider().create_chat_model(
+            _TEST_ARN,
+            max_tokens=2048,
+            timeout=120,
+        )
+
+        kwargs = mock_chat.call_args.kwargs
+        assert kwargs["model"] == _TEST_ARN
+        assert kwargs["provider"] == "anthropic"
+        assert kwargs["max_tokens"] == 2048
+        assert kwargs["region_name"] == BEDROCK_DEFAULT_REGION
+
+    @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
+    @patch("skillspector.providers.bedrock.provider.boto3.Session")
+    def test_plain_model_id_does_not_pin_provider(
+        self, mock_session: MagicMock, mock_chat: MagicMock
+    ) -> None:
+        """For non-ARN model IDs, provider is inferred from the prefix — omit it."""
+        mock_session.return_value.get_credentials.return_value = MagicMock()
+        mock_session.return_value.client.return_value = MagicMock()
+
+        BedrockProvider().create_chat_model(
+            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            max_tokens=1024,
+            timeout=60,
+        )
+
+        assert "provider" not in mock_chat.call_args.kwargs
+
+    @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
+    @patch("skillspector.providers.bedrock.provider.boto3.Session")
+    def test_temperature_is_forwarded_without_openai_seed(
+        self,
+        mock_session: MagicMock,
+        mock_chat: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mock_session.return_value.get_credentials.return_value = MagicMock()
+        mock_session.return_value.client.return_value = MagicMock()
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.3")
+        monkeypatch.setenv("SKILLSPECTOR_SEED", "42")
+
+        BedrockProvider().create_chat_model(
+            "us.anthropic.claude-sonnet-4-6-20250915-v1:0",
+            max_tokens=1024,
+        )
+
+        kwargs = mock_chat.call_args.kwargs
+        assert kwargs["temperature"] == 0.3
+        assert "seed" not in kwargs
+
+
+class TestBedrockProviderSelection:
+    """SKILLSPECTOR_PROVIDER=bedrock activates BedrockProvider."""
+
+    def test_select_bedrock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_PROVIDER", "bedrock")
+        # Bedrock returns no OpenAI-style credentials.
+        assert resolve_provider_credentials() is None
+        assert isinstance(get_metadata_provider(), BedrockProvider)
+
+
+_REJECTING_MODELS = [
+    "anthropic.claude-fable-5-1",
+    "us.anthropic.claude-fable-5-1",
+    "global.anthropic.claude-fable-5-1",
+    "eu.anthropic.claude-mythos-5-1",
+    "anthropic.claude-fable-5-1-20260901-v1:0",
+    "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-fable-5-1",
+    "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-mythos-5-1",
+]
+_FORCING_MODELS = [
+    BEDROCK_DEFAULT_MODEL,
+    "anthropic.claude-opus-4-6-20250915-v1:0",
+    "us.anthropic.claude-opus-5",
+    "global.anthropic.claude-sonnet-5",
+    "us.anthropic.claude-fable-5",
+    "amazon.nova-pro-v1:0",
+    _TEST_ARN,
+]
+
+
+class TestBedrockProviderToolChoice:
+    """Models that answer a forced ``toolChoice`` with HTTP 400 get an auto-only client."""
+
+    @pytest.mark.parametrize("model", _REJECTING_MODELS)
+    def test_rejecting_models_are_recognised_from_ids_profiles_and_arns(self, model: str) -> None:
+        assert BedrockProvider().forced_tool_choice_supported(model) is False
+
+    @pytest.mark.parametrize("model", _FORCING_MODELS)
+    def test_other_models_and_opaque_arns_keep_forced_tool_choice(self, model: str) -> None:
+        assert BedrockProvider().forced_tool_choice_supported(model) is True
+
+    @pytest.mark.parametrize(
+        "model", ["anthropic.claude-fable-5-1", "us.anthropic.claude-mythos-5-1"]
+    )
+    def test_registry_models_carry_token_limits(self, model: str) -> None:
+        provider = BedrockProvider()
+        assert provider.get_context_length(model) == 1_000_000
+        assert provider.get_max_output_tokens(model) == 128_000
+
+    def test_registry_entry_opts_an_opaque_arn_in(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        override = tmp_path / "registry.yaml"
+        override.write_text(
+            f'models:\n  "{_TEST_ARN}":\n    context_length: 1000000\n    tool_choice: auto\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SKILLSPECTOR_MODEL_REGISTRY", str(override))
+        assert BedrockProvider().forced_tool_choice_supported(_TEST_ARN) is False
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("anthropic.claude-fable-5-1", "claude-fable-5-1"),
+            ("us.anthropic.claude-fable-5-1", "claude-fable-5-1"),
+            ("us-gov.anthropic.claude-mythos-5-1", "claude-mythos-5-1"),
+            (
+                "arn:aws:bedrock:eu-west-1::foundation-model/anthropic.claude-sonnet-4-6-20250915-v1:0",
+                "claude-sonnet-4-6-20250915-v1:0",
+            ),
+            (_TEST_ARN, None),
+            ("amazon.nova-pro-v1:0", None),
+            ("anthropic.", None),
+        ],
+    )
+    def test_claude_model_from_bedrock_id(self, model: str, expected: str | None) -> None:
+        assert claude_model_from_bedrock_id(model) == expected
+
+    @patch("skillspector.providers.bedrock.provider.ChatBedrockConverse")
+    @patch("skillspector.providers.bedrock.provider.boto3.Session")
+    def test_create_chat_model_restricts_rejecting_models_to_auto(
+        self,
+        mock_session: MagicMock,
+        mock_chat: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("SKILLSPECTOR_TEMPERATURE", "0.2")
+        mock_session.return_value.get_credentials.return_value = MagicMock()
+        mock_session.return_value.client.return_value = MagicMock()
+        provider = BedrockProvider()
+
+        provider.create_chat_model("us.anthropic.claude-fable-5-1", max_tokens=1024)
+        assert mock_chat.call_args.kwargs["supports_tool_choice_values"] == ("auto",)
+        assert mock_chat.call_args.kwargs["temperature"] == 0.2
+
+        provider.create_chat_model(BEDROCK_DEFAULT_MODEL, max_tokens=1024)
+        assert "supports_tool_choice_values" not in mock_chat.call_args.kwargs
+
+
+class TestBedrockStructuredOutputWireFormat:
+    """Offline round trip through the real client: botocore serialises and validates the request."""
+
+    @pytest.fixture(autouse=True)
+    def _fake_aws_credentials(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+        monkeypatch.setenv("AWS_CONFIG_FILE", "/dev/null")
+        monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "/dev/null")
+
+    @staticmethod
+    def _bound_chain(model: str, content: list[dict]) -> tuple[object, dict]:
+        import boto3
+        from botocore.stub import Stubber
+        from langchain_aws import ChatBedrockConverse
+        from pydantic import BaseModel
+
+        from skillspector.llm_utils import bind_structured_output
+
+        class Verdict(BaseModel):
+            """Test schema."""
+
+            summary: str
+
+        client = boto3.client("bedrock-runtime", region_name=BEDROCK_DEFAULT_REGION)
+        request: dict = {}
+        client.meta.events.register(
+            "provide-client-params.bedrock-runtime.Converse",
+            lambda params, **_: request.update(params),
+        )
+        stub = Stubber(client)
+        stub.add_response(
+            "converse",
+            {
+                "output": {"message": {"role": "assistant", "content": content}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+                "metrics": {"latencyMs": 1},
+            },
+        )
+        stub.activate()
+        provider = BedrockProvider()
+        llm = ChatBedrockConverse(
+            model=model,
+            client=client,
+            bedrock_client=MagicMock(),
+            region_name=BEDROCK_DEFAULT_REGION,
+            max_tokens=64,
+            **(
+                {}
+                if provider.forced_tool_choice_supported(model)
+                else {"supports_tool_choice_values": ("auto",)}
+            ),
+        )
+        return bind_structured_output(llm, Verdict, model, provider=provider), request
+
+    def test_rejecting_model_is_asked_for_the_tool_call_without_forcing_it(self) -> None:
+        chain, request = self._bound_chain(
+            "us.anthropic.claude-fable-5-1",
+            [{"toolUse": {"toolUseId": "t1", "name": "Verdict", "input": {"summary": "ok"}}}],
+        )
+        result = chain.invoke("analyse this")  # type: ignore[attr-defined]
+
+        assert result.summary == "ok"
+        assert "outputConfig" not in request
+        assert "toolChoice" not in request["toolConfig"]
+        assert request["toolConfig"]["tools"][0]["toolSpec"]["name"] == "Verdict"
+        prompt = request["messages"][-1]["content"][0]["text"]
+        assert prompt.startswith("analyse this") and "calling the Verdict tool" in prompt
+
+    def test_rejecting_model_prose_answer_is_a_retryable_parse_error(self) -> None:
+        from skillspector.llm_utils import StructuredOutputParseError
+
+        chain, _ = self._bound_chain(
+            "global.anthropic.claude-mythos-5-1", [{"text": "Here is my analysis in prose."}]
+        )
+        with pytest.raises(StructuredOutputParseError, match="Verdict"):
+            chain.invoke("analyse this")  # type: ignore[attr-defined]
+
+    def test_other_models_still_force_the_tool_call(self) -> None:
+        chain, request = self._bound_chain(
+            BEDROCK_DEFAULT_MODEL,
+            [{"toolUse": {"toolUseId": "t1", "name": "Verdict", "input": {"summary": "ok"}}}],
+        )
+        assert chain.invoke("analyse this").summary == "ok"  # type: ignore[attr-defined]
+        assert request["toolConfig"]["toolChoice"] == {"tool": {"name": "Verdict"}}
+        assert request["messages"][-1]["content"][0]["text"] == "analyse this"

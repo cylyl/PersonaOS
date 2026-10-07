@@ -1,0 +1,872 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for skillspector input_handler (resolve directory, zip, single file)."""
+
+import ctypes
+import os
+import subprocess
+import sys
+from errno import ENOENT
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import httpx
+import pytest
+
+from skillspector.input_handler import (
+    ALLOWED_GIT_HOSTS,
+    InputHandler,
+    _FileOpenError,
+    _open_regular_file_from_windows_handle,
+    _open_regular_file_no_follow,
+)
+from skillspector.state import WorkflowResourceBudget
+
+
+def _mock_windows_secure_open(
+    monkeypatch: pytest.MonkeyPatch,
+    source: Path,
+    *,
+    handle: int = 1,
+    attributes: int = 0,
+    final_path: str | None = None,
+    long_names: dict[str, str] | None = None,
+) -> None:
+    """Install a handle-level Windows open simulation on any platform.
+
+    ``long_names`` stands in for ``GetLongPathNameW``: it maps a path spelled
+    with an 8.3 short component to the long spelling the filesystem aliases.
+    """
+
+    def get_file_information(_handle: int, information: object) -> bool:
+        information._obj.dwFileAttributes = attributes  # type: ignore[attr-defined]
+        return True
+
+    def get_final_path(_handle: int, buffer: object, _size: int, _flags: int) -> int:
+        opened_path = final_path or str(source)
+        buffer.value = opened_path  # type: ignore[attr-defined]
+        return len(opened_path)
+
+    def get_long_path_name(path: str, buffer: object, _size: int) -> int:
+        expanded = (long_names or {}).get(path, path)
+        buffer.value = expanded  # type: ignore[attr-defined]
+        return len(expanded)
+
+    kernel32 = SimpleNamespace(
+        CreateFileW=lambda *_args: handle,
+        GetFileInformationByHandle=get_file_information,
+        GetFinalPathNameByHandleW=get_final_path,
+        GetLongPathNameW=get_long_path_name,
+        CloseHandle=lambda _handle: True,
+    )
+    msvcrt = SimpleNamespace(open_osfhandle=lambda _handle, _flags: os.open(source, os.O_RDONLY))
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
+    monkeypatch.setattr(os, "O_BINARY", 0, raising=False)
+    monkeypatch.setitem(sys.modules, "msvcrt", msvcrt)
+
+
+def test_resolve_directory(tmp_path: Path) -> None:
+    """Resolving a local directory returns path and source_type directory."""
+    (tmp_path / "SKILL.md").write_text("# Skill", encoding="utf-8")
+    handler = InputHandler()
+    try:
+        resolved, source_type = handler.resolve(str(tmp_path))
+        assert resolved.is_dir()
+        assert (resolved / "SKILL.md").exists()
+        assert source_type == "directory"
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_single_md_file(tmp_path: Path) -> None:
+    """Resolving a single .md file wraps it in a temp dir."""
+    f = tmp_path / "doc.md"
+    f.write_text("# Doc", encoding="utf-8")
+    handler = InputHandler()
+    try:
+        resolved, source_type = handler.resolve(str(f))
+        assert resolved.is_dir()
+        assert (resolved / "doc.md").exists()
+        assert source_type == "file"
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_single_symlinked_file_raises(tmp_path: Path) -> None:
+    """Standalone file inputs must not dereference symlinks before scanning."""
+    secret = tmp_path / "external_secret.md"
+    secret.write_text("AWS_SECRET=hunter2", encoding="utf-8")
+    symlink = tmp_path / "SKILL.md"
+    try:
+        symlink.symlink_to(secret)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    handler = InputHandler()
+    try:
+        with pytest.raises(ValueError, match="symlinked input"):
+            handler.resolve(str(symlink))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_file_with_symlinked_parent_raises(tmp_path: Path) -> None:
+    """Standalone file inputs must not traverse a symlinked parent directory."""
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    (external_dir / "secret.md").write_text("AWS_SECRET=hunter2", encoding="utf-8")
+    symlinked_parent = tmp_path / "linked"
+    try:
+        symlinked_parent.symlink_to(external_dir, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    handler = InputHandler()
+    try:
+        with pytest.raises(ValueError, match="symlinked parent"):
+            handler.resolve(str(symlinked_parent / "secret.md"))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_directory_with_symlinked_parent_raises(tmp_path: Path) -> None:
+    """Directory inputs must not escape through a symlinked ancestor."""
+    external_skill = tmp_path / "external" / "skill"
+    external_skill.mkdir(parents=True)
+    (external_skill / "SKILL.md").write_text("# External skill", encoding="utf-8")
+    symlinked_parent = tmp_path / "linked"
+    try:
+        symlinked_parent.symlink_to(external_skill.parent, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    handler = InputHandler()
+    try:
+        with pytest.raises(ValueError, match="symlinked parent"):
+            handler.resolve(str(symlinked_parent / external_skill.name))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_junctioned_directory_raises(tmp_path: Path) -> None:
+    """Directory inputs must reject terminal Windows junctions too."""
+    skill_dir = tmp_path / "skill"
+    skill_dir.mkdir()
+    handler = InputHandler()
+    try:
+        with patch.object(Path, "is_junction", autospec=True) as is_junction:
+            is_junction.side_effect = lambda path: path == skill_dir
+            with pytest.raises(ValueError, match="junctioned input"):
+                handler.resolve(str(skill_dir))
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_file_with_junction_parent_raises(tmp_path: Path) -> None:
+    """Standalone file inputs must not traverse Windows junctions."""
+    source = tmp_path / "linked" / "SKILL.md"
+    source.parent.mkdir()
+    source.write_text("# Skill", encoding="utf-8")
+    handler = InputHandler()
+    try:
+        with patch.object(Path, "is_junction", autospec=True) as is_junction:
+            is_junction.side_effect = lambda path: path == source.parent
+            with pytest.raises(ValueError, match="symlinked parent"):
+                handler.resolve(str(source))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_file_through_root_owned_system_alias(tmp_path: Path) -> None:
+    """Root-owned system aliases do not prevent scanning ordinary local files."""
+    root_alias = Path("/var")
+    try:
+        relative_path = tmp_path.relative_to("/private/var")
+    except ValueError:
+        pytest.skip("temporary directory is not below the macOS /var alias")
+    if not root_alias.is_symlink():
+        pytest.skip("/var is not a system alias on this platform")
+
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    handler = InputHandler()
+    try:
+        resolved, source_type = handler.resolve(str(root_alias / relative_path / source.name))
+        assert (resolved / source.name).read_text(encoding="utf-8") == "# Skill"
+        assert source_type == "file"
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_symlinked_zip_raises(tmp_path: Path) -> None:
+    """Local archives must be rejected before their symlink target is opened."""
+    archive = tmp_path / "external_archive.zip"
+    archive.write_bytes(b"not opened")
+    symlink = tmp_path / "skill.zip"
+    try:
+        symlink.symlink_to(archive)
+    except OSError:
+        pytest.skip("symlinks are not supported on this filesystem")
+
+    handler = InputHandler()
+    try:
+        with pytest.raises(ValueError, match="symlinked input"):
+            handler.resolve(str(symlink))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_file_open_failure_does_not_create_temp_dir(tmp_path: Path) -> None:
+    """Failed secure opens leave no handler-owned temporary directory behind."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    handler = InputHandler()
+    denied = OSError("denied")
+    try:
+        # The secure open dispatches on the platform: POSIX goes through os.open,
+        # Windows through the handle-based helper. Deny both so the failure is
+        # injected wherever the test happens to run.
+        with (
+            patch("skillspector.input_handler.os.open", side_effect=denied),
+            patch(
+                "skillspector.input_handler._open_regular_file_from_windows_handle",
+                side_effect=_FileOpenError(source, denied),
+            ),
+        ):
+            with pytest.raises(ValueError, match="Could not safely open"):
+                handler.resolve(str(source))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="requires O_PATH (Linux)")
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root bypasses directory permissions"
+)
+def test_secure_open_traverses_search_only_ancestors(tmp_path: Path) -> None:
+    """Traversal needs search access on ancestors, not read access."""
+    parent = tmp_path / "search_only"
+    parent.mkdir()
+    source = parent / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    os.chmod(parent, 0o111)
+    try:
+        with _open_regular_file_no_follow(source) as opened:
+            assert opened.read() == b"# Skill"
+    finally:
+        os.chmod(parent, 0o755)
+
+
+def test_resolve_file_rejects_platform_without_safe_open_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scanning must fail closed when neither secure-open implementation is available."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    handler = InputHandler()
+    try:
+        monkeypatch.setattr("skillspector.input_handler._HAS_SECURE_DIR_FD", False)
+        monkeypatch.setattr("skillspector.input_handler._IS_WINDOWS", False)
+        with pytest.raises(ValueError, match="Secure no-follow file opens are unavailable"):
+            handler.resolve(str(source))
+        assert handler.temp_dir_for_cleanup() is None
+    finally:
+        handler.cleanup()
+
+
+def test_windows_no_follow_open_reads_verified_regular_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows secure-open accepts a verified regular file handle."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    _mock_windows_secure_open(monkeypatch, source)
+
+    with _open_regular_file_from_windows_handle(source) as opened:
+        assert opened.read() == b"# Skill"
+
+
+def test_windows_no_follow_open_rejects_missing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows secure-open reports a missing file without exposing a handle."""
+    source = tmp_path / "missing.md"
+    _mock_windows_secure_open(monkeypatch, source, handle=ctypes.c_void_p(-1).value)
+    monkeypatch.setattr(
+        "skillspector.input_handler._windows_last_error", lambda: OSError(ENOENT, "missing")
+    )
+
+    with pytest.raises(FileNotFoundError, match="File not found"):
+        _open_regular_file_from_windows_handle(source)
+
+
+def test_windows_no_follow_open_rejects_reparse_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows secure-open rejects a reparse-point handle before reading it."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    _mock_windows_secure_open(monkeypatch, source, attributes=0x00000400)
+
+    with pytest.raises(ValueError, match="Could not safely open"):
+        _open_regular_file_from_windows_handle(source)
+
+
+def test_windows_no_follow_open_accepts_a_short_dos_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path spelled with an 8.3 short component opens the entry it aliases."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    short = tmp_path / "SHORTN~1.MD"
+    _mock_windows_secure_open(
+        monkeypatch,
+        source,
+        final_path=str(source),
+        long_names={str(short): str(source)},
+    )
+
+    with _open_regular_file_from_windows_handle(short) as opened:
+        assert opened.read() == b"# Skill"
+
+
+def test_windows_no_follow_open_rejects_an_unresolvable_short_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short name that no longer expands leaves the comparison fail-closed."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    short = tmp_path / "SHORTN~1.MD"
+    _mock_windows_secure_open(monkeypatch, source, final_path=str(source))
+
+    with pytest.raises(ValueError, match="Could not safely open"):
+        _open_regular_file_from_windows_handle(short)
+
+
+def test_windows_no_follow_open_rejects_canonical_path_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows secure-open rejects a handle whose resolved path changed."""
+    source = tmp_path / "SKILL.md"
+    source.write_text("# Skill", encoding="utf-8")
+    _mock_windows_secure_open(monkeypatch, source, final_path=str(tmp_path / "outside.md"))
+
+    with pytest.raises(ValueError, match="Could not safely open"):
+        _open_regular_file_from_windows_handle(source)
+
+
+@pytest.mark.parametrize("extension", [".zip", ".ZIP", ".ZiP"])
+def test_resolve_zip_file(tmp_path: Path, extension: str) -> None:
+    """ZIP extensions are recognized regardless of case for local inputs."""
+    import zipfile
+
+    (tmp_path / "SKILL.md").write_text("# Skill", encoding="utf-8")
+    zip_path = tmp_path / f"skill{extension}"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.write(tmp_path / "SKILL.md", "SKILL.md")
+    handler = InputHandler()
+    try:
+        resolved, source_type = handler.resolve(str(zip_path))
+        assert resolved.is_dir()
+        assert source_type == "zip"
+        assert (resolved / "SKILL.md").read_text(encoding="utf-8") == "# Skill"
+    finally:
+        handler.cleanup()
+
+
+def test_resolve_nonexistent_raises() -> None:
+    """Resolving a nonexistent path raises FileNotFoundError or ValueError."""
+    handler = InputHandler()
+    with pytest.raises((FileNotFoundError, ValueError)):
+        handler.resolve("/nonexistent/path/xyz")
+
+
+def test_resolve_single_non_md_file(tmp_path: Path) -> None:
+    """Resolving a single non-.md file (e.g. .txt) wraps it in a temp dir."""
+    f = tmp_path / "readme.txt"
+    f.write_text("Read me", encoding="utf-8")
+    handler = InputHandler()
+    try:
+        resolved, source_type = handler.resolve(str(f))
+        assert resolved.is_dir()
+        assert (resolved / "readme.txt").exists()
+        assert source_type == "file"
+    finally:
+        handler.cleanup()
+
+
+def test_cleanup_idempotent(tmp_path: Path) -> None:
+    """cleanup() can be called after resolve and does not raise."""
+    (tmp_path / "a.md").write_text("x", encoding="utf-8")
+    handler = InputHandler()
+    handler.resolve(str(tmp_path / "a.md"))
+    handler.cleanup()
+    handler.cleanup()
+
+
+def test_clone_git_disables_symlinks() -> None:
+    """git clone must prevent symlinked entries from materializing as links."""
+    handler = InputHandler()
+    try:
+
+        def fake_clone(command: list[str], **_kwargs: object) -> MagicMock:
+            Path(command[-1]).mkdir(parents=True)
+            process = MagicMock()
+            process.poll.return_value = 0
+            process.wait.return_value = 0
+            return process
+
+        with (
+            patch.object(handler, "_validate_url_host", return_value="github.com"),
+            patch(
+                "skillspector.input_handler.subprocess.Popen",
+                side_effect=fake_clone,
+            ) as mock_run,
+        ):
+            handler._clone_git("https://github.com/example/repo.git")
+            cmd = mock_run.call_args.args[0]
+
+        assert cmd[:2] == ["git", "-c"]
+        assert "core.symlinks=false" in cmd
+        assert cmd.index("-c") < cmd.index("clone")
+    finally:
+        handler.cleanup()
+
+
+def test_scp_url_is_git_url() -> None:
+    """scp-style SSH URL is recognised as a Git URL."""
+    assert InputHandler()._is_git_url("git@github.com:org/repo.git") is True
+
+
+def test_github_tree_url_resolves_a_checked_out_subdirectory(tmp_path: Path) -> None:
+    handler = InputHandler()
+    clone = tmp_path / "repo"
+    (clone / "skills" / "biome-gritql").mkdir(parents=True)
+    with (
+        patch.object(handler, "_clone_git", return_value=clone) as clone_git,
+        patch.object(handler, "_list_remote_refs", return_value={"main"}),
+    ):
+        resolved, source_type = handler.resolve(
+            "https://github.com/somtougeh/somto-dev-toolkit/tree/main/skills/biome-gritql"
+        )
+    assert resolved == clone / "skills" / "biome-gritql"
+    assert source_type == "git"
+    clone_git.assert_called_once_with(
+        "https://github.com/somtougeh/somto-dev-toolkit.git", branch="main"
+    )
+
+
+def test_github_tree_url_resolves_slash_containing_ref(tmp_path: Path) -> None:
+    """A branch name containing / must not be split into ref + subdirectory."""
+    handler = InputHandler()
+    clone = tmp_path / "repo"
+    (clone / "skills" / "demo").mkdir(parents=True)
+    with (
+        patch.object(handler, "_clone_git", return_value=clone) as clone_git,
+        patch.object(handler, "_list_remote_refs", return_value={"main", "feature", "feature/foo"}),
+    ):
+        resolved, source_type = handler.resolve(
+            "https://github.com/example/repo/tree/feature/foo/skills/demo"
+        )
+    assert resolved == clone / "skills" / "demo"
+    assert source_type == "git"
+    clone_git.assert_called_once_with("https://github.com/example/repo.git", branch="feature/foo")
+
+
+def test_github_tree_url_prefers_shorter_ref_when_longest_absent() -> None:
+    """The longest *advertised* ref wins, not the longest URL prefix."""
+    handler = InputHandler()
+    with patch.object(handler, "_list_remote_refs", return_value={"feature"}):
+        repository_url, ref, subdirectory = handler._github_tree_target(
+            "https://github.com/example/repo/tree/feature/sub"
+        )
+    assert repository_url == "https://github.com/example/repo.git"
+    assert ref == "feature"
+    assert subdirectory == PurePosixPath("sub")
+
+
+def test_github_tree_url_rejects_unknown_ref() -> None:
+    handler = InputHandler()
+    with (
+        patch.object(handler, "_list_remote_refs", return_value={"main"}),
+        pytest.raises(ValueError, match="does not name a known branch or tag"),
+    ):
+        handler._github_tree_target("https://github.com/example/repo/tree/nope/sub")
+
+
+def test_github_tree_url_supports_ref_without_subdirectory() -> None:
+    handler = InputHandler()
+    with patch.object(handler, "_list_remote_refs", return_value={"main"}):
+        repository_url, ref, subdirectory = handler._github_tree_target(
+            "https://github.com/example/repo/tree/main"
+        )
+    assert repository_url == "https://github.com/example/repo.git"
+    assert ref == "main"
+    assert subdirectory == PurePosixPath(".")
+
+
+@pytest.mark.parametrize("segment", ["%2Fetc", "%2E%2E%2Frepo", "%5Coutside"])
+def test_github_tree_url_rejects_encoded_path_escapes(segment: str) -> None:
+    with pytest.raises(ValueError, match="stay within the repository"):
+        InputHandler()._github_tree_target(
+            f"https://github.com/example/repo/tree/main/skills/{segment}"
+        )
+
+
+@pytest.mark.parametrize("target", ["missing", "SKILL.md"])
+def test_github_tree_url_selection_failure_cleans_owned_clone(tmp_path: Path, target: str) -> None:
+    """A post-clone tree selection error must not strand the owned checkout."""
+    handler = InputHandler()
+    clone = tmp_path / "repo"
+    clone.mkdir()
+    if target == "SKILL.md":
+        (clone / target).write_text("# skill\n")
+    handler._temp_dir = tmp_path
+    with (
+        patch.object(handler, "_clone_git", return_value=clone),
+        patch.object(handler, "_list_remote_refs", return_value={"main"}),
+    ):
+        with pytest.raises(ValueError):
+            handler.resolve(f"https://github.com/example/repo/tree/main/{target}")
+    assert not tmp_path.exists()
+    assert handler.temp_dir_for_cleanup() is None
+
+
+def test_http_urls_are_not_accepted_as_remote_inputs() -> None:
+    """Network inputs require HTTPS unless they use SSH's scp-style syntax."""
+    handler = InputHandler()
+    assert handler._is_git_url("http://github.com/org/repo.git") is False
+    assert handler._is_file_url("http://raw.githubusercontent.com/org/repo/SKILL.md") is False
+
+
+@pytest.mark.parametrize("budgeted", [False, True], ids=["direct", "workflow-budget"])
+@pytest.mark.parametrize(
+    ("page_url", "raw_url"),
+    [
+        (
+            "https://github.com/org/repo/blob/main/skills/demo/SKILL.md",
+            "https://raw.githubusercontent.com/org/repo/main/skills/demo/SKILL.md",
+        ),
+        (
+            "https://gitlab.com/group/repo/-/blob/main/skills/demo/SKILL.md",
+            "https://gitlab.com/group/repo/-/raw/main/skills/demo/SKILL.md",
+        ),
+    ],
+    ids=["github", "gitlab"],
+)
+def test_file_page_url_downloads_the_raw_file(
+    monkeypatch: pytest.MonkeyPatch, page_url: str, raw_url: str, budgeted: bool
+) -> None:
+    """A forge's /blob/ file page resolves to the file itself, not its HTML viewer."""
+    skill = b"---\nname: demo\ndescription: demo\n---\n# Demo\n"
+    requested: list[str] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        if str(request.url) == raw_url:
+            return httpx.Response(200, content=skill, headers={"content-type": "text/plain"})
+        return httpx.Response(200, content=b"<!DOCTYPE html><html></html>")
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        "skillspector.input_handler.httpx.Client",
+        lambda *args, **kwargs: real_client(*args, transport=httpx.MockTransport(serve), **kwargs),
+    )
+    monkeypatch.setattr("skillspector.input_handler._is_private_ip", lambda _host: False)
+    handler = InputHandler(transitive_budget=WorkflowResourceBudget() if budgeted else None)
+    try:
+        resolved, source_type = handler.resolve(page_url)
+
+        assert source_type == "url"
+        assert requested == [raw_url]
+        assert (resolved / "SKILL.md").read_bytes() == skill
+    finally:
+        handler.cleanup()
+
+
+@pytest.mark.parametrize("budgeted", [False, True], ids=["direct", "workflow-budget"])
+@pytest.mark.parametrize("extension", [".zip", ".ZIP", ".ZiP"])
+def test_file_url_download_extracts_zip_regardless_of_extension_case(
+    monkeypatch: pytest.MonkeyPatch, extension: str, budgeted: bool
+) -> None:
+    """ZIP filenames trigger extraction even without a ZIP content type."""
+    import io
+    import zipfile
+
+    skill = b"---\nname: demo\ndescription: demo\n---\n# Demo\n"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("SKILL.md", skill)
+    url = f"https://raw.githubusercontent.com/org/repo/main/skill{extension}"
+    requested: list[str] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        requested.append(str(request.url))
+        return httpx.Response(
+            200, content=archive.getvalue(), headers={"content-type": "application/octet-stream"}
+        )
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        "skillspector.input_handler.httpx.Client",
+        lambda *args, **kwargs: real_client(*args, transport=httpx.MockTransport(serve), **kwargs),
+    )
+    monkeypatch.setattr("skillspector.input_handler._is_private_ip", lambda _host: False)
+    handler = InputHandler(transitive_budget=WorkflowResourceBudget() if budgeted else None)
+    try:
+        resolved, source_type = handler.resolve(url)
+
+        assert source_type == "url"
+        assert requested == [url]
+        assert (resolved / "SKILL.md").read_bytes() == skill
+    finally:
+        handler.cleanup()
+
+
+def test_validate_url_host_scp_extracts_github() -> None:
+    """_validate_url_host extracts 'github.com' from an scp-style URL."""
+    with patch("skillspector.input_handler._is_private_ip", return_value=False):
+        host = InputHandler()._validate_url_host("git@github.com:org/repo.git", ALLOWED_GIT_HOSTS)
+    assert host == "github.com"
+
+
+def test_scp_valid_host_clones() -> None:
+    """resolve() calls git clone with the scp URL when the host is allowed."""
+    handler = InputHandler()
+    try:
+
+        def fake_clone(command: list[str], **_kwargs: object) -> MagicMock:
+            Path(command[-1]).mkdir(parents=True)
+            process = MagicMock()
+            process.poll.return_value = 0
+            process.wait.return_value = 0
+            return process
+
+        with (
+            patch("skillspector.input_handler._is_private_ip", return_value=False),
+            patch(
+                "skillspector.input_handler.subprocess.Popen", side_effect=fake_clone
+            ) as mock_run,
+        ):
+            handler.resolve("git@github.com:org/repo.git")
+        assert mock_run.called
+        call_args = mock_run.call_args[0][0]
+        assert "git@github.com:org/repo.git" in call_args
+    finally:
+        handler.cleanup()
+
+
+def test_scp_disallowed_host_raises() -> None:
+    """_validate_url_host rejects an scp URL whose host is not in the allowlist."""
+    with pytest.raises(ValueError, match="not in the allowed hosts"):
+        InputHandler()._validate_url_host("git@malicious.internal:org/repo.git", ALLOWED_GIT_HOSTS)
+
+
+def test_scp_private_ip_raises() -> None:
+    """_validate_url_host rejects an scp URL whose extracted host is not in the allowlist."""
+    with pytest.raises(ValueError):
+        InputHandler()._validate_url_host("git@169.254.169.254:org/repo.git", ALLOWED_GIT_HOSTS)
+
+
+def test_https_url_unchanged() -> None:
+    """https URLs continue to extract the host via urlparse without hitting the scp fallback."""
+    with patch("skillspector.input_handler._is_private_ip", return_value=False):
+        host = InputHandler()._validate_url_host(
+            "https://github.com/org/repo.git", ALLOWED_GIT_HOSTS
+        )
+    assert host == "github.com"
+
+
+def test_scp_ssrf_gate_fires() -> None:
+    """SSRF gate raises ValueError for an scp URL whose host resolves to a private IP."""
+    with patch("skillspector.input_handler._is_private_ip", return_value=True):
+        with pytest.raises(ValueError, match="private/internal IP"):
+            InputHandler()._validate_url_host("git@github.com:org/repo.git", ALLOWED_GIT_HOSTS)
+
+
+@pytest.mark.parametrize("operation", ["_clone_git", "_list_remote_refs"])
+def test_anonymous_git_drops_ambient_auth_and_config(
+    operation: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    hostile = {
+        "HOME": str(tmp_path),
+        "SSH_AUTH_SOCK": "/synthetic/agent",
+        "GIT_ASKPASS": "/synthetic/askpass",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": "Authorization: synthetic-secret",
+        "GIT_CONFIG_GLOBAL": str(tmp_path / "credentials.config"),
+        "GITHUB_TOKEN": "synthetic-token",
+        "CURL_HOME": str(tmp_path),
+        "SSLKEYLOGFILE": str(tmp_path / "tls-keys"),
+        "GIT_SSL_CERT": "/synthetic/client.pem",
+        "GIT_SSL_KEY": "/synthetic/client.key",
+        "GIT_CEILING_DIRECTORIES": "/synthetic/ceiling",
+    }
+    transport = {
+        key: "/synthetic/ca"
+        if "CA" in key or key.startswith("SSL_")
+        else "http://proxy.example:8080"
+        for key in (
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "GIT_SSL_CAINFO",
+            "GIT_SSL_CAPATH",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "CURL_CA_BUNDLE",
+        )
+    }
+    for key, value in (hostile | transport).items():
+        monkeypatch.setenv(key, value)
+    handler = InputHandler(allow_git_credentials=False)
+    calls: list[tuple[list[str], dict]] = []
+
+    def fake_git(command: list[str], **kwargs: object) -> MagicMock:
+        calls.append((command, kwargs))
+        if "clone" in command:
+            Path(command[-1]).mkdir(parents=True)
+        process = MagicMock()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        process.returncode = 0
+        process.stdout = b"abc\trefs/heads/main\n"
+        return process
+
+    try:
+        with (
+            patch.object(handler, "_validate_url_host", return_value="github.com"),
+            patch("skillspector.input_handler.subprocess.Popen", side_effect=fake_git),
+            patch("skillspector.input_handler.subprocess.run", side_effect=fake_git),
+        ):
+            getattr(handler, operation)("https://github.com/org/public.git")
+        assert len(calls) == 1
+        command, kwargs = calls[0]
+        env = kwargs["env"]
+        isolated_home = handler.temp_dir_for_cleanup() / "git-home"
+        assert command[:3] == ["git", "-C", str(isolated_home)]
+        assert "credential.helper=" in command
+        assert "core.askPass=" in command
+        assert "http.extraHeader=" in command
+        assert "http.followRedirects=false" in command
+        assert env["HOME"] == env["USERPROFILE"] == str(isolated_home)
+        assert env["GIT_CONFIG_GLOBAL"] == env["GIT_CONFIG_SYSTEM"] == os.devnull
+        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert env["GIT_ALLOW_PROTOCOL"] == "https"
+        assert env["GIT_CEILING_DIRECTORIES"] == str(isolated_home.parent)
+        assert {key: env[key] for key in transport} == transport
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+        assert list(isolated_home.iterdir()) == []
+        for key in hostile.keys() - {"HOME", "GIT_CONFIG_GLOBAL", "GIT_CEILING_DIRECTORIES"}:
+            assert key not in env
+        assert os.environ["HOME"] == str(tmp_path)
+    finally:
+        handler.cleanup()
+
+
+@pytest.mark.parametrize("operation", ["_clone_git", "_list_remote_refs"])
+@pytest.mark.parametrize(
+    "target",
+    [
+        "git@github.com:org/private.git",
+        "ssh://git@github.com/org/private.git",
+        "https://user:password@github.com/org/private.git",
+    ],
+)
+def test_anonymous_git_rejects_auth_targets_before_start(operation: str, target: str) -> None:
+    handler = InputHandler(allow_git_credentials=False)
+    with (
+        patch("skillspector.input_handler.subprocess.Popen") as popen,
+        patch("skillspector.input_handler.subprocess.run") as run,
+    ):
+        with pytest.raises(ValueError, match="unauthenticated HTTPS"):
+            getattr(handler, operation)(target)
+    popen.assert_not_called()
+    run.assert_not_called()
+    assert handler.temp_dir_for_cleanup() is None
+
+
+@pytest.mark.parametrize("operation", ["_clone_git", "_list_remote_refs"])
+@pytest.mark.parametrize(
+    "target, expected",
+    [
+        ("https://gitlab.com/group/subgroup/repo", "https://gitlab.com/group/subgroup/repo.git"),
+        ("https://gitlab.com/group/repo.git/", "https://gitlab.com/group/repo.git"),
+        ("https://bitbucket.org/team/repo/", "https://bitbucket.org/team/repo.git"),
+        ("https://github.com/org/repo", "https://github.com/org/repo"),
+    ],
+)
+def test_anonymous_git_normalizes_repository_urls_without_redirects(operation, target, expected):
+    handler = InputHandler(allow_git_credentials=False)
+    calls = []
+
+    def fake_git(command, **kwargs):
+        calls.append(command)
+        if "clone" in command:
+            Path(command[-1]).mkdir(parents=True)
+        return SimpleNamespace(poll=lambda: 0, returncode=0, stdout=b"abc\trefs/heads/main\n")
+
+    try:
+        with (
+            patch.object(handler, "_validate_url_host"),
+            patch("skillspector.input_handler.subprocess.Popen", side_effect=fake_git),
+            patch("skillspector.input_handler.subprocess.run", side_effect=fake_git),
+        ):
+            getattr(handler, operation)(target)
+        assert expected in calls[0]
+        assert "http.followRedirects=false" in calls[0]
+    finally:
+        handler.cleanup()
+
+
+def test_anonymous_git_cannot_read_enclosing_repository_config(tmp_path):
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "config",
+            "http.https://github.com/.extraheader",
+            "synthetic-header",
+        ],
+        check=True,
+    )
+    handler = InputHandler(allow_git_credentials=False)
+    with patch.object(handler, "_get_temp_dir", return_value=tmp_path / "scan"):
+        (tmp_path / "scan").mkdir()
+        argv, env, _ = handler._git_invocation("https://github.com/org/repo")
+    result = subprocess.run(
+        [*argv, "config", "--get-urlmatch", "http.extraheader", "https://github.com/org/repo"],
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    assert b"synthetic-header" not in result.stdout
+    assert result.stdout.strip() == b""

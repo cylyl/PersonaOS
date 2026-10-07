@@ -1,0 +1,260 @@
+{
+    "_comment": "DevOps Pipeline Workflow - cylyl-labs",
+    "_schema": "https://docs.openclaw.ai/tools/lobster",
+    "name": "devops-pipeline",
+    "version": "1.0.0",
+    "description": "Software development pipeline: CTO \u2192 Engineer \u2192 DevOps \u2192 QA \u2192 Operations",
+    "settings": {
+        "loop": true,
+        "max_iterations": 5,
+        "stop_on": [
+            "qa_approved",
+            "deployed_to_production"
+        ]
+    },
+    "pipeline": [
+        {
+            "step": "spec_ready",
+            "agent": "cto",
+            "emits": "spec_ready"
+        },
+        {
+            "step": "implement",
+            "agent": "software_engineer",
+            "receives": "spec_ready",
+            "emits": "db_review_requested"
+        },
+        {
+            "step": "db_review",
+            "agent": "dba",
+            "receives": "db_review_requested",
+            "emits": "db_approved"
+        },
+        {
+            "step": "build",
+            "agent": "software_engineer",
+            "receives": "db_approved",
+            "emits": "build_done"
+        },
+        {
+            "step": "deploy_staging",
+            "agent": "devops",
+            "receives": "build_done",
+            "emits": "deploy_ready"
+        },
+        {
+            "step": "test",
+            "agent": "qa",
+            "receives": "deploy_ready",
+            "emits": [
+                "tests_passed",
+                "tests_failed"
+            ]
+        },
+        {
+            "step": "hotfix",
+            "agent": "devops",
+            "receives": "hotfix_requested",
+            "emits": "hotfix_deployed"
+        }
+    ],
+    "events": [
+        {
+            "name": "spec_ready",
+            "emit_by": "cto",
+            "consumed_by": [
+                "software_engineer"
+            ],
+            "description": "Architectural spec is ready for implementation"
+        },
+        {
+            "name": "code_review_requested",
+            "emit_by": "software_engineer",
+            "consumed_by": [
+                "cto"
+            ],
+            "description": "Code ready for architecture review"
+        },
+        {
+            "name": "build_done",
+            "emit_by": "software_engineer",
+            "consumed_by": [
+                "devops"
+            ],
+            "description": "Build artifact ready for deployment"
+        },
+        {
+            "name": "db_review_requested",
+            "emit_by": "software_engineer",
+            "consumed_by": [
+                "dba"
+            ],
+            "description": "Database changes need review"
+        },
+        {
+            "name": "db_approved",
+            "emit_by": "dba",
+            "consumed_by": [
+                "software_engineer"
+            ],
+            "description": "Database changes approved"
+        },
+        {
+            "name": "deploy_ready",
+            "emit_by": "devops",
+            "consumed_by": [
+                "qa"
+            ],
+            "description": "Deployed to staging, ready for testing"
+        },
+        {
+            "name": "tests_passed",
+            "emit_by": "qa",
+            "consumed_by": [
+                "operations",
+                "cto"
+            ],
+            "description": "All tests passed, ready for production"
+        },
+        {
+            "name": "tests_failed",
+            "emit_by": "qa",
+            "consumed_by": [
+                "software_engineer"
+            ],
+            "description": "Tests failed, needs fixes"
+        },
+        {
+            "name": "qa_approved",
+            "emit_by": "qa",
+            "consumed_by": [
+                "operations"
+            ],
+            "description": "QA gate passed, cleared for deployment"
+        },
+        {
+            "name": "deployed_to_staging",
+            "emit_by": "operations",
+            "consumed_by": [
+                "qa"
+            ],
+            "description": "Deployed to staging environment"
+        },
+        {
+            "name": "deployed_to_production",
+            "emit_by": "operations",
+            "consumed_by": [
+                "cto"
+            ],
+            "description": "Successfully deployed to production"
+        },
+        {
+            "name": "hotfix_requested",
+            "emit_by": "operations",
+            "consumed_by": [
+                "devops"
+            ],
+            "description": "Production issue requires hotfix"
+        },
+        {
+            "name": "hotfix_deployed",
+            "emit_by": "devops",
+            "consumed_by": [
+                "qa",
+                "operations"
+            ],
+            "description": "Hotfix deployed, needs verification"
+        }
+    ],
+    "agents": {
+        "cto": {
+            "role": "architect",
+            "skills": [
+                "architecture",
+                "technical-leadership",
+                "dennis-da-menace-agent-memory",
+                "elite-longterm-memory"
+            ],
+            "receives_from": [
+                "qa",
+                "dba"
+            ],
+            "sends_to": [
+                "software_engineer"
+            ]
+        },
+        "software_engineer": {
+            "role": "builder",
+            "skills": [
+                "coding-agent",
+                "github"
+            ],
+            "receives_from": [
+                "cto",
+                "qa",
+                "dba"
+            ],
+            "sends_to": [
+                "devops",
+                "dba"
+            ]
+        },
+        "devops": {
+            "role": "infrastructure",
+            "skills": [
+                "tkuehnl-kube-medic",
+                "tkuehnl-agentic-devops",
+                "pals-software-azure-devops"
+            ],
+            "receives_from": [
+                "software_engineer",
+                "operations"
+            ],
+            "sends_to": [
+                "qa"
+            ]
+        },
+        "dba": {
+            "role": "database-admin",
+            "skills": [
+                "ansible-db-hardening",
+                "database-admin"
+            ],
+            "receives_from": [
+                "software_engineer"
+            ],
+            "sends_to": [
+                "software_engineer"
+            ]
+        },
+        "qa": {
+            "role": "tester",
+            "skills": [
+                "testing",
+                "automation",
+                "sanguineseal-aegis-audit",
+                "bluesbell-ai-act-risk-check"
+            ],
+            "receives_from": [
+                "devops"
+            ],
+            "sends_to": [
+                "software_engineer",
+                "operations"
+            ]
+        },
+        "operations": {
+            "role": "release-manager",
+            "skills": [
+                "management",
+                "operations"
+            ],
+            "receives_from": [
+                "qa"
+            ],
+            "sends_to": [
+                "devops"
+            ]
+        }
+    }
+}

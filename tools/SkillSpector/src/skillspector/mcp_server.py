@@ -1,0 +1,322 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""MCP server exposing SkillSpector scanning as an agent-callable tool.
+
+This lets local MCP-capable agents (Claude Code, Codex CLI, Gemini CLI) call
+``scan_skill`` and gate skill/MCP installs on the verdict, turning
+SkillSpector from an out-of-band audit tool into a runtime guardrail.
+
+The scan core (:func:`run_scan`) is deliberately independent of the ``mcp`` SDK
+so it can be unit-tested without the optional dependency; :func:`build_server`
+wraps it in a FastMCP tool and is only reachable once ``skillspector[mcp]`` is
+installed.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from ipaddress import ip_address
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
+
+from skillspector import __version__
+from skillspector.cleanup import TempDirTracker, cleanup_result
+from skillspector.constants import RISK_THRESHOLD
+from skillspector.graph import graph
+from skillspector.graph_proxy import restore_package_graph_export
+from skillspector.inspection_ledger import LedgerReason
+from skillspector.llm_utils import is_llm_available
+from skillspector.logging_config import get_logger
+from skillspector.nodes.analyzers import ANALYZER_MODULES
+from skillspector.semantic_runtime import llm_runtime_available, semantic_runtime_accounting
+from skillspector.suppression import effective_findings
+
+# Importing `skillspector.graph` above assigns the submodule to the parent
+# package's `graph` attribute, shadowing the documented lazy proxy. Restore
+# the proxy so `skillspector.graph` stays invokable when MCP is imported
+# before any other graph access.
+restore_package_graph_export()
+
+if TYPE_CHECKING:
+    from mcp.server.fastmcp import FastMCP
+
+logger = get_logger(__name__)
+
+VALID_FORMATS = ("json", "markdown", "sarif", "terminal")
+
+
+def _llm_runtime_accounting(*, enabled: bool, result: Mapping[str, object]) -> tuple[bool, bool]:
+    """Apply shared semantic runtime accounting to the discovered registry."""
+    return semantic_runtime_accounting(
+        enabled=enabled,
+        result=result,
+        discovered_modules=ANALYZER_MODULES,
+    )
+
+
+def _llm_runtime_available(*, preflight_available: bool, result: Mapping[str, object]) -> bool:
+    """Apply shared provider and meta-analysis runtime availability."""
+    return llm_runtime_available(
+        preflight_available=preflight_available,
+        result=result,
+    )
+
+
+def _is_local_target(target: str) -> bool:
+    """Return True when ``target`` names local filesystem content."""
+    stripped = target.strip()
+    if stripped.startswith("file://"):
+        return True
+    if stripped.startswith("git@"):
+        return False
+    if stripped.startswith(("\\\\", "//")):
+        return True
+    if "://" in stripped:
+        return False
+
+    try:
+        candidate = Path(stripped).expanduser()
+    except RuntimeError:
+        return True
+    if candidate.is_absolute() or candidate.drive:
+        return True
+    return candidate.exists()
+
+
+async def run_scan(
+    target: str,
+    *,
+    use_llm: bool = True,
+    output_format: str = "json",
+    allow_local_targets: bool = True,
+    yara_rules_dir: str | None = None,
+) -> dict[str, Any]:
+    """Invoke the SkillSpector graph and return a structured verdict.
+
+    Args:
+        target: Git URL, file URL, ``.zip``, ``.md`` file, or local directory.
+        use_llm: Whether to request the optional LLM semantic pass on top of
+            static analysis. Honoured only when the active provider can
+            actually build or run the LLM pass; the returned payload reports
+            what actually happened.
+        output_format: Format of the embedded ``report`` string. One of
+            :data:`VALID_FORMATS`.
+        allow_local_targets: Whether local filesystem targets are allowed.
+            HTTP MCP calls set this to ``False`` so routable servers do not
+            accept caller-controlled local paths or use ambient Git credentials.
+        yara_rules_dir: Optional directory of additional YARA rules.
+
+    Returns:
+        A JSON-serialisable verdict with ``risk_score`` (0-100), ``severity``,
+        ``recommendation``, ``safe_to_install``, ``findings``, the rendered
+        ``report``, and an honest LLM accounting (``llm_requested``,
+        ``llm_available``, ``llm_used``, ``scan_mode``) so a caller is never
+        misled into thinking a full semantic scan ran when it silently did not.
+    """
+    if output_format not in VALID_FORMATS:
+        raise ValueError(f"output_format must be one of {VALID_FORMATS}, got {output_format!r}")
+    if not allow_local_targets:
+        local_target = _is_local_target(target)
+        local_yara_rules = yara_rules_dir is not None and _is_local_target(yara_rules_dir)
+        if local_target or local_yara_rules:
+            raise ValueError("local targets are disabled for this MCP transport")
+        parsed_target = urlparse(target.strip())
+        if (
+            parsed_target.scheme != "https"
+            or parsed_target.username is not None
+            or parsed_target.password is not None
+        ):
+            raise ValueError("this MCP transport requires an unauthenticated HTTPS target")
+
+    llm_preflight_available, _ = is_llm_available()
+    llm_enabled = use_llm and llm_preflight_available
+
+    state: dict[str, Any] = {
+        "input_path": target,
+        "allow_git_credentials": allow_local_targets,
+        "output_format": output_format,
+        "use_llm": llm_enabled,
+        "llm_requested": use_llm,
+    }
+    if yara_rules_dir:
+        state["yara_rules_dir"] = yara_rules_dir
+
+    logger.debug(
+        "MCP scan started: target=%s, format=%s, llm_enabled=%s",
+        target,
+        output_format,
+        llm_enabled,
+    )
+
+    result: dict[str, Any] | None = None
+    # A cancelled or failed scan returns no result to clean up; the tracker still
+    # knows the temp directory resolve_input made.
+    temp_dir_tracker = TempDirTracker()
+    try:
+        result = await graph.ainvoke(
+            state,
+            config={
+                "callbacks": [temp_dir_tracker],
+                "run_name": "skillspector-mcp-scan",
+                "tags": ["skillspector", "mcp"],
+                "metadata": {
+                    "input_path": target,
+                    "use_llm": llm_enabled,
+                    "llm_requested": use_llm,
+                    "output_format": output_format,
+                    "version": __version__,
+                },
+            },
+        )
+        findings = effective_findings(result)
+        risk_score = int(result.get("risk_score") or 0)
+        llm_used, llm_runtime_complete = _llm_runtime_accounting(enabled=llm_enabled, result=result)
+        llm_available = _llm_runtime_available(
+            preflight_available=llm_preflight_available,
+            result=result,
+        )
+        execution_successful = bool(result.get("execution_successful", True))
+        analysis_completeness = result.get("analysis_completeness") or {}
+        entirely_uninspected = int(analysis_completeness.get("entirely_uninspected_files", 0))
+        partially_inspected = int(analysis_completeness.get("partially_inspected_files", 0))
+        # A missing reference names a path the bundle does not carry, such as a
+        # file the skill writes at runtime. Every discovered file is still
+        # inspected, so on its own it hides no bytes and must not fail this
+        # gate. An *ambiguous* reference (REFERENCE_UNRESOLVED) is different:
+        # it matches more than one bundled artifact, so the scanner has not
+        # established which bytes the instruction actually reaches, and it
+        # must keep blocking safe_to_install like any other exceptional
+        # reason.
+        ledger_exceptions = analysis_completeness.get("ledger_exceptions") or []
+        reference_caveat_only = (
+            bool(ledger_exceptions)
+            and not analysis_completeness.get("limitations")
+            and all(
+                exception.get("reason_code") == LedgerReason.REFERENCE_MISSING
+                for exception in ledger_exceptions
+            )
+        )
+        analysis_requirement_met = not use_llm or llm_runtime_complete
+        safe_to_install = (
+            risk_score <= RISK_THRESHOLD
+            and execution_successful
+            and entirely_uninspected == 0
+            and partially_inspected == 0
+            and (bool(analysis_completeness.get("is_complete", True)) or reference_caveat_only)
+            and analysis_requirement_met
+        )
+        recommendation = result.get("risk_recommendation")
+        if not analysis_requirement_met and recommendation == "SAFE":
+            recommendation = "CAUTION"
+        return {
+            "target": target,
+            "risk_score": risk_score,
+            "severity": result.get("risk_severity"),
+            "recommendation": recommendation,
+            "safe_to_install": safe_to_install,
+            "execution_successful": execution_successful,
+            "analysis_completeness": analysis_completeness,
+            "findings": [f.to_dict() for f in findings],
+            "report": result.get("report_body") or "",
+            # Honest LLM accounting — never silently imply a full semantic scan.
+            "llm_requested": use_llm,
+            "llm_available": llm_available,
+            "llm_used": llm_used,
+            "scan_mode": "static+llm" if llm_used else "static-only",
+            "version": __version__,
+        }
+    finally:
+        if result is not None:
+            cleanup_result(result)
+        else:
+            temp_dir_tracker.remove()
+
+
+def build_server(name: str = "skillspector", *, allow_local_targets: bool = False) -> FastMCP:
+    """Construct the FastMCP server exposing the ``scan_skill`` tool.
+
+    Requires the optional ``mcp`` dependency (``pip install 'skillspector[mcp]'``).
+    Local targets stay disabled unless the caller selects a trusted transport.
+    """
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ModuleNotFoundError as exc:
+        if exc.name != "mcp":
+            raise ModuleNotFoundError(
+                "The installed 'mcp' package is incompatible with the SkillSpector "
+                "MCP server. Reinstall with: pip install 'skillspector[mcp]'"
+            ) from exc
+        raise ModuleNotFoundError(
+            "The MCP server requires the optional 'mcp' dependency. "
+            "Install it with: pip install 'skillspector[mcp]'"
+        ) from exc
+
+    server = FastMCP(name)
+
+    @server.tool()
+    async def scan_skill(
+        target: str,
+        use_llm: bool = True,
+        output_format: str = "json",
+    ) -> dict[str, Any]:
+        """Scan an AI agent skill for security risks before installing it.
+
+        Use this before installing or loading any skill or MCP server to decide
+        whether it is safe. ``target`` accepts a Git URL, file URL, ``.zip``,
+        ``.md`` file, or local directory.
+
+        Returns a verdict with ``risk_score`` (0-100), ``severity``,
+        ``recommendation``, ``safe_to_install``, and ``findings``. The
+        ``llm_used`` / ``scan_mode`` fields report whether the semantic LLM pass
+        actually ran, so a low score from a static-only scan is not mistaken for
+        a clean full scan.
+        """
+        return await run_scan(
+            target,
+            use_llm=use_llm,
+            output_format=output_format,
+            allow_local_targets=allow_local_targets,
+        )
+
+    return server
+
+
+def run(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Run the MCP server over ``stdio`` or loopback-only ``http``."""
+    if transport == "http":
+        # Never resolve caller-selected names or expose this unauthenticated server.
+        host = "127.0.0.1" if host.lower() == "localhost" else host
+        try:
+            host = str(ip_address(host))
+            # FastMCP permits these Host headers, not the full IPv4 loopback range.
+            loopback = host in {"127.0.0.1", "::1"}
+        except ValueError:
+            loopback = False
+        if not loopback:
+            raise ValueError(
+                "HTTP MCP has no authentication and must bind to a loopback IP "
+                "(127.0.0.1 or ::1). Use an authenticating reverse proxy for remote access."
+            )
+    server = build_server(allow_local_targets=transport == "stdio")
+    if transport == "stdio":
+        server.run(transport="stdio")
+    elif transport == "http":
+        server.settings.host = host
+        server.settings.port = port
+        server.run(transport="streamable-http")
+    else:
+        raise ValueError(f"transport must be 'stdio' or 'http', got {transport!r}")

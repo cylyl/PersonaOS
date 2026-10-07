@@ -1,0 +1,50 @@
+# Token-budget metadata for the NvBuildProvider (build.nvidia.com /
+# integrate.api.nvidia.com).  Bundled with the package; consulted whenever
+# the active provider is NvBuildProvider.
+#
+# Format:
+#   models:
+#     "<model-label>":
+#       context_length: <int>          # total context window in tokens (required)
+#       max_output_tokens: <int>       # model's max output cap (optional)
+#
+# Add an entry for any model you intend to use against build.nvidia.com.
+# Stock OpenAI IDs (gpt-5.2, gpt-5.3-chat, ...) work transparently when the
+# endpoint proxies to OpenAI; NVIDIA-curated NIMs (e.g. meta/llama-3.1-...)
+# can be added as needed.
+
+models:
+  # Conservative application budgets, retained from the unknown-model fallback.
+  # The model card advertises 1M context, but the hosted endpoint's combined
+  # input/output limit has not been verified. These are not its capacity claims.
+  # https://build.nvidia.com/z-ai/glm-5-3/modelcard
+  "z-ai/glm-5.3":
+    context_length: 128000
+    max_output_tokens: 32000
+
+  # NVIDIA-curated NIMs on build.nvidia.com.
+  # 202749 e' il tetto COMBINATO ingresso+uscita che l'endpoint impone, ed e' riportato
+  # alla lettera nel 400 che restituisce quando lo si supera. Dichiarando la finestra
+  # nominale di 1000000, model_info calcolava un budget d'uscita di 250000 token
+  # (ctx * (1 - MAX_INPUT_TOKENS_PCT)) e OGNI chiamata falliva:
+  #   "This model configuration accepts at most 202749 combined input and output tokens.
+  #    However, your request has 1249 input tokens and asks for 250000 output tokens"
+  # Una finestra sovrastimata non degrada con grazia: azzera lo stadio LLM. Sottostimare
+  # e' sicuro, sovrastimare no.
+  "z-ai/glm-5.2":
+    context_length: 202749
+    max_output_tokens: 32768
+
+  "moonshotai/kimi-k2.6":
+    context_length: 256000
+
+  # deepseek-v4-flash e' a fine vita dal 2026-08-07 e risponde 410 Gone; il successore
+  # servito e' deepseek-v4-flash-0731. I limiti qui sotto sono prudenti: non sono stati
+  # sondati, e una finestra sottostimata e' il verso sicuro in cui sbagliare.
+  "deepseek-ai/deepseek-v4-flash-0731":
+    context_length: 128000
+    max_output_tokens: 16384
+
+  "openai/gpt-oss-120b":
+    context_length: 128000
+    max_output_tokens: 16384

@@ -1,0 +1,4189 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Static patterns: tool misuse (TM1–TM4). Node and analyze() in one module.
+
+Detects patterns where tool parameters are abused (TM1), tool chaining
+is used to bypass safety (TM2), tool defaults are unsafe (TM3), or a
+privileged Kubernetes workload is deployed (TM4).
+
+Framework: ASI02.
+"""
+
+from __future__ import annotations
+
+import ast
+import io
+import re
+import sys
+import tokenize
+import warnings
+from bisect import bisect_right
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from threading import Lock
+
+from skillspector.logging_config import get_logger
+from skillspector.models import AnalyzerFinding, Location, Severity
+from skillspector.python_ast import MAX_PYTHON_AST_SOURCE_CHARS, parse_python_source
+from skillspector.security_reconstruction import validated_json_string_spans
+from skillspector.state import AnalyzerNodeResponse, SkillspectorState
+
+from . import static_runner
+from .common import (
+    LINE_BREAK_CHARS,
+    MARKDOWN_FENCE_CLOSE,
+    MARKDOWN_FENCE_OPEN,
+    get_context,
+    get_line_number,
+    is_reference_material,
+)
+from .pattern_defaults import PatternCategory
+
+logger = get_logger(__name__)
+
+ANALYZER_ID = "static_patterns_tool_misuse"
+
+_SHELL_COMMAND_WORD_START_RE = re.compile(r"[rRdDeE$'\"`\\]")
+_SHELL_COMMAND_WORD_CHARS = 4096
+_ROOT_GLOB_COMMAND_CHARS = 8192
+_SHELL_HORIZONTAL_OR_CONTINUED_GAP = r"(?>(?:\\\r?\n)*[ \t](?:[ \t]|\\\r?\n)*)"
+_BOUNDED_SHELL_CLAUSE_ATOM = r"(?:\\(?:\r?\n|[^\n])|[^\\\n|;&])"
+_STATIC_BRACE_WORD_CHARS = 256
+_PRINTF_STATIC_CHARS = 256
+_PRINTF_STATIC_ARGUMENTS = 32
+_PRINTF_STATIC_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?%]{0,64}")
+# A bounded ``printf`` format operand may also carry POSIX backslash escapes.
+_PRINTF_FORMAT_WORD_RE = re.compile(r"[-A-Za-z0-9_./*?%\\]{0,64}")
+# The old deterministic alphabet plus the control/high-byte values needed by
+# byte-oriented probes. Command substitutions are expanded after shell syntax
+# has been recognized, so decoded angle brackets remain literal word data
+# rather than redirections. Anything else outside this set is either a shell
+# separator, a metacharacter the downstream glob model does not handle, or
+# otherwise not provably inert, so the substitution stays undecidable.
+_PRINTF_SAFE_WORD_RE = re.compile(r"[\x01-\x08\x0e-\x1f\x7f-\xffA-Za-z0-9_./*?%<>-]*")
+_DESTRUCTIVE_COMMAND_BASENAMES = frozenset({"rm", "del", "erase"})
+_QUOTED_GLOB_SENTINEL = "\ue000"
+_DYNAMIC_SHELL_WORD_SENTINEL = "\ue001"
+_RUNTIME_SHELL_PARAMETER_SENTINEL = "\ue002"
+# A braced expansion head whose result depends only on parameter values: an
+# optional length prefix, a name with an optional literal subscript or a
+# numeric/special parameter, then the closing brace or a value operator.
+# Indirection, arithmetic subscripts, substring offsets, ``@`` transformations,
+# zsh flags and ``${ cmd; }`` can evaluate code, so they do not match. The
+# documentation placeholder ``${...}`` is a bad substitution in every shell.
+_VALUE_PARAMETER_EXPANSION_HEAD_RE = re.compile(
+    r"\$\{(?:#?(?:[A-Za-z_][A-Za-z0-9_]*(?:\[(?:[@*]|[0-9]+)\])?|[0-9]+|[@*#?$!-])"
+    r"(?:\}|:?[-=?+]|##?|%%?|/[/#%]?|\^\^?|,,?)|\.\.\.\})"
+)
+_VALUE_PARAMETER_EXPANSION_START_RE = re.compile(r"\$\{")
+_EXECUTABLE_EXPANSION_MARKERS = ("`", "$(", "$[", "<(", ">(")
+_SHELL_ASSIGNMENT_PREFIX_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\+?=")
+_SHELL_ASSIGNMENT_NAME_CHARACTERS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+)
+_SHELL_CLAUSE_BOUNDARY_CHARACTERS = "\r\n;|&(){}`"
+_SHELL_DELIMITER_WORD_RE = re.compile(r"[^$'\"`\\(){}<>#;|&!\s]++")
+# A ``#`` that starts a word begins a shell comment. Quoting is not tracked, so
+# ``echo "a # b"`` also matches; callers only use this to restrict ownership.
+_SHELL_COMMENT_START_RE = re.compile(r"(?<![^\s;&|()<>])#")
+_PERL_LITERAL_PRINT_RE = re.compile(
+    r"^[ \t]*+print\b(?:[ \t]++(?:STDOUT|STDERR)\b)?[ \t]*+(?P<paren>\()?[ \t]*+"
+    r"(?P<literal>\"(?:\\[\\\"'nrt]|[^\\\"$@`\r\n])*+\""
+    r"|'(?:\\[\\\"'nrt]|[^\\'$@`\r\n])*+')"
+    r"[ \t]*+(?(paren)\))[ \t]*+;[ \t]*+(?:\#[^\r\n]*+)?\r?$",
+    re.MULTILINE,
+)
+_PERL_QUOTE_OPERATOR_RE = re.compile(r"\b(?:q[qwxr]?|m|s|tr|y)(?:\s+\S|[^\w\s])")
+_PERL_AMBIGUOUS_SIGIL_RE = re.compile(r"[$@%&*]\s*+[{#'\"`]")
+# Perl's ``eval BLOCK`` runs already-compiled statements and traps exceptions.
+# Only ``eval EXPR`` (a string, variable, or quote operator) reparses source.
+_PERL_EVAL_BLOCK_RE = re.compile(r"\s*+\{")
+# Outside string and comment tokens, valid Python ends a shell word at
+# whitespace or a shell control character. A backslash-newline is a line
+# continuation in both languages, so it does not end the word.
+_PYTHON_SHELL_WORD_BREAK_RE = re.compile(r"(?<!\\)(?<!\\\r)[\s;|&()<>]")
+# The tokenizer and the compiler disagree about a carriage return that does
+# not start CRLF, so such source never acquires token ownership.
+_LONE_CARRIAGE_RETURN_RE = re.compile(r"\r(?!\n)")
+# A shebang that names another interpreter (for example a shell polyglot)
+# makes the Python host ambiguous. Without a shebang, ``.py`` source is Python.
+_PYTHON_SHEBANG_RE = re.compile(
+    r"#![ \t]*+(?:\S*/)?(?:env[ \t]++(?:-\S*[ \t]++)*(?:\S*/)?)?"
+    r"(?:python[0-9.]*|pypy[0-9.]*|uv)(?=[ \t\r\n]|$)"
+)
+# ``warnings.catch_warnings`` swaps the process-global filter list, and analyzer
+# nodes run on concurrent graph worker threads. Two such blocks that exit out of
+# order can leave their ``ignore`` filter installed for the whole process, so
+# the ownership parse serializes its block.
+_PYTHON_OWNERSHIP_PARSE_LOCK = Lock()
+_PYTHON_TEMPLATE_STRING_STARTS = frozenset(
+    {tokenize.FSTRING_START, getattr(tokenize, "TSTRING_START", tokenize.FSTRING_START)}
+)
+_PYTHON_TEMPLATE_STRING_ENDS = frozenset(
+    {tokenize.FSTRING_END, getattr(tokenize, "TSTRING_END", tokenize.FSTRING_END)}
+)
+_PRINTF_FORMAT_CONVERSION_RE = re.compile(r"%[-+ #0-9.*']*[A-Za-z%]")
+_SHELL_ROOT_TARGET_ESCAPE_RE = re.compile(
+    r"\\(?:[/~*?]|x(?:2[fF]|7[eE]|2[aA]|3[fF])|"
+    r"u(?:002[fF]|007[eE]|002[aA]|003[fF])|"
+    r"U(?:0000002[fF]|0000007[eE]|0000002[aA]|0000003[fF])|"
+    r"(?:057|176|052|077)(?![0-7]))"
+)
+_POWERSHELL_REPLACE_EXPRESSION_RE = re.compile(
+    r"\A\s*\$(?:[A-Za-z_][A-Za-z0-9_]*|_[A-Za-z0-9_.]*)"
+    r"(?:\.[A-Za-z_][A-Za-z0-9_]*)*\s+-replace\b",
+    re.IGNORECASE,
+)
+_SHELL_COMMAND_STRING_SHELLS = frozenset({"sh", "ash", "bash", "dash", "ksh", "yash", "zsh"})
+_SHELL_COMMAND_STRING_ARGUMENTS = 32
+_SHELL_CLAUSE_PREFIX_WORDS = frozenset({"do", "else", "elif", "then", "time", "!"})
+_SHELL_ASSIGNMENT_PREFIX_WORDS = _SHELL_CLAUSE_PREFIX_WORDS | frozenset(
+    {"if", "while", "until", "export", "local", "declare", "readonly", "typeset"}
+)
+_SHELL_REDIRECTION_PREFIX_RE = re.compile(r"(?:[0-9]+)?(?:&>>?|<>|>>?|<<-?|>&|<&|[<>])")
+_RECURSIVE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*[rR]|-recursive)")
+_FORCE_OPTION_SOURCE_RE = re.compile(r"-(?:[A-Za-z]*f|-force)")
+_MARKDOWN_CONTRACTION_PROSE_RE = re.compile(
+    r"(?:The|This|That|These|Those|It|They|We|You|I|A|An)[ \t]+[A-Za-z \t,]*\b"
+    r"(?:doesn|isn|aren|wasn|weren|don|didn|hasn|haven|hadn|can|couldn|shouldn|wouldn|won|mustn)"
+    r"(?P<apostrophe>')t\b[A-Za-z \t,]*[.!?]",
+    re.IGNORECASE,
+)
+_ROOT_GLOB_DOCUMENTATION_LINE_RE = re.compile(
+    r"[ \t]*(?:(?:[-*+]|#{1,6})[ \t]+)?"
+    r"(?:(?:(?:documentation|note|example)[ \t]*:[ \t]*)"
+    r"(?:(?:the|this|a|an)[ \t]+)?|(?:the|this|a|an)[ \t]+)"
+    r"(?:(?:gnu|posix(?:\.[0-9]+)?|unix)[ \t]+)?rm[ \t]+(?:utility|command|tool)\b"
+    r"[^;\n]{0,160}\b(?:accepts?|supports?)\b"
+    r"[^;\n]{0,160}\b(?:denotes?|means?|represents?)\b"
+    r"[^;\n]{0,80}\b(?:wildcard|glob|option|flag)\b[.!?]?[ \t]*",
+    re.IGNORECASE,
+)
+_ROOT_GLOB_EXECUTION_PREFIX_RE = re.compile(
+    r"\b(?P<action>run|execute|invoke|issue|launch|perform|call|eval|type|submit|"
+    r"enter|paste|carry[ \t]+out)\b[^.;\n]{0,240}$",
+    re.IGNORECASE,
+)
+_ROOT_GLOB_NEGATED_EXECUTION_RE = re.compile(
+    r"(?:(?:\bdo[ \t]+not|\bdon't|\bnever|\bavoid|\bmust[ \t]+not)"
+    r"(?:(?:[ \t]*,[ \t]*|[ \t]+)"
+    r"(?!(?:so|but|yet|then|therefore|however|instead)\b)\w+){0,8}[ \t,]*|"
+    r"\bnot[ \t,]*|"
+    r"\bnot(?:[ \t]*,[ \t]*|[ \t]+)"
+    r"(?:ever|directly|immediately|actually)[ \t,]*|"
+    r"\bnot(?:[ \t]*,[ \t]*|[ \t]+)(?:under|in)"
+    r"(?:[ \t]*,[ \t]*|[ \t]+)(?:any|all|these|those)"
+    r"(?:(?:[ \t]*,[ \t]*|[ \t]+)\w+){0,4}[ \t,]*)$",
+    re.IGNORECASE,
+)
+_ROOT_GLOB_SAFETY_WARNING_PREFIX_RE = re.compile(
+    r"[ \t]*(?:please[ \t]+)?(?:"
+    r"(?:do[ \t]+not|don't|never|must[ \t]+not)[ \t]+"
+    r"(?:run|execute|invoke|issue|launch|perform|call|eval|type|submit|enter|paste|use)"
+    r"|avoid[ \t]+(?:running|executing|invoking|issuing|launching|performing|calling|"
+    r"evaluating|typing|submitting|entering|pasting|using)"
+    r"|refrain[ \t]+from[ \t]+(?:running|executing|invoking|issuing|launching|"
+    r"performing|calling|evaluating|typing|submitting|entering|pasting|using)"
+    r")[ \t]+(?:the[ \t]+)?",
+    re.IGNORECASE,
+)
+_ROOT_GLOB_AFFIRMATIVE_NEGATION_PREFIX_RE = re.compile(
+    r".*\b(?:do[ \t]+not|don't|never)[ \t]+(?:"
+    r"forget(?:[ \t]+to|[ \t]+that(?:[ \t]+you)?[ \t]+"
+    r"(?:must|should|shall|will|need[ \t]+to)"
+    r"|[ \t]*,[ \t]*(?:and[ \t]+)?(?:be|make)[ \t]+sure[ \t]+to)"
+    r"|hesitate(?:[ \t]+at[ \t]+all)?[ \t]+to"
+    r"|fail[ \t]+to)[ \t]*$",
+    re.IGNORECASE,
+)
+
+# Match a literal True assigned to a local name shortly before it is passed as
+# shell=<name> to a subprocess invocation.  The bounded newline gap and the
+# intervening-write guard keep this a local data-flow fact; Python scope
+# visibility is enforced separately in analyze() via _VARIABLE_SHELL_FLAG_RE.
+_VARIABLE_SHELL_FLAG_PATTERN = (
+    r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*True\s*$\n"
+    r"(?:(?![^\n]*\b\1\s*=)[^\n]{0,240}\n){0,4}?[^\n]{0,240}"
+    r"(?:subprocess\.\w+|Popen)\s*\([^)]*\bshell\s*=\s*\1\b"
+)
+_VARIABLE_SHELL_FLAG_RE = re.compile(_VARIABLE_SHELL_FLAG_PATTERN, re.IGNORECASE | re.MULTILINE)
+
+# TM1: Tool Parameter Abuse — dangerous parameter values
+TM1_CODE_PATTERNS = [
+    # shell=True is a classic command injection vector
+    (r"subprocess\.\w+\s*\([^)]*shell\s*=\s*True", 0.8),
+    (r"Popen\s*\([^)]*shell\s*=\s*True", 0.8),
+    # Preserve the direct-call signal when a Python boolean is assigned to a
+    # local name immediately before the invocation. The bounded newline gap
+    # avoids treating an arbitrary distant assignment as a data-flow fact.
+    (_VARIABLE_SHELL_FLAG_PATTERN, 0.8),
+    # Bound command names on both sides so prefixes such as rmm/ (RAPIDS
+    # Memory Manager headers) are not interpreted as destructive commands.
+    # Keep the scan within one bounded shell command.  The former ``[^|]*``
+    # crossed newlines/``;``/``&`` and rescanned the remainder of a document
+    # for every prose mention of ``rm``, making repeated documentation
+    # quadratic.  Escaped newlines remain valid shell continuations.
+    (
+        rf"\b(?:rm|del|erase)\b{_SHELL_HORIZONTAL_OR_CONTINUED_GAP}"
+        rf"{_BOUNDED_SHELL_CLAUSE_ATOM}{{0,{_ROOT_GLOB_COMMAND_CHARS}}}"
+        rf"(?:\\)?-(?:rf|fr|r){_SHELL_HORIZONTAL_OR_CONTINUED_GAP}[/~]",
+        0.9,
+    ),
+    (r"--force\s+(?:delete|remove|push|reset|clean)", 0.7),
+    # A bare application-defined --no-verify flag is ambiguous. Match it only
+    # for known Git hook bypasses below; retain the other explicit unsafe flags.
+    (r"--no-?(?:check|validate|confirm|protect|safe)\b", 0.75),
+    (r"--skip-?(?:validation|verification|checks?|auth|tests?)", 0.7),
+    # --allow-empty is a benign git-commit option, unlike the bypass flags below.
+    (r"--allow-?(?:root|unrelated|unsafe)\b", 0.65),
+    # Dangerous globs and wildcards in destructive commands
+    # Match a path in the actual rm argument token. Stop at whitespace and shell
+    # redirection operators so `rm "$VAR" 2>/dev/null` does not borrow the slash
+    # from the redirection target.
+    (
+        r"\brm\b\s+(?:-[A-Za-z]+\s+)*(?:--\s+)?"
+        r"(?:['\"][^'\"]*/[^'\"]*['\"]|[^\s|;&>]*/[^\s|;&>]*)",
+        0.85,
+    ),
+    (r"\bshutil\.rmtree\s*\(\s*['\"]\s*/", 0.85),
+    # A numeric chmod mode is world-writable when the others-triple carries the
+    # write bit, i.e. its last digit is 2, 3, 6 or 7.  Matching the mode argument
+    # itself rather than a bare `777`/`666` substring also keeps a path or a
+    # trailing comment from being read as the mode (chmod 755 /tmp/6660 is a
+    # chmod 755).  This owns the numeric forms that TM1 already owned for
+    # 777/666, plus the 646/757/0662 spellings the privilege-escalation rule used
+    # to catch as a side effect of matching 4/5/6/7 anywhere in the mode.
+    # Only `chmod` is matched here: `chown` takes an owner rather than a mode, so
+    # a numeric owner ID whose last digit is 2/3/6/7 (Grafana's 472:472, Istio's
+    # 1337:1337) is not a world-writable mode.  The optional [+=] accepts the
+    # operator GNU chmod allows in front of the digits (chmod +777, chmod =666);
+    # BSD chmod rejects those, so they are reported rather than assumed safe.
+    # The option group takes a single leading dash for the reason given in the
+    # privilege-escalation rule: `--?` made the match exponential on a line of
+    # unmatched `-- ` tokens, and `[\w=-]*` already absorbs a long option's
+    # second dash.
+    (r"chmod\s+(?:-[\w=-]*[ \t]+)*[\"']?[+=]?0*[0-7]{2,3}[2367](?![0-9\w])[\"']?", 0.8),
+    (r"(?:chmod|chown)\s+[^|]*a\+rwx", 0.8),
+    # Git force operations
+    (r"git\s+push\s+[^|]*--force", 0.7),
+    (r"git\s+reset\s+--hard", 0.65),
+    (r"git\s+clean\s+-[fd]+x", 0.7),
+    (r"\bgit\s+(?:am|commit|merge|push)\b[^\n|]*--no-verify\b", 0.75),
+    # Curl/wget with unsafe parameters
+    (r"curl\s+[^|]*-k\b", 0.6),
+    (r"curl\s+[^|]*--insecure\b", 0.65),
+    (r"wget\s+[^|]*--no-check-certificate", 0.65),
+    # File deletion commands (delete/remove) with explicit path argument
+    # Separate from rm pattern: requires \b and a short span to a "/" to avoid
+    # matching HTTP verb DELETE in REST docs or "remove" in prose
+    (r"\b(?:delete|remove)\s+['\"]?/[^\s'\"]{1,100}", 0.80),
+    # SQL injection via parameter construction
+    (
+        r"(?:execute|query)\s*\(\s*f?['\"].*?\{.*?\}.*?\b(?:DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE)\b",
+        0.85,
+    ),
+]
+TM1_PROSE_PATTERNS = [
+    # Dangerous tool parameter patterns in instructions
+    (
+        r"(?:set|pass|use)\s+(?:the\s+)?(?:parameter|argument|flag|option)\s+(?:to\s+)?(?:shell\s*=\s*True|--force|-rf)\b",
+        0.8,
+    ),
+]
+TM1_PATTERNS = TM1_CODE_PATTERNS + TM1_PROSE_PATTERNS
+
+# TM2: Chaining Abuse — chained commands to bypass safety
+TM2_CODE_PATTERNS = [
+    # Shell command chaining with dangerous commands (\b prevents substring matches)
+    (r"(?:&&|;)\s*\b(?:rm\b|del\b|erase\b)\s+-", 0.75),
+    (r"(?:&&|;)\s*(?:curl|wget)\s+[^|]*\|\s*(?:ba)?sh", 0.9),
+    (r"(?:&&|;)\s*(?:sudo|su\s+)", 0.75),
+    (r"(?:&&|;)\s*(?:chmod|chown)\s+(?:777|666|a\+rwx|-R)", 0.75),
+    # Pipe chains with escalating danger
+    (r"\|\s*(?:sudo|su)\s+", 0.75),
+    (r"\|\s*(?:sh|bash|zsh|python|node|ruby|perl)\s*$", 0.7),
+    (r"\|\s*(?:tee|xargs)\s+.*?\b(?:rm|del|sudo|curl)\b", 0.75),
+]
+TM2_PROSE_PATTERNS = [
+    # Multi-step chains designed to circumvent individual checks
+    # Bounded to ~500 chars per gap to avoid spanning entire documents
+    (
+        r"(?:first|step\s+1)[^\n]{0,500}(?:then|step\s+2)[^\n]{0,500}(?:finally|step\s+3)[^\n]{0,200}\b(?:delete|remove|wipe|destroy|exfiltrate|send)\b",
+        0.7,
+    ),
+    (
+        r"(?:chain|combine|sequence|pipe)\s+(?:these\s+)?(?:tools?|commands?|actions?)\s+to\s+(?:bypass|circumvent|avoid|skip)\s+(?:the\s+)?(?:safety|security|check|restriction|limit)",
+        0.9,
+    ),
+    (
+        r"(?:use|call)\s+(?:tool\s+)?(?:A|one|the\s+first)\s+(?:to|and)[^\n]{0,300}(?:then\s+)?(?:use|call|pass\s+(?:the\s+)?(?:output|result)\s+to)\s+(?:tool\s+)?(?:B|two|another)",
+        0.6,
+    ),
+    # Natural language chaining instructions
+    (
+        r"(?:after|once)\s+(?:the\s+)?(?:first|initial)\s+(?:tool|command|action)\s+(?:succeeds|completes|runs)[^\n]{0,300}(?:immediately|then|next)\s+(?:run|execute|call|invoke)",
+        0.6,
+    ),
+]
+TM2_PATTERNS = TM2_CODE_PATTERNS + TM2_PROSE_PATTERNS
+
+# TM3: Unsafe Defaults — overly permissive default settings
+TM3_CODE_PATTERNS = [
+    # TLS/SSL verification disabled
+    (r"verify\s*=\s*False", 0.75),
+    (r"VERIFY_SSL\s*=\s*False", 0.8),
+    (r"(?:ssl|tls)[_.]?verify\s*=\s*(?:False|false|0|off|no|disable)", 0.8),
+    (r"(?:REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE)\s*=\s*['\"]['\"]", 0.75),
+    (r"NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*['\"]?0['\"]?", 0.8),
+    # Authentication disabled
+    (r"(?:auth|authentication|authorization)\s*=\s*(?:None|False|false|disabled?|off|no)", 0.75),
+    (r"(?:require[_-]?auth|auth[_-]?required|check[_-]?auth)\s*=\s*(?:False|false|0|no|off)", 0.8),
+    (r"(?:allow[_-]?anonymous|anonymous[_-]?access)\s*=\s*(?:True|true|1|yes|on)", 0.75),
+    # Overly permissive CORS / access
+    (r"(?:CORS|cors)[^=]*=\s*['\"]?\*['\"]?", 0.65),
+    (r"(?:allow|access)[_-]?(?:origin|hosts?)\s*=\s*['\"]?\*['\"]?", 0.7),
+    # Unsafe permissions
+    (r"(?:mode|permission|umask)\s*=\s*(?:0?o?777|0?o?666)", 0.8),
+    (r"world[_-]?(?:readable|writable|executable)", 0.7),
+    # Debug/dev mode in production
+    (r"(?:debug|dev|development)[_-]?mode\s*=\s*(?:True|true|1|on|yes|enable)", 0.6),
+    (
+        r"(?:FLASK_ENV|NODE_ENV|RAILS_ENV|DJANGO_DEBUG)\s*=\s*['\"]?(?:development|debug|true|1)['\"]?",
+        0.6,
+    ),
+    # Disable security features
+    (
+        r"(?:disable|skip|ignore|bypass)[_-]?(?:security|auth|validation|sanitization|encoding|escaping)",
+        0.8,
+    ),
+    (r"(?:safe[_-]?mode|secure[_-]?mode|sandbox)\s*=\s*(?:False|false|0|off|no|disable)", 0.8),
+]
+TM3_PROSE_PATTERNS = [
+    (r"(?:allow|trust)\s+(?:all|any|every)\s+(?:origins?|hosts?|domains?|ips?)", 0.7),
+    # Natural language unsafe defaults
+    (r"(?:by\s+default|default\s+to)\s+(?:allow|accept|trust)\s+(?:all|any|everything)", 0.7),
+    (
+        r"(?:trust|accept|allow)\s+(?:all|any)\s+(?:input|connections?|certificates?|origins?)\s+(?:by\s+default)",
+        0.7,
+    ),
+]
+TM3_PATTERNS = TM3_CODE_PATTERNS + TM3_PROSE_PATTERNS
+
+# TM4: Privileged Kubernetes Workload — manifest/CLI primitives that grant
+# node/host takeover (the cluster-scale counterpart of a privileged container).
+# Only isolation-breaking signals are matched, so a normal `kubectl apply` or a
+# plain DaemonSet does not fire.
+TM4_PATTERNS = [
+    (r"privileged\s*:\s*true", 0.7),  # privileged container in a manifest
+    (r"hostPath\s*:", 0.55),  # host filesystem mount
+    (r"host(?:PID|Network|IPC)\s*:\s*true", 0.6),  # host namespace sharing
+    (r"kubectl\s+run\b[^\n]*--privileged", 0.7),  # privileged ad-hoc pod
+    (r"--set\b[^\n]*privileged\s*=\s*true", 0.6),  # helm privileged override
+]
+
+
+_SAFE_CONTAINER_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"docker\s+run\s+.*--rm", re.IGNORECASE),
+    re.compile(r"docker\s+run\s+.*-it", re.IGNORECASE),
+    re.compile(r"docker\s+(?:build|compose|pull|push)\b", re.IGNORECASE),
+    re.compile(r"podman\s+run\b", re.IGNORECASE),
+)
+
+# Standard Dockerfile RUN idioms that are best practice, not abuse
+_SAFE_DOCKERFILE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # apt cleanup: rm -rf /var/lib/apt/lists/*
+    re.compile(r"rm\s+-rf\s+/var/lib/apt/lists", re.IGNORECASE),
+    re.compile(r"rm\s+-rf\s+/var/cache/apt", re.IGNORECASE),
+    # Dockerfile user setup: chown -R user:group /path
+    re.compile(r"chown\s+-R\s+\w+:\w+\s+/", re.IGNORECASE),
+    # pip cache cleanup
+    re.compile(r"rm\s+-rf\s+/root/\.cache", re.IGNORECASE),
+)
+
+_SAFE_CACHE_CLEANUP_RE = re.compile(
+    r"\brm\s+-rf\s+(?P<quote>['\"]?)(?P<path>(?:\$?\{?HOME\}?|~)/\.cache/[^\s;&|'\"]+)(?P=quote)(?:\s*(?:$|[;&|]))",
+    re.IGNORECASE,
+)
+
+# Dockerfile context indicators (nearby keywords that signal Dockerfile content)
+_DOCKERFILE_CONTEXT_RE = re.compile(
+    r"\b(?:FROM|RUN|WORKDIR|COPY|ADD|ENV|EXPOSE|ENTRYPOINT|CMD|USER|HEALTHCHECK|ARG)\s",
+)
+
+
+def _is_safe_container_command(text: str) -> bool:
+    """Return True for standard Docker/Podman commands that are not parameter abuse."""
+    return any(p.search(text) for p in _SAFE_CONTAINER_PATTERNS)
+
+
+def _is_safe_dockerfile_idiom(context: str, matched_text: str) -> bool:
+    """Return True for standard Dockerfile cleanup/setup patterns."""
+    if not _DOCKERFILE_CONTEXT_RE.search(context):
+        return False
+    return any(p.search(matched_text) or p.search(context) for p in _SAFE_DOCKERFILE_PATTERNS)
+
+
+def _is_safe_cache_cleanup(matched_text: str) -> bool:
+    """Return True for scoped cleanup of a tool-owned user cache path."""
+    match = _SAFE_CACHE_CLEANUP_RE.fullmatch(matched_text)
+    if not match:
+        return False
+    parts = match.group("path").split("/")
+    lowered_parts = [part.lower() for part in parts]
+    cache_index = lowered_parts.index(".cache")
+    cache_parts = parts[cache_index + 1 :]
+    return bool(cache_parts) and not any(
+        part in ("", ".", "..") or "*" in part for part in cache_parts
+    )
+
+
+@dataclass(frozen=True)
+class _ShellToken:
+    text: str
+    root_glob: bool
+    glob_projection: str
+    has_quoted_content: bool
+    brace_expansion: bool
+    leading_tilde_unquoted: bool
+
+
+@dataclass(frozen=True)
+class _ShellCommandWord:
+    text: str
+    end: int
+    dynamic: bool
+    limited: bool = False
+
+
+@dataclass(frozen=True)
+class _ParameterExpansionEnd:
+    """Cached parameter endpoint plus its enclosing-quote transition."""
+
+    end: int | None
+    inherited_quote_closed: bool = False
+
+
+@dataclass
+class _ShellDelimiterFrame:
+    """One iterative shell-expansion delimiter frame."""
+
+    kind: str
+    start: int | None
+    quote: str | None = None
+    ansi_c_quote: bool = False
+    word_started: bool = False
+    inherited_double_quote: bool = False
+    inherited_quote_closed: bool = False
+    pending_case_clauses: int = 0
+    open_case_clauses: int = 0
+
+
+def _is_shell_command_word_start(content: str, start: int) -> bool:
+    if start == 0:
+        return True
+    previous = content[start - 1]
+    if previous.isspace() or previous in ";|&()<>/":
+        return True
+    if previous in "'\"`":
+        before_quote = start - 2
+        return (
+            before_quote < 0
+            or content[before_quote].isspace()
+            or content[before_quote] in ";|&()<>{}/"
+        )
+    return False
+
+
+def _has_quoted_assignment_prefix(content: str, start: int) -> bool:
+    """Return whether a quoted candidate starts with a shell assignment name."""
+    if start >= len(content) or content[start] not in "'\"":
+        return False
+    cursor = start + 1
+    if cursor >= len(content) or not (content[cursor].isalpha() or content[cursor] == "_"):
+        return False
+    cursor += 1
+    while cursor < len(content) and (content[cursor].isalnum() or content[cursor] == "_"):
+        cursor += 1
+    return cursor < len(content) and content[cursor] == "="
+
+
+def _decode_ansi_c_escape(content: str, start: int, limit: int) -> tuple[str, int]:
+    """Decode one bounded Bash ANSI-C escape without evaluating shell input."""
+    if start + 1 >= limit:
+        return "\\", start + 1
+    escaped = content[start + 1]
+    simple = {
+        "a": "\a",
+        "b": "\b",
+        "e": "\x1b",
+        "E": "\x1b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+        "\\": "\\",
+        "'": "'",
+        '"': '"',
+        "?": "?",
+    }
+    if escaped in simple:
+        return simple[escaped], start + 2
+    if escaped in "xXuU":
+        maximum_digits = {"x": 2, "X": 2, "u": 4, "U": 8}[escaped]
+        cursor = start + 2
+        while (
+            cursor < limit
+            and cursor < start + 2 + maximum_digits
+            and content[cursor] in "0123456789abcdefABCDEF"
+        ):
+            cursor += 1
+        if cursor > start + 2:
+            value = int(content[start + 2 : cursor], 16)
+            if value <= sys.maxunicode:
+                return chr(value), cursor
+    if escaped in "01234567":
+        cursor = start + 1
+        while cursor < limit and cursor < start + 4 and content[cursor] in "01234567":
+            cursor += 1
+        return chr(int(content[start + 1 : cursor], 8)), cursor
+    if escaped == "c" and start + 2 < limit:
+        return chr(ord(content[start + 2].upper()) ^ 0x40), start + 3
+    return "\\" + escaped, start + 2
+
+
+def _skip_ansi_c_quote_tail(content: str, start: int, limit: int) -> int | None:
+    """Find the real closing quote after a NUL, skipping escaped quotes."""
+    cursor = start
+    while cursor < limit:
+        if content[cursor] == "\\" and cursor + 1 < limit:
+            cursor += 2
+            continue
+        if content[cursor] == "'":
+            return cursor
+        cursor += 1
+    return None
+
+
+def _skip_shell_delimited_expansion(
+    content: str,
+    start: int,
+    limit: int,
+    root_kind: str,
+    check_runtime: Callable[[], None] | None,
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] | None,
+    substitution_end_cache: dict[int, int | None] | None,
+    backtick_end_cache: dict[int, int | None] | None,
+    root_inherited_double_quote: bool = False,
+    inherited_quote_closed: list[bool] | None = None,
+) -> int | None:
+    """Skip nested shell delimiters iteratively and cache every typed endpoint."""
+    opener_width = 1 if root_kind == "backtick" else 2
+    frames = [
+        _ShellDelimiterFrame(
+            root_kind,
+            start,
+            inherited_double_quote=root_inherited_double_quote,
+        )
+    ]
+    cursor = start + opener_width
+    next_runtime_check = ((cursor + 4095) // 4096) * 4096
+
+    def cache_frame(frame: _ShellDelimiterFrame, end: int | None) -> None:
+        if frame.start is None:
+            return
+        if frame.kind == "parameter" and parameter_end_cache is not None:
+            parameter_end_cache[frame.start] = _ParameterExpansionEnd(
+                end,
+                frame.inherited_quote_closed,
+            )
+        elif frame.kind == "command" and substitution_end_cache is not None:
+            substitution_end_cache[frame.start] = end
+        elif frame.kind == "backtick" and backtick_end_cache is not None:
+            backtick_end_cache[frame.start] = end
+
+    def cache_failure() -> None:
+        for frame in frames:
+            cache_frame(frame, None)
+
+    def close_frame(end: int) -> int | None:
+        frame = frames.pop()
+        cache_frame(frame, end)
+        return end if not frames else None
+
+    def push(kind: str, frame_start: int | None, width: int) -> None:
+        nonlocal cursor
+        parent = frames[-1]
+        if kind in {"parameter", "command", "backtick"} and parent.kind in {
+            "command",
+            "paren",
+        }:
+            parent.word_started = True
+        inherited_double_quote = kind in {"parameter", "brace"} and (
+            parent.quote == '"'
+            or (
+                parent.inherited_double_quote
+                and parent.kind in {"parameter", "brace"}
+                and parent.quote is None
+            )
+        )
+        frames.append(
+            _ShellDelimiterFrame(
+                kind,
+                frame_start,
+                inherited_double_quote=inherited_double_quote,
+            )
+        )
+        cursor += width
+
+    def at_shell_keyword(keyword: str) -> bool:
+        end = cursor + len(keyword)
+        if end > limit or content[cursor:end] != keyword:
+            return False
+        before = content[cursor - 1] if cursor else " "
+        after = content[end] if end < limit else " "
+        delimiters = ";|&(){}<>! \t\r\n"
+        return before in delimiters and after in delimiters
+
+    while cursor < limit:
+        if check_runtime is not None and cursor >= next_runtime_check:
+            check_runtime()
+            next_runtime_check = cursor + 4096
+        frame = frames[-1]
+        character = content[cursor]
+
+        if frame.kind == "backtick":
+            if character == "\\" and cursor + 1 < limit:
+                cursor += 2
+                continue
+            if character == "`":
+                endpoint = close_frame(cursor + 1)
+                cursor += 1
+                if endpoint is not None:
+                    return endpoint
+                continue
+            cursor += 1
+            continue
+
+        if frame.quote is not None:
+            if frame.quote == '"' and content.startswith("${", cursor):
+                push("parameter", cursor, 2)
+                continue
+            if frame.quote == '"' and content.startswith("$(", cursor):
+                push("command", cursor, 2)
+                continue
+            if frame.quote == '"' and character == "`":
+                push("backtick", cursor, 1)
+                continue
+            if character == frame.quote:
+                frame.quote = None
+                frame.ansi_c_quote = False
+            elif character == "\\" and frame.ansi_c_quote:
+                _, cursor = _decode_ansi_c_escape(content, cursor, limit)
+                continue
+            elif character == "\\" and frame.quote == '"' and cursor + 1 < limit:
+                cursor += 2
+                continue
+            cursor += 1
+            continue
+
+        # Ordinary words cannot change the delimiter stack. Consume them in
+        # one bounded match rather than testing each character for every shell
+        # opener, quote, and keyword. Nested static-evaluator windows otherwise
+        # repeat those Python-level checks hundreds of thousands of times.
+        word = _SHELL_DELIMITER_WORD_RE.match(content, cursor, min(limit, cursor + 4096))
+        if word is not None:
+            if frame.kind in {"command", "paren"}:
+                if at_shell_keyword("case"):
+                    frame.pending_case_clauses += 1
+                elif frame.pending_case_clauses and at_shell_keyword("in"):
+                    frame.pending_case_clauses -= 1
+                    frame.open_case_clauses += 1
+                elif frame.open_case_clauses and at_shell_keyword("esac"):
+                    frame.open_case_clauses -= 1
+                frame.word_started = True
+            cursor = word.end()
+            continue
+
+        if content.startswith("${", cursor):
+            push("parameter", cursor, 2)
+            continue
+        if content.startswith("$(", cursor):
+            push("command", cursor, 2)
+            continue
+        if character in "<>" and cursor + 1 < limit and content[cursor + 1] == "(":
+            push("command", cursor, 2)
+            continue
+        if character == "`":
+            push("backtick", cursor, 1)
+            continue
+        if (
+            character == "$"
+            and cursor + 1 < limit
+            and content[cursor + 1] in "'\""
+            and not (
+                frame.inherited_double_quote
+                and frame.kind in {"parameter", "brace"}
+                and content[cursor + 1] in "'\""
+            )
+        ):
+            frame.quote = content[cursor + 1]
+            frame.ansi_c_quote = frame.quote == "'"
+            if frame.kind in {"command", "paren"}:
+                frame.word_started = True
+            cursor += 2
+            continue
+        if (
+            character == '"'
+            and frame.inherited_double_quote
+            and frame.kind in {"parameter", "brace"}
+        ):
+            # In ksh, $" inside a parameter expansion inherited from a
+            # double-quoted word is a literal '$' followed by the closing
+            # quote.  Do not mistake that quote for the start of a new
+            # locale-translation string, or the scanner can hide commands
+            # that follow the parameter expansion.
+            frame.inherited_double_quote = False
+            frame.inherited_quote_closed = True
+            if inherited_quote_closed is not None:
+                inherited_quote_closed[0] = True
+            for parent in reversed(frames[:-1]):
+                if parent.kind in {"parameter", "brace"}:
+                    parent.inherited_double_quote = False
+                    parent.inherited_quote_closed = True
+                if parent.quote == '"':
+                    parent.quote = None
+                    parent.ansi_c_quote = False
+                    break
+            cursor += 1
+            continue
+        if character in "'\"" and not (
+            character == "'"
+            and frame.inherited_double_quote
+            and frame.kind in {"parameter", "brace"}
+        ):
+            frame.quote = character
+            frame.ansi_c_quote = False
+            if frame.kind in {"command", "paren"}:
+                frame.word_started = True
+            cursor += 1
+            continue
+        if character == "\\" and cursor + 1 < limit:
+            if frame.kind in {"command", "paren"}:
+                frame.word_started = True
+            cursor += 2
+            continue
+
+        if frame.kind in {"parameter", "brace"}:
+            if character == "{":
+                push("brace", None, 1)
+                continue
+            if character == "}":
+                endpoint = close_frame(cursor + 1)
+                cursor += 1
+                if endpoint is not None:
+                    return endpoint
+                continue
+            cursor += 1
+            continue
+
+        if character == "(":
+            push("paren", None, 1)
+            continue
+        if character == ")":
+            if frame.open_case_clauses:
+                # ``)`` terminates a case pattern, not the surrounding command
+                # substitution. The corresponding ``esac`` above releases the
+                # real substitution closer without requiring a full shell AST.
+                frame.word_started = False
+                cursor += 1
+                continue
+            endpoint = close_frame(cursor + 1)
+            cursor += 1
+            if endpoint is not None:
+                return endpoint
+            continue
+        if character == "#" and not frame.word_started:
+            newline = content.find("\n", cursor + 1, limit)
+            if newline < 0:
+                cache_failure()
+                return None
+            cursor = newline
+            continue
+        if character.isspace() or character in ";|&":
+            frame.word_started = False
+        else:
+            frame.word_started = True
+        cursor += 1
+
+    cache_failure()
+    return None
+
+
+def _skip_parameter_expansion(
+    content: str,
+    start: int,
+    limit: int,
+    check_runtime: Callable[[], None] | None = None,
+    end_cache: dict[int, _ParameterExpansionEnd] | None = None,
+    substitution_end_cache: dict[int, int | None] | None = None,
+    backtick_end_cache: dict[int, int | None] | None = None,
+    inherited_double_quote: bool = False,
+    inherited_quote_closed: list[bool] | None = None,
+) -> int | None:
+    if end_cache is not None and start in end_cache:
+        cached = end_cache[start]
+        if inherited_quote_closed is not None:
+            inherited_quote_closed[0] = cached.inherited_quote_closed
+        return cached.end
+    if start + 1 >= limit or content[start] != "$":
+        return None
+    next_character = content[start + 1]
+    if next_character == "{":
+        return _skip_shell_delimited_expansion(
+            content,
+            start,
+            limit,
+            "parameter",
+            check_runtime,
+            end_cache,
+            substitution_end_cache,
+            backtick_end_cache,
+            inherited_double_quote,
+            inherited_quote_closed,
+        )
+    if next_character.isalpha() or next_character == "_":
+        cursor = start + 2
+        while cursor < limit and (content[cursor].isalnum() or content[cursor] == "_"):
+            cursor += 1
+        return cursor
+    if next_character.isdigit() or next_character in "*@#?$!-":
+        return start + 2
+    return None
+
+
+def _is_ifs_expansion(content: str, start: int, end: int) -> bool:
+    return content[start:end] in {"$IFS", "${IFS}"}
+
+
+def _consume_printf_invocation(
+    next_word: Callable[[], str | None],
+    *,
+    runtime_command_context: bool = False,
+) -> tuple[bool, bool]:
+    """Resolve an allowlisted invocation; return ``(recognized, exact)``."""
+    pending: str | None = None
+    for _ in range(4):
+        word = pending if pending is not None else next_word()
+        pending = None
+        if word is None:
+            return False, False
+        if _DYNAMIC_SHELL_WORD_SENTINEL in word:
+            # A command substitution or complex expansion participates in the
+            # invocation or wrapper word. Its basename is not deterministic.
+            return True, False
+        command = word.casefold().rsplit("/", 1)[-1]
+        if _RUNTIME_SHELL_PARAMETER_SENTINEL in word and command in {
+            "printf",
+            "command",
+            "builtin",
+            "env",
+        }:
+            # A known basename does not make a runtime-selected executable exact.
+            return True, False
+        if _RUNTIME_SHELL_PARAMETER_SENTINEL in command:
+            # An opaque basename can still participate in printf reconstruction.
+            # Require bounded invocation evidence or destructive outer operands,
+            # rather than reclassifying ordinary runtime-parameter notation.
+            if runtime_command_context:
+                return True, False
+            characters = 0
+            for _ in range(_PRINTF_STATIC_ARGUMENTS):
+                operand = next_word()
+                if operand is None:
+                    break
+                characters += len(operand)
+                if characters > _PRINTF_STATIC_CHARS:
+                    return True, False
+                if (
+                    operand.casefold().rsplit("/", 1)[-1] == "printf"
+                    or _PRINTF_FORMAT_CONVERSION_RE.search(operand) is not None
+                ):
+                    return True, False
+            else:
+                return True, False
+            return False, False
+        if command == "printf":
+            return True, True
+        if command == "command":
+            while True:
+                word = next_word()
+                if word == "-p":
+                    continue
+                if word == "--":
+                    word = next_word()
+                break
+            if word is None or word.startswith("-"):
+                return False, False
+            pending = word
+            continue
+        if command == "builtin":
+            word = next_word()
+            if word == "--":
+                word = next_word()
+            if word is None or word.startswith("-"):
+                return False, False
+            pending = word
+            continue
+        if command != "env":
+            return False, False
+        while (word := next_word()) is not None:
+            if word == "--":
+                pending = next_word()
+                break
+            # ``env`` assignment values may contain quoted newlines and other
+            # characters. Only the portable name and first ``=`` determine
+            # whether this word is an assignment operand.
+            if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", word) is not None:
+                continue
+            if word in {"-i", "--ignore-environment"}:
+                continue
+            if word in {"-u", "--unset", "-C", "--chdir"}:
+                if next_word() is None:
+                    return True, False
+                continue
+            if re.fullmatch(r"(?:--unset|--chdir)=.+", word) is not None:
+                continue
+            if word.startswith("-"):
+                # Preserve the existing fail-closed contract for unsupported
+                # env options even though the final command cannot be resolved.
+                return True, False
+            pending = word
+            break
+        if pending is None:
+            return False, False
+    # The allowlisted wrapper chain exceeded the deterministic depth budget.
+    # Treat it as recognized but inexact so callers record a coverage gap
+    # instead of silently declaring a potentially reconstructed command safe.
+    return True, False
+
+
+def _printf_invocation_arguments(
+    inner: str,
+    *,
+    runtime_command_context: bool = False,
+    check_runtime: Callable[[], None] | None = None,
+) -> tuple[bool, list[str]]:
+    """Parse direct or allowlisted wrapper invocations of shell ``printf``."""
+    runtime_check = check_runtime or (lambda: None)
+
+    cursor = 0
+    limited = False
+
+    def next_word() -> str | None:
+        nonlocal cursor, limited
+        word, cursor, word_limited = _next_shell_invocation_word(
+            inner,
+            cursor,
+            runtime_check,
+        )
+        limited = limited or word_limited or (word is None and cursor < len(inner))
+        return word
+
+    recognized, exact = _consume_printf_invocation(
+        next_word, runtime_command_context=runtime_command_context
+    )
+    if not recognized or not exact or limited:
+        return recognized, []
+
+    arguments: list[str] = []
+    while cursor < len(inner):
+        word = next_word()
+        if word is None:
+            return (True, []) if limited or cursor < len(inner) else (True, arguments)
+        arguments.append(word)
+    return True, arguments
+
+
+def _is_value_parameter_expansion(content: str, start: int, end: int) -> bool:
+    """Return whether a braced expansion and its nested expansions substitute only values."""
+    expansion = content[start:end]
+    if any(marker in expansion for marker in _EXECUTABLE_EXPANSION_MARKERS):
+        return False
+    return all(
+        _VALUE_PARAMETER_EXPANSION_HEAD_RE.match(expansion, nested.start()) is not None
+        for nested in _VALUE_PARAMETER_EXPANSION_START_RE.finditer(expansion)
+    )
+
+
+def _invocation_expansion_marker(content: str, start: int, end: int) -> str:
+    """Distinguish runtime-only parameters from possible command reconstruction."""
+    if content.startswith("$(", start) or (
+        content.startswith("${", start) and not _is_value_parameter_expansion(content, start, end)
+    ):
+        # Other parameter expansions may contain nested command substitutions
+        # or evaluate a value as code.
+        return _DYNAMIC_SHELL_WORD_SENTINEL
+    # ``${NAME:-default}``, ``${ARR[@]}`` and similar forms select the same
+    # runtime value as ``$NAME`` and need the same printf invocation evidence.
+    return _RUNTIME_SHELL_PARAMETER_SENTINEL
+
+
+def _next_shell_invocation_word(
+    content: str,
+    start: int,
+    check_runtime: Callable[[], None],
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] | None = None,
+    substitution_end_cache: dict[int, int | None] | None = None,
+    backtick_end_cache: dict[int, int | None] | None = None,
+) -> tuple[str | None, int, bool]:
+    """Read one direct shell word without traversing nested substitutions."""
+    cursor = start
+    limit = len(content)
+    while cursor < limit:
+        if cursor % 4096 == 0:
+            check_runtime()
+        if content[cursor].isspace():
+            cursor += 1
+            continue
+        if content.startswith("\\\r\n", cursor):
+            cursor += 3
+            continue
+        if content.startswith("\\\n", cursor):
+            cursor += 2
+            continue
+        break
+    if cursor >= limit or content[cursor] in ");|&()<>":
+        return None, cursor, False
+
+    output: list[str] = []
+    quote: str | None = None
+    ansi_c_quote = False
+    word_started = False
+    unquoted_characters = 0
+    while cursor < limit:
+        if cursor % 4096 == 0:
+            check_runtime()
+        character = content[cursor]
+        if quote is not None:
+            if character == quote:
+                quote = None
+                ansi_c_quote = False
+            elif character == "\\" and ansi_c_quote:
+                decoded, cursor = _decode_ansi_c_escape(content, cursor, limit)
+                if "\x00" in decoded:
+                    closing_quote = _skip_ansi_c_quote_tail(content, cursor, limit)
+                    if closing_quote is None:
+                        return None, cursor, True
+                    cursor = closing_quote
+                    continue
+                output.append(decoded)
+                word_started = True
+                continue
+            elif quote == '"' and character == "\\" and cursor + 1 < limit:
+                escaped = content[cursor + 1]
+                if escaped == "\n":
+                    cursor += 2
+                    continue
+                if escaped == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                    cursor += 3
+                    continue
+                if escaped in '$`"\\':
+                    output.append(escaped)
+                else:
+                    output.extend(("\\", escaped))
+                cursor += 2
+                continue
+            elif quote == '"' and character == "$":
+                inherited_quote_closed = [False]
+                if cursor + 1 < limit and content[cursor + 1] == "(":
+                    parameter_end = _skip_command_substitution(
+                        content,
+                        cursor,
+                        limit,
+                        check_runtime,
+                        substitution_end_cache,
+                        parameter_end_cache,
+                        backtick_end_cache,
+                    )
+                else:
+                    parameter_end = _skip_parameter_expansion(
+                        content,
+                        cursor,
+                        limit,
+                        check_runtime,
+                        parameter_end_cache,
+                        substitution_end_cache,
+                        backtick_end_cache,
+                        True,
+                        inherited_quote_closed,
+                    )
+                if parameter_end is None:
+                    if cursor + 1 < limit and content[cursor + 1] in "({":
+                        return None, cursor, True
+                    output.append("$")
+                    word_started = True
+                    cursor += 1
+                    continue
+                output.append(_invocation_expansion_marker(content, cursor, parameter_end))
+                word_started = True
+                cursor = parameter_end
+                if inherited_quote_closed[0]:
+                    quote = None
+                    ansi_c_quote = False
+                continue
+            elif quote == '"' and character == "`":
+                substitution_end = _skip_backtick_substitution(
+                    content,
+                    cursor,
+                    limit,
+                    check_runtime,
+                    backtick_end_cache,
+                    parameter_end_cache,
+                    substitution_end_cache,
+                )
+                if substitution_end is None:
+                    return None, cursor, True
+                output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+                word_started = True
+                cursor = substitution_end
+                continue
+            else:
+                output.append(character)
+        elif character in "'\"":
+            quote = character
+            ansi_c_quote = False
+            word_started = True
+        elif character == "\\" and cursor + 1 < limit:
+            escaped = content[cursor + 1]
+            if escaped == "\n":
+                cursor += 2
+                continue
+            if escaped == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                cursor += 3
+                continue
+            output.append(escaped)
+            word_started = True
+            cursor += 2
+            continue
+        elif character == "$":
+            if cursor + 1 < limit and content[cursor + 1] in "'\"":
+                quote = content[cursor + 1]
+                ansi_c_quote = quote == "'"
+                word_started = True
+                cursor += 2
+                continue
+            if cursor + 1 < limit and content[cursor + 1] == "(":
+                parameter_end = _skip_command_substitution(
+                    content,
+                    cursor,
+                    limit,
+                    check_runtime,
+                    substitution_end_cache,
+                    parameter_end_cache,
+                    backtick_end_cache,
+                )
+            else:
+                parameter_end = _skip_parameter_expansion(
+                    content,
+                    cursor,
+                    limit,
+                    check_runtime,
+                    parameter_end_cache,
+                    substitution_end_cache,
+                    backtick_end_cache,
+                )
+            if parameter_end is None:
+                if cursor + 1 < limit and content[cursor + 1] in "({":
+                    return None, cursor, True
+                output.append("$")
+                word_started = True
+                cursor += 1
+                continue
+            # A simple runtime parameter does not invoke the printf evaluator.
+            output.append(_invocation_expansion_marker(content, cursor, parameter_end))
+            word_started = True
+            cursor = parameter_end
+            continue
+        elif character == "`":
+            substitution_end = _skip_backtick_substitution(
+                content,
+                cursor,
+                limit,
+                check_runtime,
+                backtick_end_cache,
+                parameter_end_cache,
+                substitution_end_cache,
+            )
+            if substitution_end is None:
+                return None, cursor, True
+            output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+            word_started = True
+            cursor = substitution_end
+            continue
+        elif character in "<>" and cursor + 1 < limit and content[cursor + 1] == "(":
+            substitution_end = _skip_command_substitution(
+                content,
+                cursor,
+                limit,
+                check_runtime,
+                substitution_end_cache,
+                parameter_end_cache,
+                backtick_end_cache,
+            )
+            if substitution_end is None:
+                return None, cursor, True
+            output.append(_DYNAMIC_SHELL_WORD_SENTINEL)
+            word_started = True
+            cursor = substitution_end
+            continue
+        elif character.isspace() or character in ";|&()<>":
+            break
+        elif character == "#" and not word_started:
+            return None, cursor, False
+        else:
+            output.append(character)
+            word_started = True
+            unquoted_characters += 1
+            if unquoted_characters > _SHELL_COMMAND_WORD_CHARS:
+                return None, cursor, True
+        cursor += 1
+    if quote is not None:
+        return None, cursor, True
+    return "".join(output) if word_started else None, cursor, False
+
+
+_PRINTF_HEX_ESCAPE_RE = re.compile(r"[0-9A-Fa-f]{1,2}")
+_PRINTF_OCTAL_ESCAPE_RE = re.compile(r"[0-7]{1,3}")
+_PRINTF_ESCAPE_SEQUENCES = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+}
+
+
+def _decode_printf_escapes(text: str) -> str | None:
+    """Decode bounded escapes as modeled by Bash builtin/coreutils ``printf``.
+
+    This intentionally models the Bash/GNU-coreutils escape subset used by the
+    static parser.  Extensions such as ``\\xHH``, ``\\e``/``\\E``, ``\\'`` and
+    ``\\"`` are not portable to a dash ``printf`` and are not a general POSIX
+    guarantee.  Unknown or trailing escapes make the substitution undecidable
+    and return ``None`` so the caller keeps its fail-closed behaviour.
+    """
+    output: list[str] = []
+    cursor = 0
+    while cursor < len(text):
+        character = text[cursor]
+        if character != "\\":
+            output.append(character)
+            cursor += 1
+            continue
+        if cursor + 1 >= len(text):
+            return None
+        escaped = text[cursor + 1]
+        simple = _PRINTF_ESCAPE_SEQUENCES.get(escaped)
+        if simple is not None:
+            output.append(simple)
+            cursor += 2
+            continue
+        if escaped == "x":
+            digits = _PRINTF_HEX_ESCAPE_RE.match(text, cursor + 2)
+            if digits is None:
+                return None
+            output.append(chr(int(digits.group(0), 16)))
+            cursor = digits.end()
+            continue
+        if escaped in "01234567":
+            digits = _PRINTF_OCTAL_ESCAPE_RE.match(text, cursor + 1)
+            if digits is None:
+                return None
+            value = int(digits.group(0), 8)
+            if value > 0o377:
+                return None
+            output.append(chr(value))
+            cursor = digits.end()
+            continue
+        return None
+    return "".join(output)
+
+
+def _bounded_printf_word(result: str) -> str | None:
+    """Return a decoded ``printf`` result only when it stays one inert word."""
+    if _PRINTF_SAFE_WORD_RE.fullmatch(result) is None:
+        return None
+    return result
+
+
+def _static_printf_substitution(
+    content: str,
+    start: int,
+    end: int,
+    *,
+    backtick: bool = False,
+) -> str | None:
+    """Evaluate a tiny, bounded subset of shell ``printf`` deterministically."""
+    inner_start = start + (1 if backtick else 2)
+    inner_end = end - 1
+    inner = content[inner_start:inner_end]
+    recognized, arguments = _printf_invocation_arguments(inner)
+    if (
+        not recognized
+        or len(inner) > _PRINTF_STATIC_CHARS
+        or re.search(r"[;|&<>\r\n]", inner) is not None
+    ):
+        return None
+    if arguments[:1] == ["--"]:
+        arguments = arguments[1:]
+    if not arguments or len(arguments) > _PRINTF_STATIC_ARGUMENTS + 1:
+        return None
+    format_word, *values = arguments
+    if _PRINTF_FORMAT_WORD_RE.fullmatch(format_word) is None or any(
+        _PRINTF_STATIC_WORD_RE.fullmatch(value) is None for value in values
+    ):
+        return None
+
+    segments: list[str | None] = []
+    literal: list[str] = []
+
+    def flush_literal() -> bool:
+        # POSIX ``printf`` decodes escapes in the format operand before any
+        # conversion runs, so decode each literal segment in place. Decoding
+        # after the conversion split keeps an escaped percent sign from
+        # re-entering conversion parsing.
+        text = "".join(literal)
+        literal.clear()
+        if "\\" in text:
+            decoded = _decode_printf_escapes(text)
+            if decoded is None:
+                return False
+            text = decoded
+        segments.append(text)
+        return True
+
+    cursor = 0
+    while cursor < len(format_word):
+        character = format_word[cursor]
+        if character != "%":
+            literal.append(character)
+            cursor += 1
+            continue
+        if cursor + 1 >= len(format_word) or format_word[cursor + 1] not in "s%":
+            return None
+        if literal and not flush_literal():
+            return None
+        conversion = format_word[cursor + 1]
+        segments.append(None if conversion == "s" else "%")
+        cursor += 2
+    if literal and not flush_literal():
+        return None
+
+    conversions = sum(segment is None for segment in segments)
+    if conversions == 0:
+        return _bounded_printf_word("".join(segments))
+    remaining = iter(values)
+    output: list[str] = []
+    cycles = max(1, (len(values) + conversions - 1) // conversions)
+    for _ in range(cycles):
+        for segment in segments:
+            output.append(next(remaining, "") if segment is None else segment)
+        if sum(len(piece) for piece in output) > 64:
+            return None
+    return _bounded_printf_word("".join(output))
+
+
+def _may_have_destructive_outer_operands(content: str) -> bool:
+    """Conservatively prove whether one view can contain destructive operands."""
+    target_evidence = (
+        any(marker in content for marker in "/~*?")
+        or _SHELL_ROOT_TARGET_ESCAPE_RE.search(content) is not None
+    )
+    option_evidence = (
+        _RECURSIVE_OPTION_SOURCE_RE.search(content) is not None
+        and _FORCE_OPTION_SOURCE_RE.search(content) is not None
+    ) or _has_constructed_recursive_force_option_source(content)
+    return target_evidence and option_evidence
+
+
+def _has_constructed_recursive_force_option_source(content: str) -> bool:
+    """Return whether a bounded option word can construct both ``r`` and ``f``."""
+    for hyphen in re.finditer(r"-(?=\S)", content):
+        fragment = content[hyphen.start() : hyphen.start() + 128]
+        command_substitution = fragment.startswith("-$(")
+        if command_substitution:
+            close = fragment.find(")")
+            if close >= 0:
+                fragment = fragment[: close + 1]
+        else:
+            boundary = re.search(r"[\s;|&]", fragment)
+            if boundary is not None:
+                fragment = fragment[: boundary.start()]
+        if not any(marker in fragment for marker in ("\\", "'", '"', "{", "}", "$(")):
+            continue
+        lowered = fragment.casefold()
+        if "r" in lowered and "f" in lowered:
+            return True
+    return False
+
+
+def _is_powershell_replace_value_context(
+    content: str,
+    start: int,
+    end: int,
+    inner: str,
+) -> bool:
+    """Recognize a bounded PowerShell ``-replace`` value statement."""
+    if (
+        _POWERSHELL_REPLACE_EXPRESSION_RE.search(inner) is None
+        or any(separator in inner for separator in ";|&\n")
+        or any(marker in inner for marker in ("$(", "`", "<(", ">("))
+    ):
+        return False
+
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    if line_end < 0:
+        line_end = len(content)
+    placeholder = "\ue003"
+    statement = (content[line_start:start] + placeholder + content[end:line_end]).strip()
+
+    if statement.startswith("|") and statement.endswith("|"):
+        cells = [cell.strip() for cell in statement[1:-1].split("|")]
+        value_cells = [cell for cell in cells if placeholder in cell]
+        if len(value_cells) != 1:
+            return False
+        statement = value_cells[0]
+    container = re.match(
+        r"(?:(?:>[ \t]*)+|(?:[-*+]|[0-9]+[.)]|#{1,6})[ \t]+)",
+        statement,
+    )
+    if container is not None:
+        statement = statement[container.end() :].strip()
+
+    # Raw Markdown inline code retains its delimiter; the normalized Markdown
+    # view blanks it. Support the explicit documentary prefix in both views
+    # without trusting a fenced-code language label as a security boundary.
+    prefix = re.match(
+        r"(?:The[ \t]+following[ \t]+is[ \t]+(?:a[ \t]+)?)?"
+        r"PowerShell(?:[ \t]+(?:example|snippet|command))?[ \t]*:[ \t]*",
+        statement,
+        re.IGNORECASE,
+    )
+    if prefix is not None:
+        statement = statement[prefix.end() :].strip()
+        if statement.endswith("."):
+            statement = statement[:-1].rstrip()
+    inline = re.fullmatch(r"(?P<ticks>`+)(?P<body>.*)(?P=ticks)", statement)
+    if inline is not None:
+        statement = inline.group("body").strip()
+
+    value = f'"{placeholder}"'
+    shapes = (
+        rf"Write-Output[ \t]+(?:{re.escape(value)}|\([ \t]*{re.escape(value)}[ \t]*\))",
+        rf"Write-Host(?:[ \t]+-NoNewline)?[ \t]+"
+        rf"(?:{re.escape(value)}|\([ \t]*{re.escape(value)}[ \t]*\))",
+        rf"{re.escape(value)}[ \t]*\|[ \t]*Write-Output",
+        rf"\$[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*{re.escape(value)}",
+    )
+    return any(re.fullmatch(shape, statement, re.IGNORECASE) is not None for shape in shapes)
+
+
+def _is_printf_substitution(
+    content: str,
+    start: int,
+    end: int,
+    *,
+    backtick: bool = False,
+    check_command_context: bool = True,
+    check_runtime: Callable[[], None] | None = None,
+) -> bool:
+    """Return whether a substitution invokes the bounded ``printf`` evaluator."""
+    runtime_check = check_runtime or (lambda: None)
+    inner_start = start + (1 if backtick else 2)
+    inner_end = end - 1
+    inner = content[inner_start:inner_end]
+    if not backtick and _is_powershell_replace_value_context(content, start, end, inner):
+        return False
+    recognized, _ = _printf_invocation_arguments(inner, check_runtime=runtime_check)
+    if recognized or not check_command_context:
+        return recognized
+    if "$" not in inner:
+        return False
+    command_start, body_start = start, end
+    if start > 0 and content[start - 1] == '"' and end < len(content) and content[end] == '"':
+        command_start -= 1
+        body_start += 1
+    tail = content[body_start : body_start + _ROOT_GLOB_COMMAND_CHARS]
+    if "\\" not in tail and ("-" not in tail or not any(marker in tail for marker in "/~*?")):
+        # Without option and target characters the bounded tokenizer cannot
+        # produce a destructive root command. Keep repeated parameter notation
+        # cheap; escapes still require tokenization because they can encode both.
+        return False
+    if (
+        not any(marker in tail for marker in ("\\", "'", '"', "{", "}"))
+        and "printf" not in tail.casefold()
+        and (
+            _RECURSIVE_OPTION_SOURCE_RE.search(tail) is None
+            or _FORCE_OPTION_SOURCE_RE.search(tail) is None
+        )
+    ):
+        # Plain options must contain recursive and force spelling in the source.
+        # Quoting, escapes, braces, or printf can construct those spellings, so
+        # keep those cases on the full tokenizer path.
+        return False
+    possible_runtime, _ = _printf_invocation_arguments(
+        inner,
+        runtime_command_context=True,
+        check_runtime=runtime_check,
+    )
+    if not possible_runtime:
+        return False
+    tokens, _, exhausted = _bounded_shell_tokens(
+        content,
+        command_start,
+        body_start,
+        check_runtime=runtime_check,
+    )
+    return (
+        exhausted
+        or _has_unsupported_brace_expansion(tokens)
+        or _has_destructive_root_glob(tokens)
+        or _has_destructive_root_path(tokens)
+    )
+
+
+def _skip_backtick_substitution(
+    content: str,
+    start: int,
+    limit: int,
+    check_runtime: Callable[[], None] | None = None,
+    end_cache: dict[int, int | None] | None = None,
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] | None = None,
+    substitution_end_cache: dict[int, int | None] | None = None,
+) -> int | None:
+    if end_cache is not None and start in end_cache:
+        return end_cache[start]
+    return _skip_shell_delimited_expansion(
+        content,
+        start,
+        limit,
+        "backtick",
+        check_runtime,
+        parameter_end_cache,
+        substitution_end_cache,
+        end_cache,
+    )
+
+
+def _previous_word_end(content: str, start: int) -> int | None:
+    """Return where the previous word in this clause ends, or ``None`` at a clause start."""
+    cursor = start
+    while cursor > 0 and content[cursor - 1] in " \t":
+        cursor -= 1
+    if cursor == 0 or content[cursor - 1] in _SHELL_CLAUSE_BOUNDARY_CHARACTERS:
+        return None
+    return cursor
+
+
+def _is_assignment_word(content: str, start: int) -> bool:
+    """Return whether ``start`` begins a prefix assignment word or its quoted value."""
+    word_start = start
+    # The exhaustion sweep already skips the checks for a quote after ``=``.
+    # Recognizing it here keeps the parser consistent for any caller and avoids
+    # evaluating printf reconstruction whose result would be discarded.
+    if 0 < start < len(content) and content[start] in "'\"" and content[start - 1] == "=":
+        word_start = start - 1
+        if word_start > 0 and content[word_start - 1] == "+":
+            word_start -= 1
+        while word_start > 0 and content[word_start - 1] in _SHELL_ASSIGNMENT_NAME_CHARACTERS:
+            word_start -= 1
+    prefix = _SHELL_ASSIGNMENT_PREFIX_RE.match(content, word_start)
+    if prefix is None or (word_start != start and prefix.end() != start):
+        return False
+    # The shell recognizes assignments only before the command name. After
+    # ``alias``, ``echo`` or a path prefix, ``NAME=value`` is an ordinary word.
+    previous_end = _previous_word_end(content, word_start)
+    if previous_end is None:
+        return True
+    if previous_end == word_start:
+        return False
+    previous_start = previous_end
+    while (
+        previous_start > 0
+        and content[previous_start - 1] not in " \t" + _SHELL_CLAUSE_BOUNDARY_CHARACTERS
+    ):
+        previous_start -= 1
+    return (
+        content[previous_start:previous_end] in _SHELL_ASSIGNMENT_PREFIX_WORDS
+        and _previous_word_end(content, previous_start) is None
+    )
+
+
+def _parse_shell_command_word(
+    content: str,
+    start: int,
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] | None = None,
+    substitution_end_cache: dict[int, int | None] | None = None,
+    backtick_end_cache: dict[int, int | None] | None = None,
+    *,
+    check_runtime: Callable[[], None] | None = None,
+    owned_word_positions: set[int] | None = None,
+    enclosing_delimiter: str | None = None,
+) -> _ShellCommandWord | None:
+    runtime_check = check_runtime or (lambda: None)
+    # The shell recognizes ``NAME=value`` before expansion and never runs the
+    # value as the command name. Its substitutions keep their own candidate
+    # positions, and a later ``$NAME`` command word is still checked, so only
+    # this word's printf reconstruction check is skipped.
+    assignment = _is_assignment_word(content, start)
+
+    def reconstructs_command(
+        substitution_start: int, substitution_end: int, *, backtick: bool = False
+    ) -> bool:
+        return not assignment and _is_printf_substitution(
+            content,
+            substitution_start,
+            substitution_end,
+            backtick=backtick,
+            check_runtime=runtime_check,
+        )
+
+    output: list[str] = []
+    wrapper_quote = enclosing_delimiter or (
+        _command_wrapper_quote(content, start) if content[start] in "$`" else None
+    )
+    quote: str | None = None
+    ansi_c_quote = False
+    dynamic = False
+    limited = False
+    unquoted_characters = 0
+    cursor = start
+    limit = len(content)
+    while cursor < limit:
+        if cursor > start and (cursor - start) % 4096 == 0:
+            runtime_check()
+        character = content[cursor]
+        if quote is not None:
+            if character == quote:
+                if owned_word_positions is not None:
+                    owned_word_positions.add(cursor)
+                quote = None
+                ansi_c_quote = False
+            elif character == "\\" and ansi_c_quote:
+                decoded, cursor = _decode_ansi_c_escape(content, cursor, limit)
+                if "\x00" in decoded:
+                    closing_quote = _skip_ansi_c_quote_tail(content, cursor, limit)
+                    if closing_quote is None:
+                        return None
+                    cursor = closing_quote
+                    continue
+                output.append(decoded)
+                continue
+            elif quote == '"' and character == "$" and cursor + 1 < limit:
+                inherited_quote_closed = [False]
+                if content[cursor + 1] == "(":
+                    substitution_end = _skip_command_substitution(
+                        content,
+                        cursor,
+                        limit,
+                        runtime_check,
+                        end_cache=substitution_end_cache,
+                        parameter_end_cache=parameter_end_cache,
+                        backtick_end_cache=backtick_end_cache,
+                    )
+                    if substitution_end is None:
+                        return None
+                    static_value = _static_printf_substitution(
+                        content,
+                        cursor,
+                        substitution_end,
+                    )
+                    if static_value is None:
+                        output.append("$()")
+                        dynamic = True
+                        limited = limited or reconstructs_command(cursor, substitution_end)
+                    else:
+                        output.append(static_value)
+                    cursor = substitution_end
+                    continue
+                parameter_end = _skip_parameter_expansion(
+                    content,
+                    cursor,
+                    limit,
+                    runtime_check,
+                    end_cache=parameter_end_cache,
+                    substitution_end_cache=substitution_end_cache,
+                    backtick_end_cache=backtick_end_cache,
+                    inherited_double_quote=True,
+                    inherited_quote_closed=inherited_quote_closed,
+                )
+                if parameter_end is not None:
+                    output.append("$PARAM")
+                    dynamic = True
+                    cursor = parameter_end
+                    if inherited_quote_closed[0]:
+                        quote = None
+                        ansi_c_quote = False
+                    continue
+            elif quote == '"' and character == "`":
+                substitution_end = _skip_backtick_substitution(
+                    content,
+                    cursor,
+                    limit,
+                    runtime_check,
+                    end_cache=backtick_end_cache,
+                    parameter_end_cache=parameter_end_cache,
+                    substitution_end_cache=substitution_end_cache,
+                )
+                if substitution_end is None:
+                    return None
+                static_value = _static_printf_substitution(
+                    content,
+                    cursor,
+                    substitution_end,
+                    backtick=True,
+                )
+                if static_value is None:
+                    output.append("$()")
+                    dynamic = True
+                    limited = limited or reconstructs_command(
+                        cursor, substitution_end, backtick=True
+                    )
+                else:
+                    output.append(static_value)
+                cursor = substitution_end
+                continue
+            elif character == "\\" and quote == '"' and cursor + 1 < limit:
+                escaped = content[cursor + 1]
+                if escaped == "\n":
+                    cursor += 2
+                    continue
+                if escaped == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                    cursor += 3
+                    continue
+                if escaped in '$`"\\':
+                    output.append(escaped)
+                else:
+                    output.extend(("\\", escaped))
+                cursor += 2
+                continue
+            else:
+                output.append(character)
+        elif character == "$" and cursor + 1 < limit and content[cursor + 1] in "'\"":
+            quote = content[cursor + 1]
+            ansi_c_quote = quote == "'"
+            cursor += 2
+            continue
+        elif character == "$" and cursor + 1 < limit and content[cursor + 1] == "(":
+            substitution_end = _skip_command_substitution(
+                content,
+                cursor,
+                limit,
+                runtime_check,
+                end_cache=substitution_end_cache,
+                parameter_end_cache=parameter_end_cache,
+                backtick_end_cache=backtick_end_cache,
+            )
+            if substitution_end is None:
+                return None
+            static_value = _static_printf_substitution(content, cursor, substitution_end)
+            if static_value is None:
+                output.append("$()")
+                dynamic = True
+                limited = limited or reconstructs_command(cursor, substitution_end)
+            else:
+                output.append(static_value)
+            cursor = substitution_end
+            continue
+        elif character == "$":
+            parameter_end = _skip_parameter_expansion(
+                content,
+                cursor,
+                limit,
+                runtime_check,
+                end_cache=parameter_end_cache,
+                substitution_end_cache=substitution_end_cache,
+                backtick_end_cache=backtick_end_cache,
+            )
+            if parameter_end is not None:
+                if _is_ifs_expansion(content, cursor, parameter_end):
+                    cursor = parameter_end
+                    break
+                output.append("$PARAM")
+                dynamic = True
+                cursor = parameter_end
+                continue
+        elif character == "`":
+            if enclosing_delimiter == "`":
+                # The enclosing substitution ends here; this is not an opener.
+                if owned_word_positions is not None:
+                    owned_word_positions.add(cursor)
+                break
+            substitution_end = _skip_backtick_substitution(
+                content,
+                cursor,
+                limit,
+                runtime_check,
+                end_cache=backtick_end_cache,
+                parameter_end_cache=parameter_end_cache,
+                substitution_end_cache=substitution_end_cache,
+            )
+            if substitution_end is None:
+                return None
+            static_value = _static_printf_substitution(
+                content,
+                cursor,
+                substitution_end,
+                backtick=True,
+            )
+            if static_value is None:
+                output.append("$()")
+                dynamic = True
+                limited = limited or reconstructs_command(cursor, substitution_end, backtick=True)
+            else:
+                output.append(static_value)
+            cursor = substitution_end
+            continue
+        elif character in "'\"":
+            if character == wrapper_quote:
+                break
+            quote = character
+        elif character == "\\" and cursor + 1 < limit:
+            if content[cursor + 1] == "\n":
+                cursor += 2
+                continue
+            if content[cursor + 1] == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                cursor += 3
+                continue
+            cursor += 1
+            output.append(content[cursor])
+        elif character.isspace() or character in ";|&()<>":
+            break
+        else:
+            output.append(character)
+            # Quoted spans have already been consumed in full. Their decoded
+            # length must not exhaust the budget for the following literal
+            # suffix, which can resolve the candidate as an ordinary word.
+            unquoted_characters += 1
+            if unquoted_characters > _SHELL_COMMAND_WORD_CHARS:
+                return _ShellCommandWord("".join(output), cursor, dynamic, limited=True)
+        cursor += 1
+    if quote is not None:
+        return None
+    return _ShellCommandWord("".join(output), cursor, dynamic, limited)
+
+
+def _destructive_command_words(content: str) -> Iterator[tuple[int, int]]:
+    parsed_through = 0
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
+    substitution_end_cache: dict[int, int | None] = {}
+    backtick_end_cache: dict[int, int | None] = {}
+    for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
+        start = candidate.start()
+        if start < parsed_through:
+            continue
+        if not _is_shell_command_word_start(content, start):
+            continue
+        if _has_quoted_assignment_prefix(content, start):
+            # This candidate cannot name a destructive command. Nested command
+            # substitutions remain independent candidates in the outer scan.
+            continue
+        if content.startswith("$(", start):
+            substitution_end = _bounded_static_substitution_end(content, start)
+            if (
+                substitution_end is None
+                or _static_printf_substitution(
+                    content,
+                    start,
+                    substitution_end,
+                )
+                is None
+            ):
+                # Dynamic substitutions cannot deterministically name a
+                # destructive command. Their inner literal commands remain
+                # independent candidates; the bounded structural check avoids
+                # reparsing nested suffixes quadratically.
+                continue
+        parsed = _parse_shell_command_word(
+            content,
+            start,
+            parameter_end_cache,
+            substitution_end_cache,
+            backtick_end_cache,
+        )
+        if parsed is None:
+            continue
+        # A long concatenated quoted word can expose every closing quote as a
+        # regex candidate. Skip the rest only when it cannot be an executed
+        # whitespace-bearing wrapper or a dynamic substitution wrapper.
+        candidate_character = content[start]
+        if (
+            candidate_character in "'\""
+            and not parsed.dynamic
+            and not any(character.isspace() for character in parsed.text)
+        ):
+            parsed_through = max(parsed_through, parsed.end)
+        command_basename = parsed.text.casefold().rsplit("/", 1)[-1]
+        if (
+            not parsed.dynamic
+            and not parsed.limited
+            and command_basename in _DESTRUCTIVE_COMMAND_BASENAMES
+        ):
+            parsed_through = max(parsed_through, parsed.end)
+            yield start, parsed.end
+
+
+def _has_shell_command_word_exhaustion(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    structural_quote_closers: set[int] | None = None,
+    structural_quote_openers: set[int] | None = None,
+    python_source: _PythonSourceOwnership | None = None,
+    perl_eval_blocks: bool = False,
+    _command_string_depth: int = 0,
+) -> bool:
+    """Find candidate command words whose deterministic parse hit a safety bound.
+
+    ``python_source`` supplies proven Python string and comment ownership, so
+    host code is never charged to a shell word or command string.
+    ``perl_eval_blocks`` recognizes Perl's exception-trapping ``eval BLOCK``,
+    which reparses no string.
+    """
+    parsed_through = 0
+    # Completed words own closing quotes, never executable expansion starts.
+    # Inner commands remain independent candidates; never suppress their bodies.
+    owned_word_positions: set[int] = set()
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] = {}
+    substitution_end_cache: dict[int, int | None] = {}
+    backtick_end_cache: dict[int, int | None] = {}
+    may_have_destructive_outer_operands = _may_have_destructive_outer_operands(content)
+    json_openers = sorted(structural_quote_openers or ())
+    complete_comments: set[tuple[int, int]] = set()
+    for candidate in _SHELL_COMMAND_WORD_START_RE.finditer(content):
+        check_runtime()
+        start = candidate.start()
+        if start in owned_word_positions:
+            continue
+        if structural_quote_closers is not None and start in structural_quote_closers:
+            continue
+        json_string_start = structural_quote_openers is not None and (
+            start in structural_quote_openers or start - 1 in structural_quote_openers
+        )
+        assignment_quote = start > 0 and content[start - 1] == "=" and content[start] in "'\""
+        if start < parsed_through or (
+            not json_string_start
+            and not assignment_quote
+            and not _is_shell_command_word_start(content, start)
+        ):
+            continue
+        if _has_quoted_assignment_prefix(content, start):
+            continue
+        candidate_word_positions: set[int] = set()
+        parsed = _parse_shell_command_word(
+            content,
+            start,
+            parameter_end_cache,
+            substitution_end_cache,
+            backtick_end_cache,
+            check_runtime=check_runtime,
+            owned_word_positions=candidate_word_positions,
+            enclosing_delimiter=(
+                _assignment_value_wrapper(content, start) if assignment_quote else None
+            ),
+        )
+        if parsed is None:
+            substitution_start = (
+                start + 1
+                if content[start : start + 1] in {"'", '"'} and content.startswith("$(", start + 1)
+                else start
+            )
+            if content.startswith("$(", substitution_start):
+                substitution_end = _skip_command_substitution(
+                    content,
+                    substitution_start,
+                    len(content),
+                    check_runtime,
+                    end_cache=substitution_end_cache,
+                    parameter_end_cache=parameter_end_cache,
+                    backtick_end_cache=backtick_end_cache,
+                )
+                if substitution_end is not None and _is_printf_substitution(
+                    content,
+                    substitution_start,
+                    substitution_end,
+                    check_runtime=check_runtime,
+                ):
+                    return True
+            # An unclosed expansion or quote can consume the rest of the
+            # artifact. Once that unresolved span exceeds the command-word
+            # budget, treating it as clean would turn malformed, deeply nested
+            # runtime selection into a fail-open result.
+            # A validated JSON value owns its bytes and is checked separately.
+            # Do not charge that value to an earlier unmatched Markdown tick.
+            next_json = bisect_right(json_openers, start)
+            unresolved_end = (
+                json_openers[next_json] if next_json < len(json_openers) else len(content)
+            )
+            if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS and python_source is not None:
+                # Likewise, a host string or comment token owns its bytes: a
+                # shell quote it opens cannot continue into later host code.
+                unresolved_end = min(unresolved_end, python_source.word_end(start))
+            if unresolved_end - start > _SHELL_COMMAND_WORD_CHARS:
+                return True
+            continue
+        # Comments end at a newline, and a quote after ``=`` in prose or host
+        # source may be mis-paired. Such a word cannot own a later line.
+        confined_word = "\n" in content[start : parsed.end] and (
+            assignment_quote
+            or _SHELL_COMMENT_START_RE.search(content, content.rfind("\n", 0, start) + 1, start)
+            is not None
+        )
+        if not confined_word:
+            # A quote that opens a runtime-selected word stays an independent
+            # candidate, so a mis-paired claim cannot hide its operands.
+            owned_word_positions.update(
+                position
+                for position in candidate_word_positions
+                if content[position + 1 : position + 2] not in ("$", "`")
+            )
+        # Only executable nested substitutions retain independent command
+        # positions. A plain dynamic data argument still owns its inner bytes;
+        # revisiting those as commands would turn quoted printf data into code.
+        raw_word = content[start : parsed.end]
+        simple_backtick_parameter = (
+            re.fullmatch(
+                r"`\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})`",
+                raw_word,
+            )
+            is not None
+        )
+        if (
+            not parsed.dynamic
+            or "$" not in raw_word
+            or not any(marker in raw_word for marker in ("$(", "`"))
+            or simple_backtick_parameter
+        ) and not (assignment_quote and confined_word):
+            parsed_through = max(parsed_through, parsed.end)
+        if assignment_quote:
+            # An assignment value never names the command, and main never
+            # parsed this position, so it only claims ownership.
+            continue
+        if parsed.limited:
+            return True
+        if (
+            parsed.dynamic
+            and may_have_destructive_outer_operands
+            and _has_runtime_command_operand_exhaustion(
+                content,
+                start,
+                parsed.end,
+                check_runtime,
+            )
+        ):
+            comment = python_source.comment(start) if python_source is not None else None
+            if comment is None:
+                return True
+            # A Python comment is prose that no shell receives, so a command
+            # named in it can take operands only from the same comment, never
+            # from later host code. Recheck that comment as standalone shell
+            # text. Strings are not confined: concatenation can supply their
+            # runtime operands.
+            if comment not in complete_comments:
+                if _has_shell_command_word_exhaustion(
+                    content[comment[0] : comment[1]],
+                    check_runtime,
+                    _command_string_depth=_command_string_depth,
+                ):
+                    return True
+                complete_comments.add(comment)
+    for command_string in _shell_command_strings(
+        content,
+        check_runtime,
+        perl_eval_blocks=perl_eval_blocks,
+        python_source=python_source,
+    ):
+        if command_string is None or _command_string_depth >= 8:
+            return True
+        if _has_shell_command_word_exhaustion(
+            command_string,
+            check_runtime,
+            _command_string_depth=_command_string_depth + 1,
+        ):
+            return True
+    return False
+
+
+def _has_runtime_command_operand_exhaustion(
+    content: str,
+    start: int,
+    word_end: int,
+    check_runtime: Callable[[], None],
+) -> bool:
+    """Return whether a runtime-selected command's operands are undecidable."""
+    tokens, command_end, exhausted = _bounded_shell_tokens(
+        content,
+        start,
+        word_end,
+        check_runtime=check_runtime,
+    )
+    if exhausted and command_end - start < _ROOT_GLOB_COMMAND_CHARS:
+        # Earlier prose (for example "row-first") cannot supply this
+        # command's operands. Refine only this candidate's exhausted
+        # span, including nested commands inside the executable word.
+        # Hitting the span bound always remains partial, including when
+        # real operands occur beyond that bound. This rescan is bounded
+        # by the same constant as the tokenizer.
+        check_runtime()
+        exhausted = _may_have_destructive_outer_operands(content[start:command_end])
+    return (
+        exhausted
+        or _has_unsupported_brace_expansion(tokens)
+        or _has_destructive_root_glob(tokens)
+        or _has_destructive_root_path(tokens)
+    )
+
+
+def _shell_command_strings(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    perl_eval_blocks: bool = False,
+    python_source: _PythonSourceOwnership | None = None,
+) -> Iterator[str | None]:
+    """Yield bounded strings reparsed by ``eval`` or a shell ``-c`` wrapper."""
+    for clause_start in _shell_clause_starts(content, check_runtime):
+        check_runtime()
+        recognized, command_string = _command_string_from_clause(
+            content,
+            clause_start,
+            check_runtime,
+            perl_eval_blocks=perl_eval_blocks,
+        )
+        if not recognized:
+            continue
+        if python_source is not None:
+            word_start = clause_start
+            while word_start < len(content) and content[word_start].isspace():
+                word_start += 1
+            if python_source.is_code(word_start):
+                # A clause that begins in Python code is Python, not shell:
+                # ``signal.alarm(timeout)`` names no ``timeout`` command.
+                # Shell text can only be reparsed from a string literal.
+                continue
+        yield command_string
+
+
+def _shell_clause_starts(
+    content: str,
+    check_runtime: Callable[[], None],
+) -> Iterator[int]:
+    """Yield command-clause starts outside quotes and comments in one pass."""
+    yield 0
+    quote: str | None = None
+    word_started = False
+    cursor = 0
+    while cursor < len(content):
+        if cursor % 4096 == 0:
+            check_runtime()
+        character = content[cursor]
+        if quote is not None:
+            if character == quote:
+                quote = None
+            elif quote == '"' and character == "\\" and cursor + 1 < len(content):
+                cursor += 2
+                continue
+        elif character in "'\"":
+            quote = character
+            word_started = True
+        elif character == "\\" and cursor + 1 < len(content):
+            cursor += 2
+            word_started = True
+            continue
+        elif character == "#" and not word_started:
+            newline = content.find("\n", cursor + 1)
+            if newline < 0:
+                return
+            cursor = newline + 1
+            word_started = False
+            yield cursor
+            continue
+        elif character in ";|&(){}\n":
+            word_started = False
+            yield cursor + 1
+        elif character.isspace():
+            word_started = False
+        else:
+            word_started = True
+        cursor += 1
+
+
+def _eval_command_string(
+    content: str,
+    start: int,
+    check_runtime: Callable[[], None],
+) -> str | None:
+    """Join bounded eval operands, excluding outer redirections and clauses."""
+    # Include one lookahead character so reaching the limit cannot masquerade
+    # as a complete final word. No individual word can scan beyond this slice.
+    source = content[start : start + _ROOT_GLOB_COMMAND_CHARS + 1]
+    cursor = 0
+    operands: list[str] = []
+    for count in range(_SHELL_COMMAND_STRING_ARGUMENTS + 1):
+        check_runtime()
+        while cursor < len(source):
+            if source.startswith("\\\r\n", cursor):
+                cursor += 3
+            elif source.startswith("\\\n", cursor):
+                cursor += 2
+            elif source[cursor].isspace() and source[cursor] not in "\r\n":
+                cursor += 1
+            else:
+                break
+        if cursor > _ROOT_GLOB_COMMAND_CHARS:
+            return None
+        redirection = _SHELL_REDIRECTION_PREFIX_RE.match(source, cursor)
+        if redirection is None and (cursor == len(source) or source[cursor] in "\r\n;|&()#"):
+            return " ".join(operands)
+        if count == _SHELL_COMMAND_STRING_ARGUMENTS:
+            return None
+        if redirection is not None:
+            # Here-documents/strings require a different grammar. Keep their
+            # coverage partial instead of treating their delimiter as code.
+            if "<<" in redirection.group():
+                return None
+            cursor = redirection.end()
+            while cursor < len(source) and source[cursor] in " \t":
+                cursor += 1
+            if cursor == len(source) or source[cursor] in "\r\n;|&()#":
+                return None
+        word, cursor, limited = _next_shell_invocation_word(source, cursor, check_runtime)
+        if limited or word is None or cursor > _ROOT_GLOB_COMMAND_CHARS:
+            return None
+        if redirection is not None:
+            continue
+        if any(
+            marker in word
+            for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+        ):
+            return None
+        if not operands and word == "--":
+            continue
+        operands.append(word)
+    return None
+
+
+def _command_string_from_clause(
+    content: str,
+    start: int,
+    check_runtime: Callable[[], None],
+    *,
+    perl_eval_blocks: bool = False,
+) -> tuple[bool, str | None]:
+    """Resolve a bounded wrapper chain to an ``eval`` or shell command string."""
+    cursor = start
+    pending: str | None = None
+    wrapper_seen = False
+
+    def next_word() -> tuple[str | None, bool]:
+        nonlocal cursor
+        word, cursor, limited = _next_shell_invocation_word(content, cursor, check_runtime)
+        return word, limited
+
+    def resolved_command_string(word: str | None, limited: bool) -> str | None:
+        if (
+            limited
+            or word is None
+            or any(
+                marker in word
+                for marker in (_DYNAMIC_SHELL_WORD_SENTINEL, _RUNTIME_SHELL_PARAMETER_SENTINEL)
+            )
+        ):
+            return None
+        return word
+
+    for _ in range(32):
+        while cursor < len(content) and content[cursor].isspace():
+            cursor += 1
+        redirection = _SHELL_REDIRECTION_PREFIX_RE.match(content, cursor)
+        if redirection is not None:
+            cursor = redirection.end()
+            target, limited = next_word()
+            if limited or target is None:
+                return wrapper_seen, None
+            continue
+
+        word, limited = (pending, False) if pending is not None else next_word()
+        pending = None
+        if limited:
+            return wrapper_seen, None
+        if word is None:
+            return False, None
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", word, re.DOTALL) is not None:
+            continue
+        command = word.casefold().rsplit("/", 1)[-1]
+        if command in _SHELL_CLAUSE_PREFIX_WORDS:
+            continue
+        if command == "eval":
+            if (
+                perl_eval_blocks
+                and word == "eval"
+                and _PERL_EVAL_BLOCK_RE.match(content, cursor) is not None
+            ):
+                # Perl ``eval BLOCK`` is exception handling, not a string
+                # reparse. ``{`` starts a new clause, so the statements in the
+                # block are still scanned as ordinary command candidates.
+                return False, None
+            return True, _eval_command_string(content, cursor, check_runtime)
+        if command in _SHELL_COMMAND_STRING_SHELLS:
+            for _ in range(16):
+                option, limited = next_word()
+                if limited:
+                    return True, None
+                if option is None:
+                    # Without -c there is no command string to reconstruct.
+                    # This also keeps Markdown fence labels such as sh inert.
+                    return False, None
+                if option.startswith("-") and not option.startswith("--"):
+                    if "c" in option[1:]:
+                        command_string, limited = next_word()
+                        return True, resolved_command_string(command_string, limited)
+                    continue
+                if option.startswith("+") or option.startswith("--"):
+                    continue
+                return False, None
+            return True, None
+
+        if command in {"env", "command", "nohup"}:
+            wrapper_seen = True
+            continue
+        if command in {"sudo", "nice", "xargs"}:
+            wrapper_seen = True
+            while True:
+                option, limited = next_word()
+                if limited or option is None:
+                    return True, None
+                if option == "--":
+                    pending, limited = next_word()
+                    if limited:
+                        return True, None
+                    break
+                if not option.startswith("-"):
+                    pending = option
+                    break
+                if option in {
+                    "-u",
+                    "-g",
+                    "-h",
+                    "-p",
+                    "-C",
+                    "-T",
+                    "-R",
+                    "-D",
+                    "-n",
+                    "-I",
+                    "-L",
+                    "-P",
+                    "-s",
+                }:
+                    _, limited = next_word()
+                    if limited:
+                        return True, None
+            continue
+        if command == "timeout":
+            wrapper_seen = True
+            while True:
+                option, limited = next_word()
+                if limited or option is None:
+                    return True, None
+                if option in {"-k", "--kill-after", "-s", "--signal"}:
+                    _, limited = next_word()
+                    if limited:
+                        return True, None
+                    continue
+                if option.startswith("-"):
+                    continue
+                break
+            pending, limited = next_word()
+            if limited:
+                return True, None
+            continue
+        return False, None
+    return wrapper_seen, None
+
+
+def _command_wrapper_quote(content: str, command_start: int) -> str | None:
+    if command_start == 0 or content[command_start - 1] not in "'\"`":
+        return None
+    backslashes = 0
+    cursor = command_start - 2
+    while cursor >= 0 and content[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    return content[command_start - 1] if backslashes % 2 == 0 else None
+
+
+def _assignment_value_wrapper(content: str, value_start: int) -> str | None:
+    """Return an unescaped quote or backtick directly enclosing an assignment."""
+    name_start = value_start - 1
+    if name_start > 0 and content[name_start - 1] == "+":
+        name_start -= 1
+    while name_start > 0 and (
+        content[name_start - 1] == "_"
+        or (content[name_start - 1].isascii() and content[name_start - 1].isalnum())
+    ):
+        name_start -= 1
+    return _command_wrapper_quote(content, name_start)
+
+
+def _perl_literal_print_shell_text(
+    content: str,
+    check_runtime: Callable[[], None],
+) -> str:
+    """Project only proven ordinary Perl print delimiters, retaining the payload.
+
+    This deliberately recognizes a small source subset, not general Perl: a
+    standalone print of one non-interpolated, single-line quoted literal, with
+    an optional standard output handle or parentheses. Ordinary surrounding
+    quotes and comments must also balance. Quote operators, heredocs, regexes,
+    and interpolation make host ownership uncertain, so leave that source on
+    the conservative path. Never use this to grant ownership to a fragment.
+
+    Only the two host delimiters change, with offsets preserved. In particular,
+    commands, prompt instructions and parser-limit payloads remain available to
+    the security scanners; printed text is not an analysis exemption.
+    """
+    literals: set[tuple[int, int]] = set()
+    check_runtime()
+    for match in _PERL_LITERAL_PRINT_RE.finditer(content):
+        check_runtime()
+        literals.add(match.span("literal"))
+    check_runtime()
+    if not literals:
+        return content
+    owned: list[tuple[int, int]] = []
+    cursor = 0
+    next_runtime_check = 0
+    while cursor < len(content):
+        if cursor >= next_runtime_check:
+            check_runtime()
+            next_runtime_check = cursor + 256
+        character = content[cursor]
+        if character == "#" and (cursor == 0 or content[cursor - 1] != "$"):
+            newline = content.find("\n", cursor)
+            cursor = len(content) if newline < 0 else newline + 1
+            continue
+        if character in "$@%&*" and _PERL_AMBIGUOUS_SIGIL_RE.match(content, cursor) is not None:
+            # Perl sigils can own quote punctuation (for example $' and *"),
+            # with whitespace/comments or braces inside the variable spelling.
+            # Leave those ambiguous forms outside this bounded source subset.
+            return content
+        if (
+            character == "/"
+            or content.startswith("<<", cursor)
+            or character in "qmsty"
+            and (cursor == 0 or content[cursor - 1] not in "$@%&")
+            and _PERL_QUOTE_OPERATOR_RE.match(content, cursor) is not None
+        ):
+            return content
+        if character not in "'\"`":
+            cursor += 1
+            continue
+        if cursor > 0:
+            previous = content[cursor - 1]
+            if character == "'" and (
+                previous.isalnum() or previous in "_:@%&*" or ord(previous) > 127
+            ):
+                # Apostrophes can separate legacy package names. Treat ambiguous adjacency
+                # (including print'...') conservatively instead of inventing
+                # a string that could hide an executable quote operator.
+                return content
+        start = cursor
+        quote = character
+        cursor += 1
+        while cursor < len(content):
+            if cursor >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = cursor + 256
+            character = content[cursor]
+            if character == "\\":
+                cursor += 2
+                continue
+            if character == quote:
+                cursor += 1
+                if (start, cursor) in literals:
+                    owned.append((start, cursor))
+                break
+            if quote != "'" and character in "$@":
+                # Interpolation can itself contain Perl expressions/quotes.
+                return content
+            cursor += 1
+        else:
+            return content
+    if not owned:
+        return content
+    output = list(content)
+    for start, end in owned:
+        output[start] = output[end - 1] = " "
+    return "".join(output)
+
+
+def _python_literal_spans(
+    content: str,
+    check_runtime: Callable[[], None],
+) -> tuple[list[int], list[int]] | None:
+    """Return outermost string and comment token spans of valid Python source.
+
+    Return ``None`` unless the whole text is accepted by the Python parser,
+    so a fragment, malformed file, or shell-shebang polyglot cannot borrow
+    host ownership. Every span is checked against the exact source text.
+    """
+    # A leading U+FEFF byte-order mark fails the module parse below and keeps
+    # every conservative bound. The file cache decodes with ``utf-8``, not
+    # ``utf-8-sig``, so the AST analyzers already report such a file as a
+    # syntax error; stripping the mark belongs with that decoding fix.
+    if (
+        len(content) > MAX_PYTHON_AST_SOURCE_CHARS
+        or _LONE_CARRIAGE_RETURN_RE.search(content) is not None
+        or (content.startswith("#!") and _PYTHON_SHEBANG_RE.match(content) is None)
+    ):
+        return None
+    check_runtime()
+    try:
+        # The lenient tokenizer accepts bytes such as ``$`` and a backtick as
+        # operators. Requiring a module parse proves that every byte outside
+        # the spans below is Python syntax, never a shell quote or expansion.
+        # The scanned module's own parse already reports its compiler warnings
+        # (for example an invalid ``"\d"`` escape). Repeating them here would
+        # duplicate that output, and ``-W error`` would turn them into a
+        # ``SyntaxError`` that silently drops ownership.
+        with _PYTHON_OWNERSHIP_PARSE_LOCK, warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ast.parse(content)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    check_runtime()
+    line_starts = [0]
+    line_starts.extend(match.end() for match in re.finditer("\n", content))
+    starts: list[int] = []
+    ends: list[int] = []
+    template_depth = 0
+    template_start = 0
+
+    def offset(position: tuple[int, int]) -> int:
+        return line_starts[position[0] - 1] + position[1]
+
+    try:
+        for index, token in enumerate(tokenize.generate_tokens(io.StringIO(content).readline)):
+            if index % 256 == 0:
+                check_runtime()
+            if token.type in _PYTHON_TEMPLATE_STRING_STARTS:
+                if template_depth == 0:
+                    template_start = offset(token.start)
+                    if not content.startswith(token.string, template_start):
+                        return None
+                template_depth += 1
+            elif token.type in _PYTHON_TEMPLATE_STRING_ENDS:
+                template_depth -= 1
+                end = offset(token.end)
+                if template_depth < 0 or not content.endswith(token.string, 0, end):
+                    return None
+                if template_depth == 0:
+                    starts.append(template_start)
+                    ends.append(end)
+            elif not template_depth and token.type in (tokenize.STRING, tokenize.COMMENT):
+                # Inside a replacement field, nested strings and comments
+                # belong to the enclosing f-string or t-string span.
+                start, end = offset(token.start), offset(token.end)
+                if content[start:end] != token.string:
+                    return None
+                starts.append(start)
+                ends.append(end)
+    except (tokenize.TokenError, SyntaxError, ValueError, IndexError):
+        return None
+    if template_depth or any(ends[index] > starts[index + 1] for index in range(len(starts) - 1)):
+        return None
+    return starts, ends
+
+
+class _PythonSourceOwnership:
+    """Lazily proven Python string and comment ownership for one source text.
+
+    Python has no shell semantics. Shell text can occur only inside a Python
+    string, which owns its bytes, or as prose in a comment that no shell ever
+    receives. Python code between those tokens contains no shell quote or
+    expansion opener, so an in-phase shell word ends at the first code-level
+    whitespace or control character. A quote or substitution that is still
+    open there was opened inside an earlier string or comment token of the
+    same word, and that token owns the rest of it.
+
+    The token spans are computed lazily, only for source that reaches one of
+    these decisions. Invalid or ambiguous source keeps every conservative bound.
+    """
+
+    def __init__(self, content: str, check_runtime: Callable[[], None]) -> None:
+        self._content = content
+        self._check_runtime = check_runtime
+        self._spans: tuple[list[int], list[int]] | None = None
+        self._spans_computed = False
+        self._cached_word_start = -1
+        self._cached_word_end = -1
+
+    def _owned_spans(self) -> tuple[list[int], list[int]] | None:
+        if not self._spans_computed:
+            self._spans = _python_literal_spans(self._content, self._check_runtime)
+            self._spans_computed = True
+        return self._spans
+
+    def _owner(self, position: int) -> tuple[int, int] | None:
+        spans = self._owned_spans()
+        if spans is None:
+            return None
+        starts, ends = spans
+        index = bisect_right(starts, position) - 1
+        if index >= 0 and position < ends[index]:
+            return starts[index], ends[index]
+        return None
+
+    def is_code(self, position: int) -> bool:
+        """Return whether a position is proven Python code, not a literal."""
+        return self._owned_spans() is not None and self._owner(position) is None
+
+    def comment(self, position: int) -> tuple[int, int] | None:
+        """Return the span of a proven Python comment containing a position."""
+        owner = self._owner(position)
+        if owner is None or self._content[owner[0]] != "#":
+            return None
+        return owner
+
+    def word_end(self, start: int) -> int:
+        """Return the end of the host region a shell word at ``start`` can own."""
+        spans = self._owned_spans()
+        content = self._content
+        if spans is None:
+            return len(content)
+        # Candidates arrive in source order. No code-level break exists
+        # between a cached start and its result, so they share that result.
+        if self._cached_word_start <= start <= self._cached_word_end:
+            return self._cached_word_end
+        starts, ends = spans
+        cursor = start
+        while True:
+            self._check_runtime()
+            index = bisect_right(starts, cursor) - 1
+            if index >= 0 and cursor < ends[index]:
+                cursor = ends[index]
+            segment_end = starts[index + 1] if index + 1 < len(starts) else len(content)
+            match = _PYTHON_SHELL_WORD_BREAK_RE.search(content, cursor, segment_end)
+            if match is not None:
+                result = match.start()
+                break
+            if segment_end == len(content):
+                result = segment_end
+                break
+            cursor = segment_end
+        self._cached_word_start, self._cached_word_end = start, result
+        return result
+
+
+def _skip_command_substitution(
+    content: str,
+    start: int,
+    limit: int,
+    check_runtime: Callable[[], None] | None = None,
+    end_cache: dict[int, int | None] | None = None,
+    parameter_end_cache: dict[int, _ParameterExpansionEnd] | None = None,
+    backtick_end_cache: dict[int, int | None] | None = None,
+) -> int | None:
+    if end_cache is not None and start in end_cache:
+        return end_cache[start]
+    return _skip_shell_delimited_expansion(
+        content,
+        start,
+        limit,
+        "command",
+        check_runtime,
+        parameter_end_cache,
+        end_cache,
+        backtick_end_cache,
+    )
+
+
+def _bounded_static_substitution_end(content: str, start: int) -> int | None:
+    """Return a structurally valid ``$()`` close within the static evaluator bound."""
+    inner_start = start + 2
+    scan_limit = min(len(content), inner_start + _PRINTF_STATIC_CHARS + 1)
+    end = _skip_command_substitution(content, start, scan_limit)
+    if end is None or end - 1 - inner_start > _PRINTF_STATIC_CHARS:
+        return None
+    return end
+
+
+def _bounded_shell_tokens(
+    content: str,
+    command_start: int,
+    body_start: int,
+    *,
+    check_runtime: Callable[[], None] | None = None,
+) -> tuple[tuple[_ShellToken, ...], int, bool]:
+    """Return argument words from one security-view-bounded shell command."""
+    runtime_check = check_runtime or (lambda: None)
+    tokens: list[_ShellToken] = []
+    current: list[str] = []
+    current_glob_projection: list[str] = []
+    word_started = False
+    current_is_argument = True
+    current_has_unquoted_star = False
+    current_can_collapse_to_root_glob = True
+    current_has_quoted_content = False
+    current_unquoted_brace_open = False
+    current_unquoted_brace_close = False
+    current_unquoted_brace_comma = False
+    current_leading_tilde_unquoted = False
+    source_word_has_content = False
+    expect_redirection_target = False
+    quote: str | None = None
+    ansi_c_quote = False
+    boundary_incomplete = False
+    parse_limited = False
+    cursor = body_start
+    limit = min(len(content), body_start + _ROOT_GLOB_COMMAND_CHARS)
+    wrapper_quote = _command_wrapper_quote(content, command_start)
+
+    def start_word() -> None:
+        nonlocal word_started, current_is_argument, expect_redirection_target
+        if not word_started:
+            word_started = True
+            current_is_argument = not expect_redirection_target
+            expect_redirection_target = False
+
+    def mark_quoted_word() -> None:
+        nonlocal current_has_quoted_content, source_word_has_content
+        start_word()
+        current_has_quoted_content = True
+        source_word_has_content = True
+
+    def append_piece(
+        piece: str,
+        *,
+        unquoted: bool = False,
+        dynamic_can_be_empty: bool = False,
+        quoted: bool = False,
+        unquoted_brace_syntax: bool = False,
+    ) -> None:
+        nonlocal current_has_unquoted_star
+        nonlocal current_can_collapse_to_root_glob
+        nonlocal current_has_quoted_content
+        nonlocal current_unquoted_brace_open
+        nonlocal current_unquoted_brace_close
+        nonlocal current_unquoted_brace_comma
+        nonlocal source_word_has_content
+        start_word()
+        source_word_has_content = True
+        current.append(piece)
+        current_glob_projection.append(
+            piece
+            if unquoted
+            else piece.replace("*", _QUOTED_GLOB_SENTINEL).replace("?", _QUOTED_GLOB_SENTINEL)
+        )
+        current_has_quoted_content = current_has_quoted_content or quoted
+        if unquoted_brace_syntax:
+            current_unquoted_brace_open = current_unquoted_brace_open or "{" in piece
+            current_unquoted_brace_close = current_unquoted_brace_close or "}" in piece
+            current_unquoted_brace_comma = current_unquoted_brace_comma or "," in piece
+        current_has_unquoted_star = current_has_unquoted_star or (unquoted and "*" in piece)
+        if not dynamic_can_be_empty and piece:
+            current_can_collapse_to_root_glob = current_can_collapse_to_root_glob and (
+                unquoted and all(character in "*?" for character in piece)
+            )
+
+    def flush(*, complete: bool = True) -> None:
+        nonlocal word_started
+        nonlocal current_has_unquoted_star
+        nonlocal current_can_collapse_to_root_glob
+        nonlocal current_has_quoted_content
+        nonlocal current_unquoted_brace_open
+        nonlocal current_unquoted_brace_close
+        nonlocal current_unquoted_brace_comma
+        nonlocal current_leading_tilde_unquoted
+        if word_started:
+            if complete and current_is_argument:
+                tokens.append(
+                    _ShellToken(
+                        "".join(current),
+                        current_has_unquoted_star and current_can_collapse_to_root_glob,
+                        "".join(current_glob_projection),
+                        current_has_quoted_content,
+                        current_unquoted_brace_open
+                        and current_unquoted_brace_close
+                        and current_unquoted_brace_comma,
+                        current_leading_tilde_unquoted,
+                    )
+                )
+            current.clear()
+            current_glob_projection.clear()
+            word_started = False
+            current_has_unquoted_star = False
+            current_can_collapse_to_root_glob = True
+            current_has_quoted_content = False
+            current_unquoted_brace_open = False
+            current_unquoted_brace_close = False
+            current_unquoted_brace_comma = False
+            current_leading_tilde_unquoted = False
+
+    while cursor < limit:
+        if (cursor - body_start) % 256 == 0:
+            runtime_check()
+        character = content[cursor]
+        if quote is not None:
+            if character == quote:
+                quote = None
+                ansi_c_quote = False
+            elif character == "\\" and ansi_c_quote:
+                decoded, cursor = _decode_ansi_c_escape(content, cursor, limit)
+                if "\x00" in decoded:
+                    closing_quote = _skip_ansi_c_quote_tail(content, cursor, limit)
+                    if closing_quote is None:
+                        return tuple(tokens), limit, True
+                    cursor = closing_quote
+                    continue
+                append_piece(decoded, quoted=True)
+                continue
+            elif quote == '"' and character == "$" and cursor + 1 < limit:
+                inherited_quote_closed = [False]
+                if content[cursor + 1] == "(":
+                    substitution_end = _skip_command_substitution(
+                        content,
+                        cursor,
+                        limit,
+                        runtime_check,
+                    )
+                    if substitution_end is None:
+                        return tuple(tokens), limit, True
+                    static_value = _static_printf_substitution(
+                        content,
+                        cursor,
+                        substitution_end,
+                    )
+                    parse_limited = parse_limited or (
+                        static_value is None
+                        and _is_printf_substitution(
+                            content,
+                            cursor,
+                            substitution_end,
+                            check_command_context=False,
+                            check_runtime=runtime_check,
+                        )
+                    )
+                    append_piece(
+                        "$DYNAMIC" if static_value is None else static_value,
+                        dynamic_can_be_empty=static_value is None,
+                        quoted=True,
+                    )
+                    cursor = substitution_end
+                    continue
+                parameter_end = _skip_parameter_expansion(
+                    content,
+                    cursor,
+                    limit,
+                    runtime_check,
+                    inherited_double_quote=True,
+                    inherited_quote_closed=inherited_quote_closed,
+                )
+                if parameter_end is not None:
+                    append_piece(
+                        "$DYNAMIC",
+                        dynamic_can_be_empty=True,
+                        quoted=True,
+                    )
+                    cursor = parameter_end
+                    if inherited_quote_closed[0]:
+                        quote = None
+                        ansi_c_quote = False
+                    continue
+            elif quote == '"' and character == "`":
+                substitution_end = _skip_backtick_substitution(
+                    content,
+                    cursor,
+                    limit,
+                    runtime_check,
+                )
+                if substitution_end is None:
+                    return tuple(tokens), limit, True
+                static_value = _static_printf_substitution(
+                    content,
+                    cursor,
+                    substitution_end,
+                    backtick=True,
+                )
+                parse_limited = parse_limited or (
+                    static_value is None
+                    and _is_printf_substitution(
+                        content,
+                        cursor,
+                        substitution_end,
+                        backtick=True,
+                        check_command_context=False,
+                        check_runtime=runtime_check,
+                    )
+                )
+                append_piece(
+                    "$DYNAMIC" if static_value is None else static_value,
+                    dynamic_can_be_empty=static_value is None,
+                    quoted=True,
+                )
+                cursor = substitution_end
+                continue
+            elif character == "\\" and quote == '"' and cursor + 1 < limit:
+                escaped = content[cursor + 1]
+                if escaped == "\n":
+                    cursor += 2
+                    continue
+                if escaped == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                    cursor += 3
+                    continue
+                if escaped in '$`"\\':
+                    append_piece(escaped, quoted=True)
+                else:
+                    append_piece("\\" + escaped, quoted=True)
+                cursor += 2
+                continue
+            elif character == "\\" and quote == '"':
+                boundary_incomplete = True
+                cursor += 1
+                continue
+            else:
+                append_piece(character, quoted=True)
+            cursor += 1
+            continue
+        if wrapper_quote is not None and character == wrapper_quote:
+            flush()
+            return tuple(tokens), cursor, parse_limited
+        if character == "$" and cursor + 1 < limit and content[cursor + 1] in "'\"":
+            mark_quoted_word()
+            quote = content[cursor + 1]
+            ansi_c_quote = quote == "'"
+            cursor += 2
+            continue
+        if character in "'\"":
+            mark_quoted_word()
+            quote = character
+        elif character == "`":
+            substitution_end = _skip_backtick_substitution(
+                content,
+                cursor,
+                limit,
+                runtime_check,
+            )
+            if substitution_end is None:
+                return tuple(tokens), limit, True
+            static_value = _static_printf_substitution(
+                content,
+                cursor,
+                substitution_end,
+                backtick=True,
+            )
+            parse_limited = parse_limited or (
+                static_value is None
+                and _is_printf_substitution(
+                    content,
+                    cursor,
+                    substitution_end,
+                    backtick=True,
+                    check_command_context=False,
+                    check_runtime=runtime_check,
+                )
+            )
+            append_piece(
+                "$DYNAMIC" if static_value is None else static_value,
+                unquoted=static_value is not None,
+                dynamic_can_be_empty=static_value is None,
+            )
+            cursor = substitution_end
+            continue
+        elif character == "$" and cursor + 1 < limit and content[cursor + 1] == "(":
+            substitution_end = _skip_command_substitution(
+                content,
+                cursor,
+                limit,
+                runtime_check,
+            )
+            if substitution_end is None:
+                return tuple(tokens), limit, True
+            static_value = _static_printf_substitution(content, cursor, substitution_end)
+            parse_limited = parse_limited or (
+                static_value is None
+                and _is_printf_substitution(
+                    content,
+                    cursor,
+                    substitution_end,
+                    check_command_context=False,
+                    check_runtime=runtime_check,
+                )
+            )
+            append_piece(
+                "$DYNAMIC" if static_value is None else static_value,
+                unquoted=static_value is not None,
+                dynamic_can_be_empty=static_value is None,
+            )
+            cursor = substitution_end
+            continue
+        elif character == "$":
+            parameter_end = _skip_parameter_expansion(
+                content,
+                cursor,
+                limit,
+                runtime_check,
+            )
+            if parameter_end is not None:
+                if _is_ifs_expansion(content, cursor, parameter_end):
+                    source_word_has_content = True
+                    flush()
+                else:
+                    append_piece("$DYNAMIC", dynamic_can_be_empty=True)
+                cursor = parameter_end
+                continue
+            if cursor + 1 == limit and limit < len(content) and content[limit] == "(":
+                boundary_incomplete = True
+        elif character in "<>" and cursor + 1 < limit and content[cursor + 1] == "(":
+            substitution_end = _skip_command_substitution(
+                content,
+                cursor,
+                limit,
+                runtime_check,
+            )
+            if substitution_end is None:
+                return tuple(tokens), limit, True
+            append_piece(character + "$DYNAMIC", dynamic_can_be_empty=True)
+            cursor = substitution_end
+            continue
+        elif character == "\\":
+            if cursor + 1 >= limit:
+                boundary_incomplete = True
+                cursor += 1
+                continue
+            if content[cursor + 1] == "\n":
+                cursor += 2
+                continue
+            if content[cursor + 1] == "\r" and cursor + 2 < limit and content[cursor + 2] == "\n":
+                cursor += 3
+                continue
+            append_piece(content[cursor + 1])
+            cursor += 1
+        elif character == "\n":
+            flush()
+            return tuple(tokens), cursor, parse_limited
+        elif character.isspace():
+            flush()
+            source_word_has_content = False
+        elif character == "#" and not word_started:
+            return tuple(tokens), cursor, parse_limited
+        elif character in "<>":
+            flush()
+            source_word_has_content = False
+            expect_redirection_target = True
+            if cursor + 1 < limit and content[cursor + 1] == character:
+                cursor += 1
+            if cursor + 1 < limit and content[cursor + 1] in "&|":
+                cursor += 1
+        elif (
+            character == "&"
+            and cursor + 1 == limit
+            and limit < len(content)
+            and content[limit] == ">"
+        ):
+            boundary_incomplete = True
+            cursor += 1
+            continue
+        elif character == "&" and cursor + 1 < limit and content[cursor + 1] == ">":
+            flush()
+            source_word_has_content = False
+            expect_redirection_target = True
+            cursor += 1
+            if cursor + 1 < limit and content[cursor + 1] == ">":
+                cursor += 1
+        elif character in ";|&()":
+            flush()
+            return tuple(tokens), cursor, parse_limited
+        else:
+            if not source_word_has_content and character == "~":
+                current_leading_tilde_unquoted = True
+            append_piece(
+                character,
+                unquoted=character in "*?",
+                unquoted_brace_syntax=character in "{},",
+            )
+        cursor += 1
+    neutral_state = quote is None and not boundary_incomplete and not expect_redirection_target
+    known_terminator = (
+        limit < len(content)
+        and neutral_state
+        and (
+            content[limit] in "\n;|&()"
+            or content[limit] == wrapper_quote
+            or (content[limit] == "#" and not word_started)
+        )
+    )
+    complete = (
+        limit == len(content) and neutral_state and wrapper_quote is None
+    ) or known_terminator
+    flush(complete=complete)
+    return tuple(tokens), limit, not complete or parse_limited
+
+
+def _is_root_glob_documentation(
+    content: str,
+    command_start: int,
+    body_start: int,
+) -> bool:
+    """Return whether ``rm`` is the noun in a bounded prose description."""
+    context_start = max(0, command_start - 256)
+    previous_boundary = max(
+        content.rfind("\n", context_start, command_start),
+        content.rfind(";", context_start, command_start),
+    )
+    prefix_truncated = previous_boundary < 0 and context_start > 0
+    clause_start = previous_boundary + 1 if previous_boundary >= 0 else context_start
+    context_end = min(len(content), command_start + 512)
+    ends = [
+        boundary
+        for boundary in (
+            content.find("\n", command_start, context_end),
+            content.find(";", command_start, context_end),
+        )
+        if boundary >= 0
+    ]
+    clause_end = min(ends, default=context_end)
+    clause = content[clause_start:clause_end]
+    if _ROOT_GLOB_DOCUMENTATION_LINE_RE.fullmatch(clause) is not None:
+        return True
+
+    relative_start = command_start - clause_start
+    prefix = clause[:relative_start]
+    suffix = clause[max(relative_start, body_start - clause_start) :]
+    if not prefix.strip() or prefix_truncated:
+        return False
+    execution = _ROOT_GLOB_EXECUTION_PREFIX_RE.search(prefix)
+    negated_execution = False
+    if execution is not None:
+        negation_prefix = prefix[: execution.start("action")]
+        if _ROOT_GLOB_AFFIRMATIVE_NEGATION_PREFIX_RE.fullmatch(negation_prefix) is not None:
+            return False
+        if _ROOT_GLOB_NEGATED_EXECUTION_RE.search(negation_prefix) is None:
+            return False
+        negated_execution = True
+    if _ROOT_GLOB_SAFETY_WARNING_PREFIX_RE.fullmatch(prefix) is not None:
+        return True
+    if (
+        re.search(
+            r"\b(?:sudo|env|xargs|command)\b[^.;\n]{0,64}$",
+            prefix,
+            re.IGNORECASE,
+        )
+        is not None
+    ):
+        return False
+    article_prefix = re.fullmatch(
+        r"[ \t]*(?:the|this|a|an)(?:[ \t]+(?:gnu|posix|unix))?[ \t]*",
+        prefix,
+        re.IGNORECASE,
+    )
+    documentary_prefix = re.search(
+        r"(?:\b(?:explain|describe|document|note|state|say)(?:[ \t]+that)?|"
+        r"(?:documentation|docs?|guide|manual|reference|note|example)[ \t]*:)"
+        r"[ \t]*$",
+        prefix,
+        re.IGNORECASE,
+    )
+    documentary_leadin = re.fullmatch(
+        r"[ \t]*(?:(?:in|under)[ \t]+(?:the[ \t]+)?(?:posix(?:\.[0-9]+)?|gnu|unix)"
+        r"(?:[ \t]+(?:standard|specification))?|"
+        r"according[ \t]+to[ \t]+(?:the[ \t]+)?(?:manual|documentation|reference|"
+        r"(?:posix(?:\.[0-9]+)?|gnu|unix)(?:[ \t]+(?:standard|specification))?)|"
+        r"for[ \t]+reference|"
+        r"this[ \t]+(?:section|guide|documentation)[ \t]+"
+        r"(?:explains?|describes?|documents?|notes?|states?|says?)(?:[ \t]+that)?)"
+        r"[ \t]*,?[ \t]+(?:(?:the|this|a|an)[ \t]+)?"
+        r"(?:(?:gnu|posix(?:\.[0-9]+)?|unix)[ \t]+)?",
+        prefix,
+        re.IGNORECASE,
+    )
+    if (
+        article_prefix is None
+        and documentary_prefix is None
+        and documentary_leadin is None
+        and not negated_execution
+    ):
+        return False
+    describes_flags = re.search(
+        r"\b(?:command|utility|tool)\b|\b(?:accepts?|supports?|uses?|takes?)\b",
+        suffix,
+        re.IGNORECASE,
+    )
+    describes_glob = re.search(
+        r"\b(?:denotes?|means?|represents?|matches?|wildcards?|globs?)\b|"
+        r"\b(?:all|every)[ \t]+files?\b",
+        suffix,
+        re.IGNORECASE,
+    )
+    return describes_flags is not None and describes_glob is not None and "*" in suffix
+
+
+def _static_brace_expansions(word: str) -> tuple[str, ...] | None:
+    """Expand a small, literal Bash brace word without executing shell code."""
+    if len(word) > _STATIC_BRACE_WORD_CHARS:
+        return None
+    expanded = [word]
+    changed = False
+    for _ in range(4):
+        next_words: list[str] = []
+        expanded_this_round = False
+        for candidate in expanded:
+            brace = re.search(r"\{(?P<body>[^{}]*)\}", candidate)
+            if brace is None or "," not in brace.group("body"):
+                next_words.append(candidate)
+                continue
+            alternatives = brace.group("body").split(",")
+            if len(alternatives) > 8:
+                return None
+            next_words.extend(
+                candidate[: brace.start()] + alternative + candidate[brace.end() :]
+                for alternative in alternatives
+            )
+            if len(next_words) > 32:
+                return None
+            expanded_this_round = True
+            changed = True
+        expanded = next_words
+        if not expanded_this_round:
+            break
+    if any("{" in candidate or "}" in candidate for candidate in expanded):
+        return None
+    return tuple(expanded) if changed else None
+
+
+def _has_recursive_force_options(tokens: tuple[_ShellToken, ...]) -> bool:
+    try:
+        options_end = next(index for index, token in enumerate(tokens) if token.text == "--")
+    except StopIteration:
+        options_end = len(tokens)
+    option_words: list[str] = []
+    for token in tokens[:options_end]:
+        if token.brace_expansion:
+            expanded = _static_brace_expansions(token.text)
+            if expanded is not None:
+                option_words.extend(expanded)
+                continue
+        option_words.append(token.text)
+    short_options = [
+        word[1:] for word in option_words if re.fullmatch(r"-[A-Za-z]+", word) is not None
+    ]
+    recursive = "--recursive" in option_words or any(
+        "r" in option or "R" in option for option in short_options
+    )
+    force = "--force" in option_words or any("f" in option for option in short_options)
+    return recursive and force
+
+
+def _has_destructive_root_glob(tokens: tuple[_ShellToken, ...]) -> bool:
+    def is_root_glob(token: _ShellToken) -> bool:
+        if token.root_glob:
+            return True
+        if not token.brace_expansion:
+            return False
+        expanded = _static_brace_expansions(token.glob_projection)
+        return expanded is not None and any(
+            re.fullmatch(r"[*?]+", word) is not None for word in expanded
+        )
+
+    return any(is_root_glob(token) for token in tokens) and _has_recursive_force_options(tokens)
+
+
+def _has_destructive_root_path(tokens: tuple[_ShellToken, ...]) -> bool:
+    """Return whether recursive-force options target root or home expansion."""
+
+    def is_root_path(token: _ShellToken) -> bool:
+        candidates: tuple[str, ...] = (token.text,)
+        if token.brace_expansion:
+            expanded = _static_brace_expansions(token.text)
+            if expanded is not None:
+                candidates = expanded
+        return any(candidate.startswith("/") for candidate in candidates) or (
+            token.leading_tilde_unquoted
+            and any(candidate.startswith("~") for candidate in candidates)
+        )
+
+    has_root_path = any(is_root_path(token) for token in tokens)
+    return has_root_path and _has_recursive_force_options(tokens)
+
+
+def _has_unsupported_brace_expansion(tokens: tuple[_ShellToken, ...]) -> bool:
+    return any(
+        token.brace_expansion and _static_brace_expansions(token.text) is None for token in tokens
+    )
+
+
+_SCOPE_NODE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def _scope_chain(tree: ast.Module, target: ast.AST) -> tuple[ast.AST, ...] | None:
+    """Return the chain of enclosing scopes for *target*, outermost first.
+
+    The module itself is the outermost scope.  Returns None when *target* is
+    not part of *tree*.
+    """
+    parents: dict[ast.AST, ast.AST] = {}
+    stack: list[ast.AST] = [tree]
+    found = False
+    while stack:
+        node = stack.pop()
+        if node is target:
+            found = True
+            break
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+            stack.append(child)
+    if not found:
+        return None
+    chain: list[ast.AST] = []
+    current: ast.AST | None = target
+    while current is not None:
+        if isinstance(current, _SCOPE_NODE_TYPES) or current is tree:
+            chain.append(current)
+        current = parents.get(current)
+    chain.reverse()
+    return tuple(chain)
+
+
+def _scope_binds_name(scope_node: ast.AST, name: str) -> bool:
+    """Return whether *name* is bound directly in *scope_node*.
+
+    Nested function/class/lambda bodies are not descended into: their bindings
+    belong to those scopes, not this one.
+    """
+    if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        args = scope_node.args
+        named = [arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
+        if args.vararg is not None:
+            named.append(args.vararg.arg)
+        if args.kwarg is not None:
+            named.append(args.kwarg.arg)
+        if name in named:
+            return True
+        bodies: list[ast.AST] = (
+            [scope_node.body] if isinstance(scope_node, ast.Lambda) else list(scope_node.body)
+        )
+    elif isinstance(scope_node, (ast.ClassDef, ast.Module)):
+        bodies = list(scope_node.body)
+    else:
+        return False
+    stack = list(bodies)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, _SCOPE_NODE_TYPES):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == name:
+            return True
+        stack.extend(ast.iter_child_nodes(node))
+    return False
+
+
+def _direct_global_nonlocal(scope_node: ast.AST, name: str) -> str | None:
+    """Return 'global'/'nonlocal' when *scope_node* declares *name* as such.
+
+    Only declarations directly in the scope are considered; nested scopes are
+    not descended into.
+    """
+    if isinstance(scope_node, ast.Lambda):
+        return None
+    bodies: list[ast.stmt] | None = None
+    if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+        bodies = scope_node.body
+    if bodies is None:
+        return None
+    stack: list[ast.AST] = list(bodies)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, _SCOPE_NODE_TYPES):
+            continue
+        if isinstance(node, ast.Global) and name in node.names:
+            return "global"
+        if isinstance(node, ast.Nonlocal) and name in node.names:
+            return "nonlocal"
+        stack.extend(ast.iter_child_nodes(node))
+    return None
+
+
+def _variable_shell_flag_same_scope(content: str, file_path: str, match: re.Match[str]) -> bool:
+    """Return whether a variable-shell-flag match is a same-scope data flow.
+
+    The regex cannot see Python scopes, so ``use_shell = True`` in one
+    function followed by ``shell=use_shell`` in another still matches.  Resolve
+    the matched assignment and the ``shell=`` use through the Python AST and
+    require the assignment to be visible from the use: identical scope chains,
+    a closure read from an enclosing scope, or a matching global/nonlocal
+    declaration.  Unparseable content keeps the candidate so a syntax error
+    cannot silence the signal.
+    """
+    var_name = match.group(1)
+    assign_line = content.count("\n", 0, match.start()) + 1
+    use_line = content.count("\n", 0, match.end()) + 1
+    tree = parse_python_source(content, file_path).tree
+    if tree is None:
+        return True
+    assign_node: ast.Assign | None = None
+    call_node: ast.Call | None = None
+    for node in ast.walk(tree):
+        if (
+            assign_node is None
+            and isinstance(node, ast.Assign)
+            and node.lineno == assign_line
+            and isinstance(node.value, ast.Constant)
+            and node.value.value is True
+            and any(
+                isinstance(target, ast.Name) and target.id == var_name for target in node.targets
+            )
+        ):
+            assign_node = node
+        if (
+            call_node is None
+            and isinstance(node, ast.Call)
+            and any(
+                keyword.arg == "shell"
+                and isinstance(keyword.value, ast.Name)
+                and keyword.value.id == var_name
+                and assign_line <= keyword.value.lineno <= use_line
+                for keyword in node.keywords
+            )
+        ):
+            call_node = node
+    if assign_node is None or call_node is None:
+        return True
+    assign_chain = _scope_chain(tree, assign_node)
+    use_chain = _scope_chain(tree, call_node)
+    if assign_chain is None or use_chain is None:
+        return True
+    if assign_chain == use_chain:
+        return True
+    if len(assign_chain) < len(use_chain) and use_chain[: len(assign_chain)] == assign_chain:
+        # Closure read: the use sits in a scope nested inside the assignment's
+        # scope, so the name resolves to the assigned value.
+        return True
+    use_scope = use_chain[-1]
+    if use_scope is not tree:
+        declaration = _direct_global_nonlocal(use_scope, var_name)
+        if declaration == "global":
+            return assign_chain == (tree,)
+        if declaration == "nonlocal":
+            binding = next(
+                (
+                    scope
+                    for scope in use_chain[-2::-1]
+                    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                    and _scope_binds_name(scope, var_name)
+                ),
+                None,
+            )
+            return binding is not None and assign_chain == _scope_chain(tree, binding)
+    return False
+
+
+def _tm1_candidates(
+    content: str,
+    *,
+    shell_content: str | None = None,
+) -> Iterator[tuple[int, int, str, float]]:
+    for pattern, confidence in TM1_PATTERNS:
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM1_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            yield match.start(), match.end(), match.group(0), confidence
+
+    yield from _tm1_shell_candidates(content)
+    if shell_content is not None and shell_content != content:
+        yield from _tm1_shell_candidates(shell_content)
+
+
+def _tm1_shell_candidates(content: str) -> Iterator[tuple[int, int, str, float]]:
+    seen_commands: set[tuple[int, int]] = set()
+    covered_until = 0
+    for command_start, body_start in _destructive_command_words(content):
+        if command_start < covered_until:
+            continue
+        command_key = (command_start, body_start)
+        if command_key in seen_commands:
+            continue
+        seen_commands.add(command_key)
+        # Documentation is excluded regardless of the shell parse result.  Apply
+        # that existing semantic gate first so large manuals do not pay for a
+        # character-by-character shell parse for every explanatory ``rm`` noun.
+        if _is_root_glob_documentation(content, command_start, body_start):
+            continue
+        tokens, command_end, _ = _bounded_shell_tokens(
+            content,
+            command_start,
+            body_start,
+        )
+        covered_until = max(covered_until, command_end)
+        command = content[command_start:command_end]
+        if _has_destructive_root_glob(tokens) or _has_destructive_root_path(tokens):
+            yield command_start, command_end, command, 0.9
+
+
+def _markdown_block_separator(line: str, check_runtime: Callable[[], None]) -> bool:
+    """Recognize Setext underlines/thematic breaks with bounded, linear work."""
+    line = line.strip(" \t")
+    marker = line[:1]
+    if marker not in {"=", "-", "*", "_"}:
+        return False
+    count = 0
+    internal_gap = False
+    for index, character in enumerate(line):
+        if index % 256 == 0:
+            check_runtime()
+        if character == marker:
+            count += 1
+        elif character in " \t" and marker != "=":
+            internal_gap = True
+        else:
+            return False
+    return count >= (3 if internal_gap or marker in {"*", "_"} else 1)
+
+
+def _markdown_table_cells(
+    line: str, start: int, check_runtime: Callable[[], None]
+) -> list[tuple[int, int]]:
+    """Locate GFM cells without copying content or changing source offsets."""
+    end = len(line)
+    while start < end and line[start] in " \t":
+        if start % 256 == 0:
+            check_runtime()
+        start += 1
+    while end > start and line[end - 1] in " \t":
+        if end % 256 == 0:
+            check_runtime()
+        end -= 1
+    if start == end:
+        return []
+    # Edge pipes are optional. In cmark-gfm a backslash immediately before a
+    # pipe escapes it even when that backslash follows another backslash.
+    if line[start] == "|":
+        start += 1
+    if line[end - 1] == "|" and (end == 1 or line[end - 2] != "\\"):
+        end -= 1
+    if start > end:
+        return []
+    cells: list[tuple[int, int]] = []
+    cell_start = start
+    for cursor in range(start, end):
+        if (cursor - start) % 256 == 0:
+            check_runtime()
+        if line[cursor] == "|" and (cursor == start or line[cursor - 1] != "\\"):
+            cells.append((cell_start, cursor))
+            cell_start = cursor + 1
+    cells.append((cell_start, end))
+    return cells
+
+
+def _markdown_table_delimiter_columns(
+    line: str, minimum_indent: int, check_runtime: Callable[[], None]
+) -> int | None:
+    """Prove a compatible delimiter row under the existing container scope."""
+    line = line.rstrip(LINE_BREAK_CHARS)
+    prefix = 0
+    column = 0
+    while prefix < len(line) and line[prefix] in " \t":
+        if prefix % 256 == 0:
+            check_runtime()
+        column += 4 - column % 4 if line[prefix] == "\t" else 1
+        prefix += 1
+    if column < minimum_indent or column >= 4 or prefix == len(line):
+        return None
+    if line[prefix] not in "|:-":
+        return None
+    # A new list item or a bare Setext/thematic underline takes precedence
+    # over table recognition, including a pipe-bearing preceding header.
+    if (
+        line[prefix] == "-" and prefix + 1 < len(line) and line[prefix + 1] in " \t"
+    ) or _markdown_block_separator(line, check_runtime):
+        return None
+    cells = _markdown_table_cells(line, prefix, check_runtime)
+    if not cells:
+        return None
+    for start, end in cells:
+        check_runtime()
+        while start < end and line[start] in " \t":
+            if start % 256 == 0:
+                check_runtime()
+            start += 1
+        while end > start and line[end - 1] in " \t":
+            if end % 256 == 0:
+                check_runtime()
+            end -= 1
+        if start < end and line[start] == ":":
+            start += 1
+        hyphen_start = start
+        while start < end and line[start] == "-":
+            if (start - hyphen_start) % 256 == 0:
+                check_runtime()
+            start += 1
+        if start == hyphen_start:
+            return None
+        if start < end and line[start] == ":":
+            start += 1
+        if start != end:
+            return None
+    return len(cells)
+
+
+def _markdown_shell_text(
+    content: str, check_runtime: Callable[[], None], *, complete_context: bool = True
+) -> str:
+    """Mask Markdown delimiters while retaining code and exact source offsets.
+
+    Inline code delimiters are not legacy shell substitutions. Fenced and
+    indented code stays literal; longer inline delimiters preserve backticks
+    inside their bodies. Pair equal-length runs in linear time.
+    """
+    output = list(content)
+    prose_apostrophes: set[int] = set()
+    runs: list[tuple[int, int]] = []
+    list_marker = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t])")
+    backtick_runs = re.compile(r"`+")
+
+    def mask_inline_delimiters() -> None:
+        if not complete_context:
+            runs.clear()
+            return
+        next_by_length: dict[int, int] = {}
+        closing: dict[int, int] = {}
+        for index in range(len(runs) - 1, -1, -1):
+            check_runtime()
+            start, end = runs[index]
+            length = end - start
+            if length in next_by_length:
+                closing[index] = next_by_length[length]
+            next_by_length[length] = index
+        index = 0
+        while index < len(runs):
+            check_runtime()
+            start, end = runs[index]
+            escape_start = start
+            while escape_start > 0 and content[escape_start - 1] == "\\":
+                escape_start -= 1
+            close_index = closing.get(index)
+            if (start - escape_start) % 2 or close_index is None:
+                index += 1
+                continue
+            close_start, close_end = runs[close_index]
+            output[start:end] = " " * (end - start)
+            output[close_start:close_end] = " " * (close_end - close_start)
+            index = close_index + 1
+        runs.clear()
+
+    # This is a conservative projection, not a general Markdown renderer.
+    # Container/HTML bodies with uncertain inline ownership remain literal.
+    fence: tuple[str, int, int] | None = None
+    quoted_block = False
+    html_end: str | None = None
+    paragraph_open = False
+    paragraph_in_list = False
+    paragraph_list_indent = 0
+    table_columns: int | None = None
+    table_minimum_indent = 0
+    table_delimiter_line = -1
+    offset = 0
+    lines = content.splitlines(keepends=True)
+    for line_index, line in enumerate(lines):
+        check_runtime()
+        stripped = line.rstrip(LINE_BREAK_CHARS)
+        leading = stripped.lstrip(" \t")
+        indentation = len(stripped[: len(stripped) - len(leading)].expandtabs(4))
+        # Interpret list padding in columns, preserving the original offsets.
+        # More than four columns after a marker can introduce indented code.
+        prefix = len(stripped) - len(leading)
+        column = indentation
+        list_indented = False
+        has_list_marker = False
+        list_markers = 0
+        if indentation < 4:
+            while marker := list_marker.match(stripped, prefix):
+                check_runtime()
+                if (
+                    not has_list_marker
+                    and paragraph_open
+                    and not paragraph_in_list
+                    and marker[0][0].isdigit()
+                    and int(marker[0][:-1]) != 1
+                ):
+                    # Only a list starting at 1 can interrupt a paragraph.
+                    # Other numbers may be literal text within an inline span.
+                    break
+                has_list_marker = True
+                list_markers += 1
+                column += marker.end() - prefix
+                prefix = marker.end()
+                padding_start = column
+                while prefix < len(stripped) and stripped[prefix] in " \t":
+                    check_runtime()
+                    column += 4 - column % 4 if stripped[prefix] == "\t" else 1
+                    prefix += 1
+                if column - padding_start > 4:
+                    list_indented = True
+                    break
+            leading = stripped[prefix:]
+        quote_start = indentation < 4 and leading.startswith(">")
+        heading = indentation < 4 and re.match(r"#{1,6}(?:[ \t]|$)", leading) is not None
+        separator = indentation < 4 and _markdown_block_separator(stripped, check_runtime)
+        setext_only = separator and (leading.startswith("=") or leading.rstrip(" \t") == "--")
+        empty_list_item = (
+            not paragraph_open and re.fullmatch(r"(?:[-+*]|[0-9]{1,9}[.)])", leading) is not None
+        )
+        if table_columns is not None and setext_only:
+            # A table row has no paragraph for a Setext underline to close.
+            # Single '-' still starts an empty item; '---' remains thematic.
+            separator = False
+        html_open = re.match(r"<(?:[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)|[!?/])", leading)
+        continuing_paragraph = False
+        if table_columns is not None and (
+            html_end is not None
+            or fence is not None
+            or quote_start
+            or quoted_block
+            or html_open
+            or not leading
+            or indentation >= 4
+            or indentation < table_minimum_indent
+            or list_indented
+            or has_list_marker
+            or empty_list_item
+            or heading
+            or separator
+        ):
+            table_columns = None
+        if html_end is not None:
+            mask_inline_delimiters()
+            if (html_end and html_end in leading.lower()) or (not html_end and not leading):
+                html_end = None
+        elif fence is not None:
+            fence_body = stripped.lstrip(" \t")
+            closing_fence = MARKDOWN_FENCE_CLOSE.fullmatch(fence_body)
+            if (
+                closing_fence
+                and 0 <= indentation - fence[2] <= 3
+                and closing_fence[1][0] == fence[0]
+                and len(closing_fence[1]) >= fence[1]
+            ):
+                begin, end = closing_fence.span(1)
+                body_start = offset + len(stripped) - len(fence_body)
+                output[body_start + begin : body_start + end] = " " * (end - begin)
+                fence = None
+        elif quote_start or quoted_block:
+            mask_inline_delimiters()
+            quoted_block = bool(leading)
+        elif html_open:
+            mask_inline_delimiters()
+            raw_tag = re.match(r"<(pre|script|style|textarea)(?=[\s/>]|$)", leading, re.I)
+            terminator = (
+                f"</{raw_tag[1].lower()}>"
+                if raw_tag
+                else "-->"
+                if leading.startswith("<!--")
+                else "?>"
+                if leading.startswith("<?")
+                else "]]>"
+                if leading.startswith("<![CDATA[")
+                else ">"
+                if re.match(r"<![A-Z]", leading)
+                else ""
+            )
+            html_end = None if terminator and terminator in leading.lower() else terminator
+        elif not leading or indentation >= 4 or list_indented:
+            mask_inline_delimiters()
+        else:
+            # Inline code may continue within a paragraph/list item, but cannot
+            # pair with delimiters in a new item, heading, or following block.
+            if has_list_marker or heading or separator:
+                mask_inline_delimiters()
+            # The body after any list markers can begin a fenced block.
+            opening = MARKDOWN_FENCE_OPEN.fullmatch(stripped[prefix:])
+            if opening:
+                mask_inline_delimiters()
+                fence = (opening[1][0], len(opening[1]), column if has_list_marker else 0)
+                begin, end = opening.span(1)
+                output[offset + prefix + begin : offset + prefix + end] = " " * (end - begin)
+            else:
+                minimum_indent = (
+                    column if has_list_marker else paragraph_list_indent if paragraph_in_list else 0
+                )
+                if (
+                    table_columns is None
+                    and not heading
+                    and not empty_list_item
+                    and (not separator or setext_only and not paragraph_open)
+                    and list_markers <= 1
+                    and (has_list_marker or indentation >= minimum_indent)
+                    and line_index + 1 < len(lines)
+                ):
+                    columns = _markdown_table_delimiter_columns(
+                        lines[line_index + 1], minimum_indent, check_runtime
+                    )
+                    if (
+                        columns is not None
+                        and len(_markdown_table_cells(stripped, prefix, check_runtime)) == columns
+                    ):
+                        # Establish the header boundary before pairing any
+                        # opener from the preceding paragraph with this row.
+                        mask_inline_delimiters()
+                        # A Setext-looking line at a fresh block boundary is
+                        # a header only after the next row proves that role.
+                        separator = False
+                        table_columns = columns
+                        table_minimum_indent = minimum_indent
+                        table_delimiter_line = line_index + 1
+                if table_columns is not None:
+                    mask_inline_delimiters()
+                    if line_index != table_delimiter_line:
+                        cells = _markdown_table_cells(stripped, prefix, check_runtime)
+                        for cell_index, (cell_start, cell_end) in enumerate(cells):
+                            if cell_index >= table_columns:
+                                # GFM drops excess body cells: no rendered
+                                # inline node can grant ownership to their ticks.
+                                break
+                            for match in backtick_runs.finditer(stripped, cell_start, cell_end):
+                                check_runtime()
+                                runs.append((offset + match.start(), offset + match.end()))
+                            mask_inline_delimiters()
+                        if not cells:
+                            table_columns = None
+                elif not separator and not empty_list_item:
+                    if (
+                        complete_context
+                        and not runs
+                        and not heading
+                        and len(leading) <= 512
+                        and (prose := _MARKDOWN_CONTRACTION_PROSE_RE.fullmatch(leading))
+                    ):
+                        # A whole plain-language sentence, including a parsed
+                        # list-item body, owns its contraction;
+                        # it is not an unclosed shell quote spanning later prose.
+                        # The restrictive grammar excludes code delimiters and
+                        # shell syntax. Fences, indented code, HTML, tables, and
+                        # pending multiline inline spans never reach this rule.
+                        prose_apostrophes.add(offset + prefix + prose.start("apostrophe"))
+                    for match in backtick_runs.finditer(line):
+                        check_runtime()
+                        runs.append((offset + match.start(), offset + match.end()))
+                    if heading:
+                        mask_inline_delimiters()
+                    else:
+                        continuing_paragraph = True
+                        paragraph_in_list = has_list_marker or paragraph_in_list
+                        if has_list_marker:
+                            paragraph_list_indent = column
+        paragraph_open = continuing_paragraph
+        if not paragraph_open:
+            paragraph_in_list = False
+            paragraph_list_indent = 0
+        offset += len(line)
+    mask_inline_delimiters()
+    projected = "".join(output)
+    if prose_apostrophes:
+        # A prose-looking line can still be inside an earlier shell word, such
+        # as a multiline bash -c string. Reuse the shell parser to preserve that
+        # ownership before masking any apostrophe. Unresolved words retain all
+        # remaining bytes; this pass never grants ownership past a parse limit.
+        cursor = 0
+        next_runtime_check = 0
+        last_apostrophe = max(prose_apostrophes)
+        parameter_ends: dict[int, _ParameterExpansionEnd] = {}
+        substitution_ends: dict[int, int | None] = {}
+        backtick_ends: dict[int, int | None] = {}
+        while cursor <= last_apostrophe:
+            if cursor >= next_runtime_check:
+                check_runtime()
+                next_runtime_check = cursor + 4096
+            if cursor in prose_apostrophes:
+                output[cursor] = " "
+            elif projected[cursor] in "'\"`$\\":
+                parsed = _parse_shell_command_word(
+                    projected,
+                    cursor,
+                    parameter_ends,
+                    substitution_ends,
+                    backtick_ends,
+                    check_runtime=check_runtime,
+                )
+                if parsed is None or parsed.limited:
+                    break
+                cursor = max(cursor + 1, parsed.end)
+                continue
+            cursor += 1
+        return "".join(output)
+    return projected
+
+
+def has_bounded_parse_exhaustion(
+    content: str,
+    check_runtime: Callable[[], None],
+    *,
+    file_type: str = "shell",
+    complete_context: bool = True,
+) -> bool:
+    """Return whether a destructive rm command exceeded the parser's span contract."""
+    # PowerShell source can invoke another shell with an executable command
+    # string. Apply the same bounded checks to those strings; benign PowerShell
+    # -replace values have their own narrowly proven expression context.
+    structural_quote_closers = None
+    structural_quote_openers = None
+    json_strings: list[tuple[int, int]] = []
+    python_source = None
+    if file_type == "perl" and complete_context:
+        content = _perl_literal_print_shell_text(content, check_runtime)
+    if file_type == "python" and complete_context:
+        # Only a complete module can prove Python token ownership. A fragment
+        # may begin inside a string and would invert code and literal bytes.
+        python_source = _PythonSourceOwnership(content, check_runtime)
+    if file_type == "markdown":
+        if complete_context:
+            json_strings = validated_json_string_spans(content, check_runtime)
+            structural_quote_closers = {end - 1 for _, end in json_strings}
+            structural_quote_openers = {start for start, _ in json_strings}
+        content = _markdown_shell_text(content, check_runtime, complete_context=complete_context)
+    # Perl ``eval BLOCK`` is recognized from its clause-initial ``eval`` and the
+    # adjacent brace alone, so unlike quote ownership it needs no full context.
+    if _has_shell_command_word_exhaustion(
+        content,
+        check_runtime,
+        structural_quote_closers=structural_quote_closers,
+        structural_quote_openers=structural_quote_openers,
+        python_source=python_source,
+        perl_eval_blocks=file_type == "perl",
+    ):
+        return True
+    covered_until = 0
+    for command_start, body_start in _destructive_command_words(content):
+        check_runtime()
+        if command_start < covered_until:
+            continue
+        # A recognized prose description cannot contribute parse exhaustion:
+        # the same predicate below would discard it after parsing.  Short-circuit
+        # it here to keep bounded-runtime accounting linear for documentation.
+        if _is_root_glob_documentation(content, command_start, body_start):
+            continue
+        tokens, command_end, exhausted = _bounded_shell_tokens(
+            content,
+            command_start,
+            body_start,
+            check_runtime=check_runtime,
+        )
+        covered_until = max(covered_until, command_end)
+        if exhausted or _has_unsupported_brace_expansion(tokens):
+            return True
+    # A literal candidate outside a JSON string can consume it before the
+    # whole-content parser reaches its structural opener. Recover each proven
+    # string independently, without bypassing that parser's forward watermark
+    # and reparsing overlapping suffixes. These raw spans are disjoint and
+    # bounded by JSON validation. Reuse the whole-document projection so each
+    # string retains its original fenced/literal or inline-code ownership.
+    # Reinterpreting a string as standalone Markdown could mask shell backticks
+    # that were literal inside its surrounding code fence. The projection keeps
+    # source offsets, outer JSON quotes and escaped bytes unchanged.
+    for start, end in json_strings:
+        check_runtime()
+        projected = content[start:end]
+        if _has_shell_command_word_exhaustion(
+            projected,
+            check_runtime,
+            structural_quote_openers={0},
+            structural_quote_closers={len(projected) - 1},
+        ):
+            return True
+    return False
+
+
+def _line_containing(content: str, start: int, end: int) -> str:
+    """Return the full line containing a regex match."""
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    if line_end == -1:
+        line_end = len(content)
+    return content[line_start:line_end]
+
+
+def analyze(content: str, file_path: str, file_type: str) -> list[AnalyzerFinding]:
+    """Analyze content for tool misuse patterns (TM1–TM3)."""
+    findings: list[AnalyzerFinding] = []
+
+    def loc(ln: int) -> Location:
+        return Location(file=file_path, start_line=ln)
+
+    def ctx(start: int) -> str:
+        return get_context(content, start)
+
+    tag = [PatternCategory.TOOL_MISUSE.value]
+    tm1_findings_by_key: dict[tuple[int, str], AnalyzerFinding] = {}
+
+    # The variable-shell-flag regex cannot see Python scopes, so an assignment
+    # in one function and a shell= use in another still match.  Drop those
+    # cross-scope candidates for Python files.
+    cross_scope_starts: set[int] = set()
+    if file_type == "python":
+        for variable_match in _VARIABLE_SHELL_FLAG_RE.finditer(content):
+            if not _variable_shell_flag_same_scope(content, file_path, variable_match):
+                cross_scope_starts.add(variable_match.start())
+
+    shell_content = (
+        _perl_literal_print_shell_text(content, lambda: None) if file_type == "perl" else None
+    )
+    for match_start, match_end, matched_text, confidence in _tm1_candidates(
+        content, shell_content=shell_content
+    ):
+        if match_start in cross_scope_starts:
+            continue
+        line_num = get_line_number(content, match_start)
+        context_text = ctx(match_start)
+        matched = matched_text[:200]
+        matched_line = _line_containing(content, match_start, match_end)
+
+        if (
+            _is_safe_container_command(context_text)
+            or _is_safe_dockerfile_idiom(context_text, matched)
+            or _is_safe_cache_cleanup(matched_line)
+        ):
+            adj = min(confidence, 0.15)
+            sev = Severity.LOW
+        else:
+            adj = (
+                min(1.0, confidence + 0.1)
+                if file_type in ("python", "shell", "javascript")
+                else confidence
+            )
+            sev = Severity.HIGH
+        candidate_key = (line_num, " ".join(matched.strip().split()))
+        existing = tm1_findings_by_key.get(candidate_key)
+        if existing is not None:
+            if adj > existing.confidence:
+                existing.confidence = adj
+                existing.severity = sev
+            continue
+        finding = AnalyzerFinding(
+            rule_id="TM1",
+            message="Tool Parameter Abuse",
+            severity=sev,
+            location=loc(line_num),
+            confidence=adj,
+            tags=tag,
+            context=context_text,
+            matched_text=matched,
+            complete_match=matched_text,
+            evidence={static_runner._VIEW_START_EVIDENCE: match_start},
+        )
+        tm1_findings_by_key[candidate_key] = finding
+        findings.append(finding)
+    for pattern, confidence in TM2_PATTERNS:
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM2_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = get_line_number(content, match.start())
+            context_text = ctx(match.start())
+            matched = match.group(0)[:200]
+
+            if _is_safe_dockerfile_idiom(context_text, matched):
+                adj = min(confidence, 0.15)
+                sev = Severity.LOW
+            else:
+                adj = confidence
+                sev = Severity.HIGH
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="TM2",
+                    message="Chaining Abuse",
+                    severity=sev,
+                    location=loc(line_num),
+                    confidence=adj,
+                    tags=tag,
+                    context=context_text,
+                    matched_text=matched,
+                    complete_match=match.group(0),
+                )
+            )
+    for pattern, confidence in TM3_PATTERNS:
+        matches = (
+            static_runner.iter_paragraph_matches
+            if (pattern, confidence) in TM3_PROSE_PATTERNS
+            else re.finditer
+        )
+        for match in matches(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = get_line_number(content, match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="TM3",
+                    message="Unsafe Defaults",
+                    severity=Severity.MEDIUM,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=tag,
+                    context=ctx(match.start()),
+                    matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
+                )
+            )
+    # TM4: privileged K8s workload. Example filtering is delegated to the runner,
+    # which keeps reference material because it is part of the skill. Findings in
+    # top-level `references/` are tagged for triage only; the agent reads those
+    # files as instructions, so confidence and score are left unchanged.
+    reference_material = is_reference_material(file_path, file_type)
+    tm4_tags = [*tag, "contextual-triage", "likely-benign-context"] if reference_material else tag
+    for pattern, confidence in TM4_PATTERNS:
+        for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+            line_num = get_line_number(content, match.start())
+            findings.append(
+                AnalyzerFinding(
+                    rule_id="TM4",
+                    message="Privileged Kubernetes Workload",
+                    severity=Severity.HIGH,
+                    location=loc(line_num),
+                    confidence=confidence,
+                    tags=tm4_tags,
+                    context=ctx(match.start()),
+                    matched_text=match.group(0)[:200],
+                    complete_match=match.group(0),
+                )
+            )
+    return findings
+
+
+def node(state: SkillspectorState) -> AnalyzerNodeResponse:
+    """Run tool_misuse patterns and return findings."""
+    response = static_runner.run_static_patterns_with_ledger(state, [sys.modules[__name__]])
+    logger.info("%s: %d findings", ANALYZER_ID, len(response["findings"]))
+    return response

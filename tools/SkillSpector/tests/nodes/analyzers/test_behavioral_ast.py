@@ -1,0 +1,858 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for behavioral_ast analyzer: AST-based dangerous execution detection."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from skillspector.nodes.analyzers import behavioral_ast
+from skillspector.nodes.deduplicate import deduplicate
+from skillspector.state import WorkflowResourceBudget
+
+
+def _run(code: str, filename: str = "script.py") -> list:
+    state = {
+        "components": [filename],
+        "file_cache": {filename: code},
+    }
+    result = behavioral_ast.node(state)
+    return result["findings"]
+
+
+class TestExecDetection:
+    def test_same_line_exec_calls_keep_exact_node_identities(self) -> None:
+        """Separate AST calls on one line must not compact as one whole-line match."""
+        findings = _run('exec("first_payload_alpha"); exec("second_payload_beta")')
+        ast1 = [finding for finding in findings if finding.rule_id == "AST1"]
+
+        assert len(ast1) == 2
+        assert len({finding.fingerprint() for finding in ast1}) == 2
+        assert len(deduplicate(ast1)) == 2
+
+    def test_same_match_at_different_columns_groups_distinct_occurrences(self) -> None:
+        findings = _run('exec("same_payload")\nif True:\n    exec("same_payload")\n')
+        ast1 = [finding for finding in findings if finding.rule_id == "AST1"]
+
+        assert len(ast1) == 2
+        assert len({finding.fingerprint() for finding in ast1}) == 1
+        assert {finding.start_column for finding in ast1} == {0, 4}
+
+        compacted = deduplicate(ast1)
+        assert len(compacted) == 1
+        assert {
+            (item["start_line"], item["start_column"]) for item in compacted[0].occurrences
+        } == {
+            (1, 0),
+            (3, 4),
+        }
+
+    def test_utf8_ast_columns_are_published_as_character_columns(self) -> None:
+        code = 'label = "🦄"; exec(\n    "payload"\n)\n'
+        ast1 = next(finding for finding in _run(code) if finding.rule_id == "AST1")
+
+        assert ast1.matched_text == 'exec(\n    "payload"\n)'
+        assert ast1.start_line == 1
+        assert ast1.start_column == code.index("exec")
+        assert ast1.end_line == 3
+        assert ast1.end_column == 1
+
+    def test_many_same_line_calls_use_preindexed_source_slices(self, monkeypatch) -> None:
+        def fail_full_source_rescan(*_args, **_kwargs):
+            raise AssertionError("ast.get_source_segment must not run per finding")
+
+        monkeypatch.setattr(behavioral_ast.ast, "get_source_segment", fail_full_source_rescan)
+        call_count = 2_000
+        code = "; ".join('exec("payload")' for _ in range(call_count))
+
+        ast1 = [finding for finding in _run(code) if finding.rule_id == "AST1"]
+
+        assert len(ast1) == call_count
+        assert ast1[0].start_column == 0
+        assert ast1[-1].start_column == code.rindex("exec")
+
+    def test_long_line_context_is_centered_on_the_ast_call(self) -> None:
+        prefix = "value = 0; " * 150
+        code = prefix + 'exec("LATE_AST_PAYLOAD")'
+
+        ast1 = next(finding for finding in _run(code) if finding.rule_id == "AST1")
+
+        assert ast1.start_column == len(prefix)
+        assert ast1.context is not None
+        assert len(ast1.context) <= 1_000
+        assert 'exec("LATE_AST_PAYLOAD")' in ast1.context
+
+    def test_exec_produces_ast1(self):
+        findings = _run('exec("print(1)")')
+        ast1 = [f for f in findings if f.rule_id == "AST1"]
+        assert len(ast1) == 1
+        assert ast1[0].severity == "HIGH"
+        assert ast1[0].file == "script.py"
+        assert ast1[0].start_line == 1
+
+    def test_exec_with_variable(self):
+        findings = _run("code = 'x = 1'\nexec(code)")
+        assert any(f.rule_id == "AST1" for f in findings)
+
+
+class TestEvalDetection:
+    def test_eval_produces_ast2(self):
+        findings = _run('result = eval("2 + 2")')
+        ast2 = [f for f in findings if f.rule_id == "AST2"]
+        assert len(ast2) == 1
+        assert ast2[0].severity == "HIGH"
+
+    def test_eval_in_function(self):
+        code = "def run(expr):\n    return eval(expr)\n"
+        findings = _run(code)
+        assert any(f.rule_id == "AST2" for f in findings)
+
+
+class TestDunderImport:
+    def test_dunder_import_produces_ast3(self):
+        findings = _run('mod = __import__("os")')
+        ast3 = [f for f in findings if f.rule_id == "AST3"]
+        assert len(ast3) == 1
+        assert ast3[0].severity == "MEDIUM"
+
+
+class TestSubprocess:
+    def test_long_ast_matches_use_complete_source_identity(self):
+        def code(tail: str) -> str:
+            shared_arguments = "\n".join(f'    "{"a" * 80}",' for _ in range(5))
+            return f'import subprocess\nsubprocess.run([\n{shared_arguments}\n    "{tail}",\n])\n'
+
+        first_code = code("UNIQUE_FIRST_TAIL")
+        second_code = code("UNIQUE_SECOND_TAIL")
+        first = next(f for f in _run(first_code, "first.py") if f.rule_id == "AST4")
+        second = next(f for f in _run(second_code, "second.py") if f.rule_id == "AST4")
+
+        assert first.matched_text == second.matched_text
+        assert len(first.matched_text or "") == 200
+        assert first.fingerprint() != second.fingerprint()
+        assert len(deduplicate([first, second])) == 2
+        assert "UNIQUE_FIRST_TAIL" not in json.dumps(first.to_dict(), sort_keys=True)
+
+    def test_subprocess_run_produces_ast4(self):
+        code = 'import subprocess\nsubprocess.run(["ls", "-la"])'
+        findings = _run(code)
+        ast4 = [f for f in findings if f.rule_id == "AST4"]
+        assert len(ast4) == 1
+        assert ast4[0].severity == "MEDIUM"
+
+    def test_subprocess_popen_produces_ast4(self):
+        code = 'import subprocess\nsubprocess.Popen(["cat", "/etc/passwd"])'
+        findings = _run(code)
+        assert any(f.rule_id == "AST4" for f in findings)
+
+    def test_subprocess_check_output_produces_ast4(self):
+        code = 'import subprocess\nsubprocess.check_output(["whoami"])'
+        findings = _run(code)
+        assert any(f.rule_id == "AST4" for f in findings)
+
+
+class TestOsSystem:
+    def test_os_system_produces_ast5(self):
+        code = 'import os\nos.system("rm -rf /")'
+        findings = _run(code)
+        ast5 = [f for f in findings if f.rule_id == "AST5"]
+        assert len(ast5) == 1
+        assert ast5[0].severity == "HIGH"
+
+    def test_os_popen_produces_ast5(self):
+        code = 'import os\nos.popen("whoami")'
+        findings = _run(code)
+        assert any(f.rule_id == "AST5" for f in findings)
+
+
+class TestCompile:
+    def test_compile_produces_ast6(self):
+        code = 'code = compile("x = 1", "<string>", "exec")'
+        findings = _run(code)
+        ast6 = [f for f in findings if f.rule_id == "AST6"]
+        assert len(ast6) == 1
+        assert ast6[0].severity == "MEDIUM"
+
+
+class TestDynamicGetattr:
+    def test_getattr_with_variable_produces_ast7(self):
+        code = "attr = 'secret'\nval = getattr(obj, attr)"
+        findings = _run(code)
+        ast7 = [f for f in findings if f.rule_id == "AST7"]
+        assert len(ast7) == 1
+        assert ast7[0].severity == "LOW"
+
+    def test_getattr_with_literal_no_finding(self):
+        code = 'val = getattr(obj, "name")'
+        findings = _run(code)
+        assert not any(f.rule_id == "AST7" for f in findings)
+
+    def test_getattr_with_direct_non_string_literal_is_silent(self):
+        findings = _run("getattr(obj, 42)")
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    def test_getattr_with_constructed_benign_name_remains_dynamic(self):
+        findings = _run("getattr(subprocess, ''.join(['P', 'o', 'p', 'e', 'n']))(cmd)")
+        assert any(f.rule_id == "AST7" for f in findings)
+
+
+class TestReflectiveGetattrExec:
+    """getattr(obj, "<sink>")(...) is a reflective handle on an exec/os sink.
+
+    It evades AST1/AST5 (the inner getattr has a *constant* name so AST7 is skipped,
+    and the outer call's func is an ast.Call whose name does not resolve), so it must
+    be caught directly as AST9.
+    """
+
+    def test_getattr_os_system_produces_ast9(self):
+        findings = _run("import os\ngetattr(os, 'system')('id')")
+        ast9 = [f for f in findings if f.rule_id == "AST9"]
+        assert len(ast9) == 1
+        assert ast9[0].severity == "HIGH"
+
+    def test_getattr_builtins_exec_produces_ast9(self):
+        findings = _run("import builtins\ngetattr(builtins, 'exec')(payload)")
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    def test_getattr_joined_exec_name_produces_ast9(self):
+        findings = _run(
+            "import builtins\ngetattr(builtins, ''.join(['e', 'x', 'e', 'c']))(payload)"
+        )
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    def test_getattr_eval_double_quotes_produces_ast9(self):
+        findings = _run('import builtins\ngetattr(builtins, "eval")("2+2")')
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    def test_getattr_os_popen_produces_ast9(self):
+        findings = _run("import os\nhandle = getattr(os, 'popen')('whoami')")
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    def test_reflective_getattr_does_not_emit_ast7(self):
+        # A constant name must not also trip the non-literal AST7 rule.
+        findings = _run("import os\ngetattr(os, 'system')('id')")
+        assert not any(f.rule_id == "AST7" for f in findings)
+
+    def test_benign_constant_attr_no_ast9(self):
+        # Common, safe reflective access must stay unflagged (near-zero false positives).
+        for name in ("name", "timeout", "value", "data", "run", "compile"):
+            findings = _run(f"v = getattr(config, '{name}')")
+            assert not any(f.rule_id == "AST9" for f in findings), name
+
+
+class TestJoinedGetattrNameBounds:
+    """Joined getattr names must be length-bounded before the join allocates.
+
+    A parseable source can carry a separator/element combination whose expanded
+    join dwarfs the source-size gate; resolving it would allocate the full
+    payload from untrusted skill source. Over-cap joins must return unresolved
+    so the caller keeps the existing AST7 dynamic-name fallback (never AST9),
+    while bounded joins keep their AST7/AST9 classification.
+    """
+
+    @staticmethod
+    def _resolve(join_code: str):
+        node = behavioral_ast.ast.parse(join_code, mode="eval").body
+        return behavioral_ast._constant_string(node)
+
+    def test_huge_separator_and_list_return_unresolved_without_allocating(self):
+        # Reviewer P1 example shape: a 100,000-character separator joined over
+        # 10,000 empty literals fits in ~130,024 source characters but expands
+        # to ~999,900,000. The test builds the source, never the payload.
+        separator = "x" * 100_000
+        elements = ", ".join(["''"] * 10_000)
+        assert self._resolve(f"{separator!r}.join([{elements}])") is None
+
+    def test_nested_join_returns_unresolved(self):
+        # The inner join is already over the cap, so the whole expression
+        # must stay unresolved.
+        assert self._resolve("'-'.join(['p', 'ab'.join(['xy'] * 30)])") is None
+
+    def test_bounded_join_still_resolves(self):
+        assert self._resolve("''.join(['e', 'x', 'e', 'c'])") == "exec"
+
+    def test_over_cap_join_falls_back_to_ast7_not_ast9(self):
+        separator = "x" * 64
+        elements = ", ".join(["''"] * 300)
+        findings = _run(f"import os\ngetattr(os, {separator!r}.join([{elements}]))(cmd)")
+        assert any(f.rule_id == "AST7" for f in findings)
+        assert not any(f.rule_id == "AST9" for f in findings)
+
+    def test_over_cap_join_spelling_dangerous_name_stays_ast7(self):
+        # Even when the bounded parts would spell a dangerous name, an
+        # over-cap join must not resolve to it.
+        elements = ", ".join(["'e'", "'x'", "'e'", "'c'"] + ["''"] * 300)
+        findings = _run(f"import os\ngetattr(os, {('x' * 64)!r}.join([{elements}]))(cmd)")
+        assert not any(f.rule_id == "AST9" for f in findings)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+
+class TestModuleDictSubscript:
+    """<module>.__dict__[key] / vars(<module>)[key] are subscript getattr equivalents.
+
+    Both index the module namespace, so they must get the same AST7/AST9
+    treatment as getattr(module, key); changing only the spelling must not
+    change the verdict.
+    """
+
+    def test_dunder_dict_computed_key_produces_ast7(self):
+        code = 'import os\nhandle = os.__dict__["po" + "pen"]("id")'
+        findings = _run(code)
+        ast7 = [f for f in findings if f.rule_id == "AST7"]
+        assert len(ast7) == 1
+        assert ast7[0].severity == "LOW"
+        assert "__dict__" in ast7[0].message
+
+    def test_dunder_dict_literal_sink_produces_ast9(self):
+        code = 'import os\nhandle = os.__dict__["popen"]("whoami")'
+        findings = _run(code)
+        ast9 = [f for f in findings if f.rule_id == "AST9"]
+        assert len(ast9) == 1
+        assert ast9[0].severity == "HIGH"
+
+    def test_vars_module_computed_key_produces_ast7(self):
+        code = "import os\nkey = 'po' + 'pen'\nhandle = vars(os)[key]"
+        findings = _run(code)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+    def test_aliased_module_dunder_dict_produces_ast7(self):
+        code = "import os as o\nkey = 'system'\nhandle = o.__dict__[key]"
+        findings = _run(code)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+    def test_instance_dunder_dict_no_finding(self):
+        # Instance attribute bags are idiomatic and must stay unflagged.
+        code = "class C:\n    def set(self, key, value):\n        self.__dict__[key] = value"
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    def test_dunder_dict_safe_literal_no_finding(self):
+        code = 'import os\nenv = os.__dict__["environ"]'
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+
+class TestModuleDictReadMethods:
+    """<module>.__dict__.get/setdefault/pop(key) (and the same on vars(<module>))
+    are further spellings of the same reflective access as the subscript form.
+
+    Each of the three returns the identical object a subscript would for any
+    key that already exists — every name in ``_DANGEROUS_GETATTR_NAMES`` always
+    does, on the module that defines it — so all three must get the same
+    AST7/AST9 treatment: an evasion that only changes spelling must not change
+    the verdict, no matter how many method-call spellings it has.
+    """
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_dunder_dict_method_computed_key_produces_ast7(self, method):
+        code = f'import os\nhandle = os.__dict__.{method}("po" + "pen")("id")'
+        findings = _run(code)
+        ast7 = [f for f in findings if f.rule_id == "AST7"]
+        assert len(ast7) == 1
+        assert ast7[0].severity == "LOW"
+        assert "__dict__" in ast7[0].message
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_dunder_dict_method_literal_sink_produces_ast9(self, method):
+        code = f'import os\nhandle = os.__dict__.{method}("popen")("whoami")'
+        findings = _run(code)
+        ast9 = [f for f in findings if f.rule_id == "AST9"]
+        assert len(ast9) == 1
+        assert ast9[0].severity == "HIGH"
+
+    def test_dunder_dict_get_with_default_still_detected(self):
+        code = 'import os\nhandle = os.__dict__.get("popen", None)("whoami")'
+        findings = _run(code)
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    def test_dunder_dict_setdefault_with_default_still_detected(self):
+        code = 'import os\nhandle = os.__dict__.setdefault("popen", None)("whoami")'
+        findings = _run(code)
+        assert any(f.rule_id == "AST9" for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_vars_module_method_computed_key_produces_ast7(self, method):
+        code = f"import os\nkey = 'po' + 'pen'\nhandle = vars(os).{method}(key)"
+        findings = _run(code)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_aliased_module_dunder_dict_method_produces_ast7(self, method):
+        code = f"import os as o\nkey = 'system'\nhandle = o.__dict__.{method}(key)"
+        findings = _run(code)
+        assert any(f.rule_id == "AST7" for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_instance_dunder_dict_method_no_finding(self, method):
+        # Instance attribute bags are idiomatic and must stay unflagged.
+        code = f"class C:\n    def get_key(self, key):\n        return self.__dict__.{method}(key)"
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_vars_self_method_no_finding(self, method):
+        code = f"class C:\n    def get_key(self, key):\n        return vars(self).{method}(key)"
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_dunder_dict_method_safe_literal_no_finding(self, method):
+        code = f'import os\nenv = os.__dict__.{method}("environ")'
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+    @pytest.mark.parametrize("method", ["get", "setdefault", "pop"])
+    def test_unrelated_method_call_no_finding(self, method):
+        # A plain dict method unrelated to any module namespace must stay silent.
+        code = f'd = {{"a": 1}}\nval = d.{method}("a")'
+        findings = _run(code)
+        assert not any(f.rule_id in ("AST7", "AST9") for f in findings)
+
+
+class TestDangerousChains:
+    def test_exec_compile_chain_produces_ast8(self):
+        code = 'exec(compile("x = 1", "<string>", "exec"))'
+        findings = _run(code)
+        ast8 = [f for f in findings if f.rule_id == "AST8"]
+        assert len(ast8) >= 1
+        assert ast8[0].severity == "CRITICAL"
+        assert "compile" in ast8[0].message
+
+    def test_eval_base64_chain_produces_ast8(self):
+        code = "import base64\neval(base64.b64decode(payload))"
+        findings = _run(code)
+        ast8 = [f for f in findings if f.rule_id == "AST8"]
+        assert len(ast8) >= 1
+        assert "base64" in ast8[0].message
+
+    def test_exec_urllib_chain_produces_ast8(self):
+        code = "import urllib.request\nexec(urllib.request.urlopen(url).read())"
+        findings = _run(code)
+        ast8 = [f for f in findings if f.rule_id == "AST8"]
+        assert len(ast8) >= 1
+
+    def test_exec_import_chain_produces_ast8(self):
+        code = 'exec(__import__("os").system("id"))'
+        findings = _run(code)
+        ast8 = [f for f in findings if f.rule_id == "AST8"]
+        assert len(ast8) >= 1
+
+
+class TestInsecureDeserialization:
+    """AST10: deserializers that reconstruct arbitrary objects / execute code."""
+
+    def test_pickle_loads_produces_ast10(self):
+        findings = _run("import pickle\nobj = pickle.loads(data)")
+        ast10 = [f for f in findings if f.rule_id == "AST10"]
+        assert len(ast10) == 1
+        assert ast10[0].severity == "MEDIUM"
+        assert "pickle.loads" in ast10[0].message
+
+    def test_pickle_load_produces_ast10(self):
+        findings = _run('import pickle\nobj = pickle.load(open("f.pkl", "rb"))')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_marshal_loads_produces_ast10(self):
+        findings = _run("import marshal\nmarshal.loads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_dill_loads_produces_ast10(self):
+        findings = _run("import dill\ndill.loads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_jsonpickle_decode_produces_ast10(self):
+        findings = _run("import jsonpickle\njsonpickle.decode(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_pandas_read_pickle_produces_ast10(self):
+        findings = _run('import pandas as pd\ndf = pd.read_pickle("data.pkl")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_joblib_load_produces_ast10(self):
+        findings = _run('import joblib\nm = joblib.load("model.pkl")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_unsafe_load_produces_ast10(self):
+        findings = _run("import yaml\nyaml.unsafe_load(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_from_import_alias_evasion(self):
+        findings = _run("from pickle import loads\nloads(blob)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    # ── yaml.load: argument-aware ─────────────────────────────────────
+
+    def test_yaml_load_without_loader_produces_ast10(self):
+        findings = _run("import yaml\nyaml.load(s)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_safe_loader_kwarg_no_finding(self):
+        findings = _run("import yaml\nyaml.load(s, Loader=yaml.SafeLoader)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_safe_loader_positional_no_finding(self):
+        findings = _run("import yaml\nyaml.load(s, yaml.SafeLoader)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_load_with_unsafe_loader_produces_ast10(self):
+        findings = _run("import yaml\nyaml.load(s, Loader=yaml.FullLoader)")
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_yaml_safe_load_no_finding(self):
+        findings = _run("import yaml\nyaml.safe_load(s)")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    # ── torch.load: argument-aware ────────────────────────────────────
+
+    def test_torch_load_without_weights_only_produces_ast10(self):
+        findings = _run('import torch\ntorch.load("model.pt")')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_torch_load_with_weights_only_no_finding(self):
+        findings = _run('import torch\ntorch.load("model.pt", weights_only=True)')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    # ── numpy.load: argument-aware ────────────────────────────────────
+
+    def test_numpy_load_default_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy")')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_allow_pickle_produces_ast10(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", allow_pickle=True)')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_allow_pickle_positional_produces_ast10(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", None, True)')
+        assert any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_mmap_mode_positional_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", "r")')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    def test_numpy_load_allow_pickle_false_positional_no_finding(self):
+        findings = _run('import numpy as np\nnp.load("arr.npy", None, False)')
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+    # ── no false positives on safe data parsing ───────────────────────
+
+    def test_json_loads_no_finding(self):
+        findings = _run("import json\njson.loads('{}')")
+        assert not any(f.rule_id == "AST10" for f in findings)
+
+
+class TestEdgeCases:
+    def test_non_python_files_skipped(self):
+        state = {
+            "components": ["readme.md"],
+            "file_cache": {"readme.md": "exec('hello')"},
+        }
+        result = behavioral_ast.node(state)
+        assert result["findings"] == []
+
+    def test_syntax_error_skipped(self):
+        findings = _run("def broken(\n")
+        assert findings == []
+
+    def test_empty_file_no_findings(self):
+        findings = _run("")
+        assert findings == []
+
+    def test_safe_code_no_findings(self):
+        code = "import json\ndata = json.loads('{}')\nprint(data)\n"
+        findings = _run(code)
+        assert findings == []
+
+    def test_finding_has_remediation(self):
+        findings = _run('exec("x = 1")')
+        assert findings[0].remediation is not None
+        assert len(findings[0].remediation) > 0
+
+    def test_finding_has_context(self):
+        findings = _run('x = 1\nexec("y = 2")\nz = 3')
+        ast1 = [f for f in findings if f.rule_id == "AST1"]
+        assert ast1[0].context is not None
+
+    def test_finding_has_matched_text(self):
+        findings = _run('exec("code")')
+        assert findings[0].matched_text is not None
+
+    def test_empty_components(self):
+        state = {"components": [], "file_cache": {}}
+        result = behavioral_ast.node(state)
+        assert result["findings"] == []
+
+    def test_missing_file_in_cache(self):
+        state = {"components": ["missing.py"], "file_cache": {}}
+        result = behavioral_ast.node(state)
+        assert result["findings"] == []
+
+    def test_file_size_gate_scans_exact_character_limit(self):
+        from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
+
+        prefix = 'exec("x")\n'
+        code = prefix + (" " * (MAX_FILE_CHARS - len(prefix)))
+        assert len(code) == MAX_FILE_CHARS
+        assert any(f.rule_id == "AST1" for f in _run(code))
+
+    def test_file_size_gate_skips_over_character_limit(self):
+        from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
+
+        prefix = 'exec("x")\n'
+        code = prefix + (" " * (MAX_FILE_CHARS - len(prefix) + 1))
+        assert len(code) == MAX_FILE_CHARS + 1
+        assert _run(code) == []
+
+    def test_file_size_gate_multibyte_under_character_limit_scanned(self):
+        from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
+
+        prefix = 'exec("x")\n# '
+        code = prefix + ("🦄" * 250_000)
+        assert len(code) <= MAX_FILE_CHARS
+        assert len(code.encode("utf-8")) > MAX_FILE_CHARS
+        assert any(f.rule_id == "AST1" for f in _run(code))
+
+    def test_file_size_gate_skips_only_oversized_component(self):
+        from skillspector.nodes.analyzers.static_runner import MAX_FILE_CHARS
+
+        big = 'exec("x")\n' + (" " * MAX_FILE_CHARS)
+        small = 'exec("ok")\n'
+        state = {
+            "components": ["big.py", "small.py"],
+            "file_cache": {"big.py": big, "small.py": small},
+        }
+
+        result = behavioral_ast.node(state)
+        files = {f.file for f in result["findings"]}
+        assert "big.py" not in files
+        assert "small.py" in files
+
+
+class TestImportAliasEvasion:
+    """Dangerous calls must be detected through ``from ... import`` and ``import ... as``.
+
+    A skill can otherwise dodge the prefix-based matching simply by importing the
+    primitive under another name (e.g. ``from os import system``).
+    """
+
+    def test_from_os_import_system(self):
+        findings = _run("from os import system\nsystem('id')")
+        assert any(f.rule_id == "AST5" for f in findings)
+
+    def test_import_os_as_alias(self):
+        findings = _run("import os as o\no.system('id')")
+        assert any(f.rule_id == "AST5" for f in findings)
+
+    def test_from_subprocess_import_run(self):
+        findings = _run("from subprocess import run\nrun(['id'])")
+        assert any(f.rule_id == "AST4" for f in findings)
+
+    def test_import_subprocess_as_alias(self):
+        findings = _run("import subprocess as sp\nsp.Popen(['id'])")
+        assert any(f.rule_id == "AST4" for f in findings)
+
+    def test_aliased_chain_via_from_import(self):
+        """``from base64 import b64decode; eval(b64decode(...))`` is still a chain (AST8)."""
+        findings = _run("from base64 import b64decode\neval(b64decode(payload))")
+        ast8 = [f for f in findings if f.rule_id == "AST8"]
+        assert len(ast8) >= 1
+        assert "base64" in ast8[0].message
+
+    def test_aliased_safe_import_no_false_positive(self):
+        findings = _run("import json as j\ndata = j.loads('{}')\nprint(data)\n")
+        assert findings == []
+
+
+class TestMultipleFindings:
+    def test_multiple_dangerous_calls_in_one_file(self):
+        code = (
+            "import os, subprocess\n"
+            'exec("x = 1")\n'
+            'eval("2 + 2")\n'
+            'os.system("ls")\n'
+            'subprocess.run(["id"])\n'
+        )
+        findings = _run(code)
+        rule_ids = {f.rule_id for f in findings}
+        assert "AST1" in rule_ids
+        assert "AST2" in rule_ids
+        assert "AST4" in rule_ids
+        assert "AST5" in rule_ids
+
+
+# ── builtins / importlib import-chain evasion ─────────────────────────
+
+
+class TestBuiltinsImportEvasion:
+    """Dangerous builtins hidden behind the ``builtins`` module must still alert.
+
+    The analyzer matches dangerous builtins by their bare name (``exec``/``eval``/
+    ``compile``/``__import__``). Writing ``from builtins import exec`` or
+    ``import builtins; builtins.exec(...)`` resolves, through the import-alias map,
+    to the qualified spelling ``builtins.exec`` — which would slip past the bare-name
+    checks unless it is canonicalized back. Since ``builtins.exec is exec``, the
+    collapse is semantically exact. Complements the ``getattr`` branch (PR #166).
+    """
+
+    def test_from_builtins_import_exec(self):
+        """``from builtins import exec; exec(code)`` must still raise AST1."""
+        findings = _run("from builtins import exec\nexec('x = 1')\n")
+        assert any(f.rule_id == "AST1" for f in findings)
+
+    def test_from_builtins_import_eval(self):
+        """``from builtins import eval`` must still raise AST2."""
+        findings = _run("from builtins import eval\neval('2 + 2')\n")
+        assert any(f.rule_id == "AST2" for f in findings)
+
+    def test_from_builtins_import_compile(self):
+        """``from builtins import compile`` must still raise AST6."""
+        findings = _run("from builtins import compile\ncompile('x', '<s>', 'exec')\n")
+        assert any(f.rule_id == "AST6" for f in findings)
+
+    def test_from_builtins_import_dunder_import(self):
+        """``from builtins import __import__`` must still raise AST3."""
+        findings = _run("from builtins import __import__\n__import__('os')\n")
+        assert any(f.rule_id == "AST3" for f in findings)
+
+    def test_import_builtins_dot_exec(self):
+        """``import builtins; builtins.exec(...)`` must still raise AST1."""
+        findings = _run("import builtins\nbuiltins.exec('x = 1')\n")
+        assert any(f.rule_id == "AST1" for f in findings)
+
+    def test_import_builtins_as_alias_dot_exec(self):
+        """``import builtins as b2; b2.exec(...)`` must still raise AST1."""
+        findings = _run("import builtins as b2\nb2.exec('x = 1')\n")
+        assert any(f.rule_id == "AST1" for f in findings)
+
+    def test_from_builtins_import_exec_as_alias(self):
+        """``from builtins import exec as e; e(...)`` must still raise AST1."""
+        findings = _run("from builtins import exec as e\ne('x = 1')\n")
+        assert any(f.rule_id == "AST1" for f in findings)
+
+    def test_user_module_exec_helper_no_false_positive(self):
+        """A benign helper merely *named* like a sink must not match (FP-neighbor).
+
+        ``from mymod import exec_helper; exec_helper()`` imports an unrelated
+        third-party callable — it is not ``builtins.exec`` and must stay clean.
+        """
+        findings = _run("from mymod import exec_helper\nexec_helper()\n")
+        assert findings == []
+
+
+class TestImportlibDynamicChainEvasion:
+    """``importlib.import_module('mod').attr(...)`` is a dynamic-import sink chain.
+
+    It mirrors ``__import__('mod')`` but lets the dangerous module name live in a
+    string literal so it never appears as a static ``import``. The chain is resolved
+    to the canonical dotted sink (``os.system``/``subprocess.run``) so it re-enters
+    the existing ``os.``/``subprocess.`` sink ladders.
+    """
+
+    def test_importlib_import_module_os_system(self):
+        """``importlib.import_module('os').system(...)`` must raise AST5."""
+        findings = _run("import importlib\nimportlib.import_module('os').system('id')\n")
+        assert any(f.rule_id == "AST5" for f in findings)
+
+    def test_importlib_import_module_subprocess_run(self):
+        """``importlib.import_module('subprocess').run(...)`` must raise AST4."""
+        findings = _run("import importlib\nimportlib.import_module('subprocess').run(['id'])\n")
+        assert any(f.rule_id == "AST4" for f in findings)
+
+    def test_from_importlib_import_module_os_system(self):
+        """Bare-imported ``import_module('os').system(...)`` must raise AST5."""
+        findings = _run("from importlib import import_module\nimport_module('os').system('id')\n")
+        assert any(f.rule_id == "AST5" for f in findings)
+
+    def test_importlib_import_module_benign_no_false_positive(self):
+        """A benign dynamic import (``json.loads``) must not match a sink ladder."""
+        findings = _run("import importlib\nimportlib.import_module('json').loads('{}')\n")
+        assert findings == []
+
+
+class TestInspectionLedgerResponse:
+    def test_syntax_error_is_skipped_without_creating_non_python_work(self) -> None:
+        result = behavioral_ast.node(
+            {
+                "components": ["broken.py", "README.md"],
+                "file_cache": {"broken.py": "def broken(:\n", "README.md": "# docs\n"},
+            }
+        )
+
+        assert [event["path"] for event in result["inspection_ledger"]] == ["broken.py"]
+        assert result["inspection_ledger"][0]["outcome"] == "skipped"
+        assert result["inspection_ledger"][0]["reason_code"] == "syntax_error"
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_completed_work_references_the_emitted_findings(self) -> None:
+        result = behavioral_ast.node(
+            {
+                "components": ["run.py"],
+                "file_cache": {"run.py": "import os\nos.system(user_input)\n"},
+            }
+        )
+
+        event = result["inspection_ledger"][0]
+        assert event["outcome"] == "completed"
+        assert event["emitted_finding_ids"] == [
+            finding.finding_id for finding in result["findings"]
+        ]
+
+
+class TestResourceBounds:
+    def test_finding_caps_stop_construction_and_account_remaining_work(self, monkeypatch) -> None:
+        monkeypatch.setattr(behavioral_ast, "MAX_FINDINGS_PER_ARTIFACT", 2)
+        monkeypatch.setattr(behavioral_ast, "MAX_FINDINGS_PER_ANALYZER", 3)
+        result = behavioral_ast.node(
+            {
+                "components": ["a.py", "b.py", "c.py"],
+                "file_cache": {
+                    "a.py": "\n".join(f'exec("{index}")' for index in range(4)),
+                    "b.py": 'exec("b1")\nexec("b2")',
+                    "c.py": 'exec("c")',
+                },
+            }
+        )
+
+        assert len(result["findings"]) == 3
+        assert [event["outcome"] for event in result["inspection_ledger"]] == [
+            "partial",
+            "partial",
+            "partial",
+        ]
+        assert result["inspection_ledger"][0]["observed_findings"] == 3
+        assert result["inspection_ledger"][0]["limit_findings"] == 2
+        assert result["inspection_ledger"][1]["observed_findings"] == 4
+        assert result["inspection_ledger"][1]["limit_findings"] == 3
+        assert result["inspection_ledger"][2]["emitted_finding_ids"] == []
+        assert result["analyzer_status_events"][0]["status"] == "degraded"
+
+    def test_expired_workflow_deadline_marks_every_python_target_partial(self) -> None:
+        result = behavioral_ast.node(
+            {
+                "components": ["a.py", "b.py"],
+                "file_cache": {"a.py": 'exec("a")', "b.py": 'exec("b")'},
+                "workflow_resource_budget": WorkflowResourceBudget(max_seconds=0.0),
+            }
+        )
+
+        assert result["findings"] == []
+        assert [event["reason_code"] for event in result["inspection_ledger"]] == [
+            "runtime_limit",
+            "runtime_limit",
+        ]
+        assert all("observed_seconds" in event for event in result["inspection_ledger"])

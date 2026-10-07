@@ -1,0 +1,13 @@
+{
+  "routing": [
+    { "from": "cto", "to": "software_engineer", "description": "Send specs to build" },
+    { "from": "software_engineer", "to": "devops", "description": "Request deployment" },
+    { "from": "software_engineer", "to": "dba", "description": "DB review requests" },
+    { "from": "devops", "to": "qa", "description": "Send for testing" },
+    { "from": "qa", "to": "software_engineer", "description": "Bug fixes loop" },
+    { "from": "qa", "to": "operations", "description": "Approved for release" },
+    { "from": "dba", "to": "software_engineer", "description": "DB review feedback" },
+    { "from": "operations", "to": "devops", "description": "Hotfix requests" },
+    { "from": "devops", "to": "qa", "description": "Hotfix for verification" }
+  ]
+}

@@ -1,0 +1,141 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Shared constants for skillspector (env-driven where applicable)."""
+
+import logging
+import os
+
+from skillspector.providers import (
+    ModelMetadataProvider,
+    UnknownProviderError,
+    get_metadata_provider,
+    get_model_config_provider,
+)
+
+logger = logging.getLogger(__name__)
+
+# % of model's max tokens used for input. 1-MAX_INPUT_TOKENS_PCT is used for output.
+MAX_INPUT_TOKENS_PCT = 0.75
+# Fallback context length when no metadata API or registry entry is available.
+DEFAULT_CONTEXT_LENGTH = 128_000
+# Risk score threshold above which a scan is treated as unsafe.
+RISK_THRESHOLD = 50
+# Maximum text-file size processed by static analyzers and lightweight
+# format recognizers.
+MAX_FILE_BYTES = 1_000_000
+# Static analysis supports complete per-artifact coverage through 16 MiB. Larger
+# files are read only to this bound and are reported as partial, never complete.
+MAX_ANALYZABLE_FILE_BYTES = 16 * 1024 * 1024
+# Truncated files must still reach the LLM stage: excluding them entirely lets
+# a payload hide past the read cap while the scan reports zero findings.  The
+# LLM view of a truncated file is bounded to this prefix so token cost stays
+# predictable, and an explicit marker records the unreviewed region.
+MAX_LLM_TRUNCATED_FILE_CHARS = 262_144
+
+# Default-model selection lives on each provider (see providers/<name>/provider.py
+# for ``DEFAULT_MODEL`` and ``SLOT_DEFAULTS``).  The active provider's
+# ``resolve_model`` runs the waterfall: ``SKILLSPECTOR_MODEL`` env > slot
+# default > general default.  OSS users pointing at build.nvidia.com or
+# stock OpenAI inherit ``NvBuildProvider``'s default model automatically.
+_provider: ModelMetadataProvider | None
+try:
+    _provider = get_metadata_provider()
+except UnknownProviderError:
+    # Importing static checks and CLI help must not require a valid LLM provider.
+    # Runtime model configuration still validates the selector in build_model_config.
+    _provider = None
+
+# Exposed for analyzers that need a final fallback symbol (e.g.,
+# ``model = state.model or MODEL_CONFIG[ANALYZER_ID] or _SKILLSPECTOR_DEFAULT_MODEL``).
+_SKILLSPECTOR_DEFAULT_MODEL = _provider.DEFAULT_MODEL if _provider is not None else ""
+
+_MODEL_SLOTS: tuple[str, ...] = (
+    "default",
+    "mcp_least_privilege",
+    "mcp_rug_pull",
+    "mcp_tool_poisoning",
+    "semantic_developer_intent",
+    "semantic_quality_policy",
+    "semantic_security_discovery",
+    "meta_analyzer",
+)
+
+
+def _resolve_slot_model(slot: str, provider=None) -> str:
+    """Resolve the model for *slot* with per-slot env var override support.
+
+    Precedence: ``SKILLSPECTOR_MODEL_{SLOT}`` env var > provider
+    ``resolve_model(slot)`` (which itself runs ``SKILLSPECTOR_MODEL`` env >
+    provider slot default > provider ``DEFAULT_MODEL``).
+    """
+    provider = provider or get_metadata_provider()
+    env_key = f"SKILLSPECTOR_MODEL_{slot.upper()}"
+    env_val = os.environ.get(env_key, "").strip()
+    if env_val:
+        return env_val
+    return provider.resolve_model(slot)
+
+
+def build_model_config() -> dict[str, str]:
+    """Resolve the model map for the provider that will build chat models."""
+    provider = get_model_config_provider()
+    return {slot: _resolve_slot_model(slot, provider) for slot in _MODEL_SLOTS}
+
+
+MODEL_CONFIG: dict[str, str] = (
+    {slot: _resolve_slot_model(slot, _provider) for slot in _MODEL_SLOTS}
+    if _provider is not None
+    else {}
+)
+
+
+def _validate_model_config() -> None:
+    """Warn about models not found in the provider's model registry.
+
+    When ``SKILLSPECTOR_STRICT_MODEL_VALIDATION=true``, raises
+    ``ValueError`` instead of logging warnings.
+    """
+    if _provider is None:
+        return
+    unknown: list[str] = []
+    for slot, model in MODEL_CONFIG.items():
+        ctx = _provider.get_context_length(model)  # type: ignore[attr-defined]
+        if ctx is None:
+            unknown.append(f"  {slot}: {model}")
+            logger.warning(
+                "Model '%s' (slot: %s) not found in model_registry.yaml. "
+                "Using fallback context length (%d). Token budgeting may be "
+                "inaccurate — add the model to the registry or verify the "
+                "model ID.",
+                model,
+                slot,
+                DEFAULT_CONTEXT_LENGTH,
+            )
+
+    strict = os.environ.get("SKILLSPECTOR_STRICT_MODEL_VALIDATION", "").lower() == "true"
+    if strict and unknown:
+        raise ValueError(
+            "Strict model validation enabled. Unknown models:\n"
+            + "\n".join(unknown)
+            + "\nAdd them to model_registry.yaml or disable "
+            "SKILLSPECTOR_STRICT_MODEL_VALIDATION."
+        )
+
+
+_validate_model_config()
+
+# Log level: from env or fallback (DEBUG, INFO, WARNING, ERROR).
+SKILLSPECTOR_LOG_LEVEL = os.environ.get("SKILLSPECTOR_LOG_LEVEL", "WARNING")
