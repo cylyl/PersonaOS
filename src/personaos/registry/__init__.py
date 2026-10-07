@@ -1,10 +1,9 @@
-"""Persona Registry — worker and node registration.
+"""Registry services — own the lifecycle of workers, profiles, and tasks.
 
-v0.1 scope:
-  - register / update / retire workers
-  - register / heartbeat / drain / lose nodes
-  - assign workers to nodes (transient binding)
+Per docs/specs/worker-profile.md + ADR 0008 Addendum, the registry is the
+ONLY writer to the profiles/ directory and is responsible for atomic
+activation of profile versions.
 
-Per ADR 0003: Worker and Node are separate entities. The lease system
-(in workload/) binds a worker to a node for the duration of a single task.
+Modules:
+  - profile: ProfileRegistry (versioned worker profiles + immutable YAML)
 """

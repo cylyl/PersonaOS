@@ -72,6 +72,9 @@ class Worker(Base):
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
     memory_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    current_profile_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -207,6 +210,9 @@ class Task(Base):
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    profile_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
     )
 
     __table_args__ = (
