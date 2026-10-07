@@ -122,6 +122,39 @@ From the README §14, trimmed to what's actually in v0.1:
 - [ ] ~~Monitoring exposes task outcomes, reliability, latency, and cost.~~ *(Phase 3 — basic read-only `/events` only in v0.1)*
 - [ ] ~~A workload replay can compare at least two team configurations.~~ *(Phase 4)*
 
+## Phase-1 acceptance test (the killer property)
+
+Per Liang, 2026-10-07 — the property PersonaOS exists to deliver. If v0.1 ships this, PersonaOS ships.
+
+**The end-to-end flow:**
+
+```
+1. Create a Worker (DevOps) with skills [kubernetes] + capabilities [kubectl]
+2. Create a Task that requires kubernetes + kubectl (deploy FMS to staging)
+3. Scheduler matches Worker to Task (skill + permission + availability + node capability + workload)
+4. Worker is bound to a Node (worker_nodes row); OpenClaw adapter starts execution
+5. Task emits events — task.created, task.claimed, task.checkpointed, task.completed
+6. Checkpoint saved to task_checkpoints after each step
+7. Worker finishes; result saved to tasks.result
+```
+
+**The killer test — what makes "compute is replaceable; the worker is persistent" real:**
+
+```
+8.  STOP node mid-task (kill the OpenClaw process / lose the box)
+9.  START a different node (same worker_id, different runtime host)
+10. LOAD the same worker (workers.status check — still idle/active)
+11. LOAD the task checkpoint (tasks.checkpoint_ref → task_checkpoints)
+12. RESUME the task from the last checkpoint
+       — no manual intervention
+       — no lost work
+       — no duplicate side effects (idempotent actions)
+```
+
+That last step is what makes the README's thesis enforceable. A worker can move hosts without losing its task. The runtime is replaceable; the worker identity and progress survive.
+
+**Six-table scope for v0.1** (per ADR 0008): `workers`, `tasks`, `worker_skills`, `worker_nodes`, `task_events`, `task_checkpoints`. No policies, leases, pending_approvals, or unified events table — those move to v0.2.
+
 ---
 
 ## After v0.1

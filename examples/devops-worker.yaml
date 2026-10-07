@@ -1,37 +1,42 @@
-id: devops-01
-name: DevOps Engineer
+# DevOps worker — example seed profile (not the runtime schema).
+# The seed script splits this into:
+#   - workers       (id, name, role, description, status, runtime, max_concurrent_tasks, personality)
+#   - worker_skills (one row per skill)
+# Workers.capabilities and workers.permissions are populated from the lists below.
+
+id: worker-devops-001
+name: DevOps-01
+
 role: devops
+description: Infrastructure and deployment specialist
 
-profile:
-  system_prompt: |
-    You are a DevOps engineer. You manage infrastructure, deployment, and
-    automation. You do not access production secrets without approval, and
-    you always flag changes that could affect availability.
-  objectives:
-    - Keep staging environments healthy
-    - Deploy approved changes safely
-    - Surface production issues promptly with full context
-  personality: methodical, risk-aware, escalation-friendly
-  operating_constraints:
-    - Never delete production resources
-    - Always require approval for prod-db access
-    - Never modify IAM policies without human sign-off
+status: idle
+runtime: openclaw
+max_concurrent_tasks: 2
 
-authority:
-  tools:
-    - ssh:staging
-    - tools:terminal
-    - tools:kubectl
-    - tools:terraform
-  resource_scopes:
-    - staging-*
-    - dev-cluster
-    - ci-runners
-  max_concurrent_tasks: 1
-  requires_approval_for:
-    - "db:write:*"
-    - "iam:*"
-    - "secret:read:*"
+personality:
+  style: cautious
+  autonomy: medium
 
-status: active
-version: 1
+# -> worker_skills
+skills:
+  - kubernetes
+  - linux
+  - ansible
+  - aws
+
+# -> workers.capabilities (jsonb)
+capabilities:
+  - terminal
+  - ssh
+  - kubectl
+  - git
+
+# -> workers.permissions (jsonb)
+permissions:
+  - staging.read
+  - staging.deploy
+  - production.read
+
+# memory_id is null in v0.1; populated when Memory lands (Phase 2, ADR 0007).
+memory_id: null

@@ -1,8 +1,11 @@
-# Worker schema — persistent identity, profile, authority
+# Worker schema — persistent identity.
 #
-# v0.1 scope: in-memory representation lives in src/personaos/domain/worker.py.
-# Postgres representation lives in src/personaos/db/models.py (generated from this YAML).
-# Per ADR 0002: this YAML is the source of truth.
+# Per the v0.1 design (Liang, 2026-10-07): Worker is a THIN record.
+# It points to external stores (Skills, Memory, Tasks, Events, Runtime).
+# All "fat" data — skills, capabilities, permissions, history — lives elsewhere.
+#
+# Per ADR 0003: Worker is identity. Node is execution location. They are separate.
+# Per ADR 0008: six tables only in v0.1; workers is one of them, intentionally lean.
 
 $schema: http://json-schema.org/draft-07/schema#
 title: Worker
@@ -13,96 +16,83 @@ required:
   - id
   - name
   - role
-  - profile
-  - authority
   - status
-  - version
+  - runtime
+  - max_concurrent_tasks
   - created_at
 
 properties:
   id:
     type: string
     description: Stable worker identifier. Survives model + runtime changes.
-    pattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
-    examples: ["devops-01", "developer-02", "qa-01"]
+    pattern: '^worker-[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    examples: ["worker-devops-001", "worker-developer-001", "worker-qa-001"]
 
   name:
     type: string
     description: Human-readable worker name.
     minLength: 1
     maxLength: 100
+    examples: ["DevOps-01", "Senior Developer", "QA Engineer"]
 
   role:
     type: string
-    description: Worker role. Drives default authority and skill expectations.
     enum: [devops, developer, qa, architect, security, custom]
 
-  profile:
-    type: object
-    additionalProperties: false
-    description: LLM-independent configuration. Survives model changes.
-    properties:
-      system_prompt:
-        type: string
-        description: The worker's operating instructions. Static across runs.
-      objectives:
-        type: array
-        items: { type: string }
-        description: What the worker is trying to achieve.
-      personality:
-        type: string
-        description: Behavioral style (e.g., "methodical, risk-aware").
-      operating_constraints:
-        type: array
-        items: { type: string }
-        description: Hard rules (e.g., "never delete production resources").
-
-  authority:
-    type: object
-    additionalProperties: false
-    description: What this worker is allowed to do. Enforced by security/policy.py.
-    properties:
-      tools:
-        type: array
-        items: { type: string }
-        description: Tool allow-list (e.g., "ssh:staging", "tools:terminal").
-      resource_scopes:
-        type: array
-        items: { type: string }
-        description: Resource patterns (e.g., "staging-*", "dev-cluster").
-      max_concurrent_tasks:
-        type: integer
-        minimum: 1
-        maximum: 16
-        default: 1
-      requires_approval_for:
-        type: array
-        items: { type: string }
-        description: Action patterns that always require human approval.
+  description:
+    type: string
+    description: One-line role description.
+    examples: ["Infrastructure and deployment specialist"]
 
   status:
     type: string
-    description: Worker status. Scheduler skips non-active workers.
-    enum: [active, paused, quarantined, retired]
+    description: Worker lifecycle status. Scheduler skips non-idle workers.
+    enum: [idle, busy, paused, quarantined, retired]
 
-  version:
+  runtime:
+    type: string
+    description: Default runtime adapter (e.g., "openclaw").
+    default: openclaw
+    examples: ["openclaw"]
+
+  max_concurrent_tasks:
     type: integer
+    description: Capacity limit. Scheduler respects this when claiming tasks.
     minimum: 1
-    description: Profile version. Bumped on every profile change.
+    maximum: 16
+    default: 1
 
-  created_at:
+  capabilities:
+    type: array
+    description: Tools the worker is allowed to invoke (e.g., "kubectl", "ssh:staging").
+    items: { type: string }
+    default: []
+
+  permissions:
+    type: array
+    description: Resource scopes the worker can access (e.g., "staging.read", "production.read").
+    items: { type: string }
+    default: []
+
+  personality:
+    type: object
+    description: LLM-independent behavioral config. Survives model changes.
+    additionalProperties: false
+    properties:
+      style: { type: string, examples: ["cautious", "methodical", "thorough"] }
+      autonomy: { type: string, enum: [low, medium, high], default: medium }
+
+  memory_id:
     type: string
-    format: date-time
+    description: Reference to the worker's memory entry. Null in v0.1; populated in Phase 2 (per ADR 0007).
+    examples: ["memory-worker-devops-001"]
 
-  updated_at:
-    type: string
-    format: date-time
-
+  created_at: { type: string, format: date-time }
+  updated_at: { type: string, format: date-time }
   last_seen_at:
     type: string
     format: date-time
-    description: Last time the worker process reported a heartbeat.
+    description: Last heartbeat from the worker process.
 
-  node_id:
-    type: string
-    description: Currently assigned node. Transient — the worker outlives the node.
+# Skills are NOT embedded. They live in the worker_skills table.
+# See: ADR 0008 — six tables only.

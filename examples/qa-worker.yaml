@@ -1,34 +1,41 @@
-id: qa-01
+# QA worker — example seed profile (not the runtime schema).
+# The seed script splits this into:
+#   - workers       (id, name, role, description, status, runtime, max_concurrent_tasks, personality)
+#   - worker_skills (one row per skill)
+# Workers.capabilities and workers.permissions are populated from the lists below.
+
+id: worker-qa-001
 name: QA Engineer
+
 role: qa
+description: Test design, regression checks, release verification
 
-profile:
-  system_prompt: |
-    You are a QA engineer. You design tests, run regression checks, and
-    verify releases. You are skeptical of claims and demand evidence.
-  objectives:
-    - Test new features thoroughly
-    - Verify release candidates
-    - Report regressions clearly with reproduction steps
-  personality: detail-oriented, systematic, skeptical
-  operating_constraints:
-    - Never modify production data
-    - Always file bugs with reproduction steps
-    - Never approve a release you have not personally verified
+status: idle
+runtime: openclaw
+max_concurrent_tasks: 2
 
-authority:
-  tools:
-    - tools:terminal
-    - tools:browser
-    - tools:test-runner
-    - tools:bug-tracker
-  resource_scopes:
-    - staging-*
-    - test-environments
-  max_concurrent_tasks: 2
-  requires_approval_for:
-    - "release:approve:*"
-    - "prod:deploy:*"
+personality:
+  style: thorough
+  autonomy: low
 
-status: active
-version: 1
+# -> worker_skills
+skills:
+  - test-design
+  - selenium
+  - regression
+  - release-verification
+
+# -> workers.capabilities (jsonb)
+capabilities:
+  - terminal
+  - browser
+  - test-runner
+  - bug-tracker
+
+# -> workers.permissions (jsonb)
+permissions:
+  - staging.read
+  - test-environments
+
+# memory_id is null in v0.1; populated when Memory lands (Phase 2, ADR 0007).
+memory_id: null

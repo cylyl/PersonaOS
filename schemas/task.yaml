@@ -1,7 +1,7 @@
-# Task schema — durable unit of work
+# Task schema — unit of work assigned to a worker.
 #
-# v0.1 scope: tasks have 8 lifecycle states. The state machine is enforced
-# by the runner (execution/runner.py) and the workload service (workload/service.py).
+# Per the v0.1 design (Liang, 2026-10-07): Task is the work. Worker is the assignee.
+# Per ADR 0008: tasks is one of the six v0.1 tables.
 
 $schema: http://json-schema.org/draft-07/schema#
 title: Task
@@ -10,87 +10,114 @@ additionalProperties: false
 
 required:
   - id
-  - type
+  - title
+  - objective
   - status
   - priority
-  - payload
-  - retry_count
+  - input
   - created_at
 
 properties:
   id:
     type: string
     description: Stable task identifier.
-    pattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    pattern: '^task-[0-9]{8}-[0-9]+$'
+    examples: ["task-20261007-001"]
 
-  type:
+  title:
     type: string
-    description: Task type (e.g., "deploy_service", "run_tests", "code_review").
-    examples: ["deploy_service", "run_tests", "code_review", "investigate_alert"]
+    description: Short human-readable title.
+    minLength: 1
+    maxLength: 200
+    examples: ["Deploy FMS backend"]
+
+  objective:
+    type: string
+    description: Human-readable goal of this task (the "why").
+    examples: ["Deploy backend version 1.4.2 to staging"]
 
   status:
     type: string
     description: |
       Task lifecycle state.
-        queued     — ready for assignment
-        assigned   — owned by a worker (not yet started)
+        queued      — ready for assignment
+        assigned    — owned by a worker (not yet started)
         in_progress — execution has started
-        blocked    — waiting for dependency, decision, or external system
-        review     — output needs validation or approval
-        completed  — acceptance criteria met
-        failed     — retries exhausted or unrecoverable
-        canceled   — explicitly stopped
+        blocked     — waiting for dependency / decision / external
+        review      — output needs validation or approval
+        completed   — acceptance criteria met
+        failed      — retries exhausted or unrecoverable
+        canceled    — explicitly stopped
     enum: [queued, assigned, in_progress, blocked, review, completed, failed, canceled]
 
   priority:
-    type: integer
-    minimum: 0
-    maximum: 100
-    default: 50
-    description: Higher = scheduled sooner. Within priority, FIFO.
-
-  worker_id:
     type: string
-    description: Assigned worker. Null if status=queued.
+    enum: [low, medium, high, critical]
+    default: medium
+    description: |
+      String enum for human readability. Underlying int for ordering:
+        low=25, medium=50, high=75, critical=100.
+      Within priority, FIFO (oldest first).
 
-  node_id:
+  type:
     type: string
-    description: Assigned node. Null if status=queued.
+    description: Optional task-type discriminator (e.g., "deploy_service", "run_tests"). Used by adapters for routing.
+    examples: ["deploy_service", "run_tests", "code_review"]
 
   required_skills:
     type: array
     items: { type: string }
-    description: Skills the assigned worker must have. Scheduler enforces match.
+    description: Skills the assigned worker must have. Scheduler enforces match via worker_skills.
+    examples: [["kubernetes", "docker"]]
 
-  required_tools:
+  required_capabilities:
     type: array
     items: { type: string }
-    description: Tools the worker must be allowed to invoke.
+    description: Tools the worker must be allowed to invoke. Scheduler checks workers.capabilities.
+    examples: [["kubectl"]]
 
-  payload:
-    type: object
-    description: Task-specific input. Shape depends on `type`.
-    additionalProperties: true
+  assigned_worker:
+    type: string
+    description: Worker ID. Null if status=queued.
+    examples: ["worker-devops-001"]
 
-  context:
-    type: object
-    description: Optional context for policy evaluation.
-    properties:
-      reason:
-        type: string
-      requested_by:
-        type: string
-      ticket_id:
-        type: string
+  assigned_node:
+    type: string
+    description: Node ID. Null if status=queued.
+    examples: ["node-01"]
 
   dependencies:
     type: array
     items: { type: string }
     description: Other task IDs that must complete before this task can be claimed.
+    default: []
 
-  checkpoint_ref:
-    type: string
-    description: Reference to the durable checkpoint for resumable tasks.
+  input:
+    type: object
+    description: Task-specific structured input. Shape depends on `type`. JSON object.
+    additionalProperties: true
+    examples: [{"version": "1.4.2", "environment": "staging"}]
+
+  checkpoint:
+    type: object
+    description: Last checkpoint for resumable tasks. The `ref` points into the task_checkpoints table.
+    properties:
+      ref:
+        type: string
+        description: Opaque pointer to the durable checkpoint row.
+      last_step:
+        type: string
+        description: Human-readable last completed step. e.g., "image_deployed".
+      state:
+        type: object
+        additionalProperties: true
+        description: Snapshot of state at the last checkpoint.
+
+  result:
+    type: object
+    nullable: true
+    description: Final output. Null until task completes.
+    additionalProperties: true
 
   retry_count:
     type: integer
@@ -111,18 +138,6 @@ properties:
     type: string
     format: date-time
 
-  created_at:
-    type: string
-    format: date-time
-
-  updated_at:
-    type: string
-    format: date-time
-
-  claimed_at:
-    type: string
-    format: date-time
-
-  completed_at:
-    type: string
-    format: date-time
+  created_at: { type: string, format: date-time }
+  started_at: { type: string, format: date-time }
+  completed_at: { type: string, format: date-time }

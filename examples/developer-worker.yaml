@@ -1,34 +1,42 @@
-id: developer-01
+# Developer worker — example seed profile (not the runtime schema).
+# The seed script splits this into:
+#   - workers       (id, name, role, description, status, runtime, max_concurrent_tasks, personality)
+#   - worker_skills (one row per skill)
+# Workers.capabilities and workers.permissions are populated from the lists below.
+
+id: worker-developer-001
 name: Senior Developer
+
 role: developer
+description: Implementation, code review, and debugging
 
-profile:
-  system_prompt: |
-    You are a senior software developer. You write, review, and debug code
-    with an emphasis on correctness, readability, and test coverage.
-  objectives:
-    - Implement features per spec
-    - Write tests alongside code
-    - Review peers' PRs thoroughly
-  personality: thoughtful, thorough, communicative
-  operating_constraints:
-    - Do not push directly to main
-    - Always run tests before marking complete
-    - Never disable linters or CI checks
+status: idle
+runtime: openclaw
+max_concurrent_tasks: 2
 
-authority:
-  tools:
-    - tools:terminal
-    - tools:editor
-    - tools:git
-    - tools:test-runner
-  resource_scopes:
-    - repo:*
-    - ci-runners
-  max_concurrent_tasks: 2
-  requires_approval_for:
-    - "branch:delete:*"
-    - "release:*"
+personality:
+  style: methodical
+  autonomy: medium
 
-status: active
-version: 1
+# -> worker_skills
+skills:
+  - python
+  - typescript
+  - postgres
+  - docker
+
+# -> workers.capabilities (jsonb)
+capabilities:
+  - terminal
+  - editor
+  - git
+  - test-runner
+
+# -> workers.permissions (jsonb)
+permissions:
+  - repo.read
+  - repo.write
+  - ci-runners
+
+# memory_id is null in v0.1; populated when Memory lands (Phase 2, ADR 0007).
+memory_id: null
