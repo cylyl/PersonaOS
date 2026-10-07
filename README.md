@@ -87,6 +87,8 @@ Use distinct memory categories instead of relying on one giant conversation tran
 
 Memory writes should be traceable. Record source, timestamp, confidence, and applicable scope. Detect stale or conflicting facts; avoid turning every model-generated statement into trusted memory.
 
+**Implementation:** memory sits behind a `MemoryAdapter` Protocol with five scopes (persona, project, worker, task, knowledge); see ADR 0007. Phase 2 ships Mem0; Graphiti joins later when temporal reasoning matters.
+
 
 ## 7. Keeping conversations alive indefinitely
 

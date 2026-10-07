@@ -128,7 +128,7 @@ From the README §14, trimmed to what's actually in v0.1:
 
 | Phase | Adds |
 |---|---|
-| **Phase 2** | Memory (5 categories), retrieval policies, provenance, resume-after-restart test, duplicate-action safety. |
+| **Phase 2** | Memory behind `MemoryAdapter` Protocol (Mem0 first); five scopes (persona/project/worker/task/knowledge); pgvector in compose; provenance + dedup. Resume-after-restart + duplicate-action safety. See ADR 0007. |
 | **Phase 3** | Skills registry + admission, full observability (dashboards), expanded security (8-item MVP list completed). |
 | **Phase 4** | Multi-worker teams, replay engine, calibration against observed outcomes. |
 | **Long-term** | Cluster scheduling, failover, AI gateway, SIEM, red teaming. |
@@ -147,5 +147,44 @@ Since "go" was given without answering the open questions, I made these calls �
 
 ---
 
+
+## Phase 2 — Memory (deferred scope, designed now)
+
+Per ADR 0007, Memory sits behind a `MemoryAdapter` Protocol with five scopes. Phase 2 ships Mem0 only; Graphiti joins later when temporal reasoning becomes a real need.
+
+### The five scopes
+
+```
+Memory
+├── persona       preferences, working style, long-term goals
+├── projects      per-project memory (PersonaOS, FMS, etc.)
+├── workers       per-worker (CTO, Developer, QA, DevOps)
+├── tasks         current / completed / failed
+└── knowledge     architecture, decisions, documentation
+```
+
+Retrieval filters by scope + category before vector/graph search. **No global RAG.**
+
+### Phase 2 deliverables
+
+- `src/personaos/memory/` package (deferred from v0.1)
+- `src/personaos/memory/adapters/mem0.py` — first concrete adapter
+- `src/personaos/memory/adapters/native.py` — pgvector-only fallback (for tests; no dedup/conflict)
+- `src/personaos/memory/service.py` — orchestrates adapter + scope validation
+- `src/personaos/memory/scopes.py` — Scope / Category enums + validation
+- `src/personaos/memory/retrieval.py` — context assembly policies per task type
+- `src/personaos/memory/provenance.py` — source, confidence, decay
+- pgvector added back to `docker-compose.yml`
+- Worker runner integration: `await memory.remember(...)` after successful task, `await memory.recall(...)` before `adapter.execute()`
+- Tests: per-scope isolation, dedup behavior, recall precision, scope-leak prevention
+
+### What Phase 2 does NOT add
+
+- Graphiti adapter (Phase 4 when temporal reasoning matters)
+- Letta integration (rejected — runtime collision, see ADR 0007)
+- Vector DB swap (Qdrant / Weaviate) — pgvector is enough for v0.2
+- Memory UI / observability dashboards (Phase 3)
+
+---
 
 ## Vikunja is the executable scope. The README is the vision. Don't conflate them.
