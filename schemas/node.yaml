@@ -1,0 +1,69 @@
+# Node schema — execution location
+#
+# v0.1 scope: one node per machine, but the model is multi-node ready.
+# Per ADR 0003: Node is execution location. Worker is identity. They are separate.
+
+$schema: http://json-schema.org/draft-07/schema#
+title: Node
+type: object
+additionalProperties: false
+
+required:
+  - id
+  - host
+  - status
+  - joined_at
+
+properties:
+  id:
+    type: string
+    description: Stable node identifier.
+    pattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    examples: ["node-01", "node-staging-01"]
+
+  host:
+    type: string
+    description: Hostname or IP of the node.
+    examples: ["worker-01.local", "10.0.1.42"]
+
+  capabilities:
+    type: array
+    description: What this node can run (model names, GPU types, tool availability).
+    items: { type: string }
+    examples:
+      - ["gpt-4", "claude-opus", "tools:browser", "tools:terminal"]
+      - ["gpt-4-mini", "tools:terminal", "gpu:a100"]
+
+  status:
+    type: string
+    description: Node lifecycle status.
+    enum: [joining, active, draining, lost]
+
+  joined_at:
+    type: string
+    format: date-time
+    description: When the node registered itself with the control plane.
+
+  last_heartbeat_at:
+    type: string
+    format: date-time
+    description: Most recent heartbeat from this node. Used by the scheduler.
+
+  current_worker_count:
+    type: integer
+    minimum: 0
+    description: How many workers are currently assigned to this node.
+
+  max_worker_count:
+    type: integer
+    minimum: 1
+    description: Capacity limit for this node.
+
+  runtime_version:
+    type: string
+    description: Version of the runtime (e.g., OpenClaw) running on this node.
+
+  drained_at:
+    type: string
+    format: date-time
+    description: When the node transitioned to `draining`. Set only if status is draining or lost.

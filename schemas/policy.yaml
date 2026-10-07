@@ -1,0 +1,131 @@
+# Policy schema — security/authorization policy
+#
+# v0.1 scope: policies are evaluated by src/personaos/security/policy.py
+# before every task runs (per ADR 0004).
+#
+# A policy is a list of rules. First match wins. If no rule matches,
+# the `default_effect` is applied (default: deny — fail-closed).
+
+$schema: http://json-schema.org/draft-07/schema#
+title: Policy
+type: object
+additionalProperties: false
+
+required:
+  - id
+  - name
+  - rules
+  - default_effect
+  - priority
+
+properties:
+  id:
+    type: string
+    description: Stable policy identifier.
+    pattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+
+  name:
+    type: string
+    description: Human-readable policy name.
+    examples: ["devops-default", "developer-default", "qa-default", "prod-readonly"]
+
+  description:
+    type: string
+    description: What this policy is for.
+
+  rules:
+    type: array
+    description: Ordered list of rules. First match wins.
+    minItems: 0
+    items:
+      type: object
+      additionalProperties: false
+      required: [effect]
+      properties:
+        id:
+          type: string
+          description: Stable rule identifier within the policy.
+        description:
+          type: string
+        action:
+          type: string
+          description: |
+            Action pattern. Glob syntax (* matches any sequence, ? matches one char).
+            Examples:
+              "tool:browser"          — exact
+              "tool:*"                — any tool
+              "ssh:*"                 — any SSH action
+              "db:read:*"             — any DB read
+              "*"                     — any action
+        resource:
+          type: string
+          description: |
+            Resource pattern. Glob syntax.
+            Examples:
+              "prod-db"               — exact
+              "staging-*"             — any staging resource
+              "*"                     — any resource
+        worker_id:
+          type: string
+          description: |
+            Worker ID pattern (optional). If set, rule only applies to matching workers.
+            Examples:
+              "devops-*"              — any devops worker
+              "qa-01"                 — exact worker
+        effect:
+          type: string
+          enum: [allow, deny, require_approval]
+        conditions:
+          type: object
+          description: Optional conditions for the rule to match.
+          properties:
+            time_window:
+              type: string
+              description: |
+                Cron-like window (e.g., "Mon-Fri 09:00-17:00 UTC").
+                Outside the window, the rule does not match.
+            source_ip:
+              type: array
+              items: { type: string }
+              description: Source IP allow-list (CIDR notation).
+
+  default_effect:
+    type: string
+    description: Effect when no rule matches. **Fail-closed by default.**
+    enum: [allow, deny, require_approval]
+    default: deny
+
+  priority:
+    type: integer
+    minimum: 0
+    description: |
+      Higher priority wins when multiple policies apply to the same actor.
+      Priority 0 is the fallback; positive integers override.
+
+  applies_to:
+    type: object
+    description: Optional scoping. If absent, applies to all workers/tasks.
+    properties:
+      worker_roles:
+        type: array
+        items:
+          type: string
+          enum: [devops, developer, qa, architect, security, custom]
+      worker_ids:
+        type: array
+        items: { type: string }
+      task_types:
+        type: array
+        items: { type: string }
+
+  created_at:
+    type: string
+    format: date-time
+
+  updated_at:
+    type: string
+    format: date-time
+
+  version:
+    type: integer
+    minimum: 1

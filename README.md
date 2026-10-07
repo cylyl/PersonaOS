@@ -87,6 +87,7 @@ Use distinct memory categories instead of relying on one giant conversation tran
 
 Memory writes should be traceable. Record source, timestamp, confidence, and applicable scope. Detect stale or conflicting facts; avoid turning every model-generated statement into trusted memory.
 
+
 ## 7. Keeping conversations alive indefinitely
 
 The goal is persistent execution and continuity, not an infinitely growing LLM context window. Model context remains finite; PersonaOS reconstructs relevant context from durable state whenever a worker resumes.
@@ -230,6 +231,29 @@ The first release should demonstrate that:
 PersonaOS should be the source of truth for worker identity, accumulated experience, workload, and governance. OpenClaw executes the work, LLMRouter selects models, and external tools provide capabilities.
 
 The long-term goal is a workforce that continuously operates, preserves experience across sessions and model changes, coordinates as a team, and can simulate alternative ways of working before real execution.
+
+## What this isn't (yet)
+
+A short, honest read of the same plan, kept here so the README does not quietly drift into marketing:
+
+- **MVP scope.** The four-phase roadmap is the real deliverable. The appendices (Cluster, Security & Governance) describe a longer-term vision, not an MVP. Phase 1–4 ships a single control plane + worker processes on one machine. Cluster scheduling, failover, capability-aware routing across GPUs, the full security-OS scope — all deferred. The Worker-Node separation stays as a future-proofing concept, not as a Phase 1 requirement.
+
+- **Security split.** Phase 3 covers the eight short items (worker identity, RBAC, tool allow/deny, secret isolation, task audit, approval gates, quarantine, kill switch). Everything else in the Security appendix — DLP, AI gateway, prompt-injection detection, shadow-AI detection, SIEM, anomaly, AI red teaming, compliance controls — is a separate roadmap and ideally its own project. Each one is a startup-grade effort on its own.
+
+- **Worker schema before code.** Phase 1's first deliverable is a worker + task schema in YAML (≈ 30 lines). The durability boundary belongs in the spec, not in code that retrofits it.
+
+- **What this does NOT replace.** LangGraph, CrewAI, AutoGen (multi-agent primitives); Temporal, Inngest, Restate (durable execution). PersonaOS sits next to them or integrates where it makes sense. The differentiator is the *persistent worker across model changes*; the rest is execution machinery.
+
+- **When NOT to use this.**
+  - You want a single agent today, not a workforce tomorrow. Use LangGraph or CrewAI.
+  - You already have a durable execution engine. PersonaOS without its own scheduler is a thin wrapper.
+  - Your workers don't need to survive model changes. A system prompt is enough.
+  - You need sub-millisecond per-task latency. Durable checkpoints cost I/O.
+  - Your threat model includes adversarial ML attacks against the workers themselves. That's a research program, not a Phase 3 task.
+
+- **One slogan.** "Compute is replaceable; the worker is persistent." The other lines are restatement.
+
+The appendices stay in this README as the long-term vision. The Vikunja project is the executable scope. Don't conflate them.
 
 # Cluster Support
 

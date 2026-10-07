@@ -1,0 +1,23 @@
+# Local development stack for PersonaOS v0.1.
+# Postgres only — pgvector deferred until Memory lands (Phase 2).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: personaos-postgres
+    environment:
+      POSTGRES_DB: personaos
+      POSTGRES_USER: personaos
+      POSTGRES_PASSWORD: personaos
+    ports:
+      - "5432:5432"
+    volumes:
+      - personaos_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U personaos -d personaos"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  personaos_pgdata:

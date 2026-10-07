@@ -1,0 +1,189 @@
+# Event schema — append-only event log
+#
+# v0.1 scope: 17 event types covering worker, task, node, security, approval.
+# Per ADR 0006: state tables remain the source of truth. The event log is
+# append-only, written in the same transaction as the state change.
+#
+# The `type` column is constrained to the 17 values below. Migration to add
+# a new event type requires updating both this schema AND the DB CHECK constraint.
+
+$schema: http://json-schema.org/draft-07/schema#
+title: Event
+type: object
+additionalProperties: false
+
+required:
+  - id
+  - type
+  - actor_id
+  - created_at
+
+properties:
+  id:
+    type: string
+    description: Stable event identifier (UUID v7, time-sortable).
+    format: uuid
+
+  type:
+    type: string
+    description: Event type. Constrained to the 17 v0.1 values.
+    enum:
+      # Worker lifecycle
+      - worker.created
+      - worker.updated
+      - worker.assigned
+      - worker.started
+      - worker.stopped
+      # Task lifecycle
+      - task.created
+      - task.claimed
+      - task.checkpointed
+      - task.completed
+      - task.failed
+      # Node events
+      - node.joined
+      - node.heartbeat
+      - node.lost
+      # Security events
+      - policy.allowed
+      - policy.denied
+      - worker.quarantined
+      - approval.requested
+
+  actor_id:
+    type: string
+    description: Worker or system actor that triggered the event.
+    examples: ["worker:devops-01", "system:scheduler", "user:alice"]
+
+  task_id:
+    type: string
+    description: Related task, if any.
+
+  worker_id:
+    type: string
+    description: Related worker, if any.
+
+  node_id:
+    type: string
+    description: Related node, if any.
+
+  payload:
+    type: object
+    description: Event-specific data. Per-type schema is enforced by codegen.
+    additionalProperties: true
+
+  created_at:
+    type: string
+    format: date-time
+
+  # Optional per-type payload schemas (referenced from docs/, not enforced in DB)
+  x-payload-schemas:
+    worker.created:
+      properties:
+        worker: { $ref: worker.yaml }
+      required: [worker]
+
+    worker.updated:
+      properties:
+        worker_id: { type: string }
+        changes: { type: object }
+      required: [worker_id, changes]
+
+    worker.assigned:
+      properties:
+        worker_id: { type: string }
+        node_id: { type: string }
+      required: [worker_id, node_id]
+
+    worker.started:
+      properties:
+        worker_id: { type: string }
+        node_id: { type: string }
+      required: [worker_id]
+
+    worker.stopped:
+      properties:
+        worker_id: { type: string }
+        reason: { type: string }
+      required: [worker_id]
+
+    task.created:
+      properties:
+        task: { $ref: task.yaml }
+      required: [task]
+
+    task.claimed:
+      properties:
+        task_id: { type: string }
+        worker_id: { type: string }
+        node_id: { type: string }
+        lease_expires_at: { type: string, format: date-time }
+      required: [task_id, worker_id, lease_expires_at]
+
+    task.checkpointed:
+      properties:
+        task_id: { type: string }
+        checkpoint_ref: { type: string }
+      required: [task_id, checkpoint_ref]
+
+    task.completed:
+      properties:
+        task_id: { type: string }
+        result: { type: object }
+      required: [task_id]
+
+    task.failed:
+      properties:
+        task_id: { type: string }
+        reason: { type: string }
+        retry_count: { type: integer }
+      required: [task_id, reason]
+
+    node.joined:
+      properties:
+        node: { $ref: node.yaml }
+      required: [node]
+
+    node.heartbeat:
+      properties:
+        node_id: { type: string }
+        current_worker_count: { type: integer }
+      required: [node_id]
+
+    node.lost:
+      properties:
+        node_id: { type: string }
+        last_heartbeat_at: { type: string, format: date-time }
+      required: [node_id]
+
+    policy.allowed:
+      properties:
+        task_id: { type: string }
+        worker_id: { type: string }
+        policy_id: { type: string }
+        matched_rule: { type: string }
+      required: [task_id, worker_id, policy_id]
+
+    policy.denied:
+      properties:
+        task_id: { type: string }
+        worker_id: { type: string }
+        policy_id: { type: string }
+        matched_rule: { type: string }
+        reason: { type: string }
+      required: [task_id, worker_id, policy_id, reason]
+
+    worker.quarantined:
+      properties:
+        worker_id: { type: string }
+        reason: { type: string }
+        quarantined_by: { type: string }
+      required: [worker_id, reason, quarantined_by]
+
+    approval.requested:
+      properties:
+        task_id: { type: string }
+        worker_id: { type: string }
+        policy_id: { type: string }
+        approvers: { type: array, items: { type: string } }
+      required: [task_id, policy_id, approvers]

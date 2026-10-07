@@ -1,0 +1,128 @@
+# Task schema — durable unit of work
+#
+# v0.1 scope: tasks have 8 lifecycle states. The state machine is enforced
+# by the runner (execution/runner.py) and the workload service (workload/service.py).
+
+$schema: http://json-schema.org/draft-07/schema#
+title: Task
+type: object
+additionalProperties: false
+
+required:
+  - id
+  - type
+  - status
+  - priority
+  - payload
+  - retry_count
+  - created_at
+
+properties:
+  id:
+    type: string
+    description: Stable task identifier.
+    pattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+
+  type:
+    type: string
+    description: Task type (e.g., "deploy_service", "run_tests", "code_review").
+    examples: ["deploy_service", "run_tests", "code_review", "investigate_alert"]
+
+  status:
+    type: string
+    description: |
+      Task lifecycle state.
+        queued     — ready for assignment
+        assigned   — owned by a worker (not yet started)
+        in_progress — execution has started
+        blocked    — waiting for dependency, decision, or external system
+        review     — output needs validation or approval
+        completed  — acceptance criteria met
+        failed     — retries exhausted or unrecoverable
+        canceled   — explicitly stopped
+    enum: [queued, assigned, in_progress, blocked, review, completed, failed, canceled]
+
+  priority:
+    type: integer
+    minimum: 0
+    maximum: 100
+    default: 50
+    description: Higher = scheduled sooner. Within priority, FIFO.
+
+  worker_id:
+    type: string
+    description: Assigned worker. Null if status=queued.
+
+  node_id:
+    type: string
+    description: Assigned node. Null if status=queued.
+
+  required_skills:
+    type: array
+    items: { type: string }
+    description: Skills the assigned worker must have. Scheduler enforces match.
+
+  required_tools:
+    type: array
+    items: { type: string }
+    description: Tools the worker must be allowed to invoke.
+
+  payload:
+    type: object
+    description: Task-specific input. Shape depends on `type`.
+    additionalProperties: true
+
+  context:
+    type: object
+    description: Optional context for policy evaluation.
+    properties:
+      reason:
+        type: string
+      requested_by:
+        type: string
+      ticket_id:
+        type: string
+
+  dependencies:
+    type: array
+    items: { type: string }
+    description: Other task IDs that must complete before this task can be claimed.
+
+  checkpoint_ref:
+    type: string
+    description: Reference to the durable checkpoint for resumable tasks.
+
+  retry_count:
+    type: integer
+    minimum: 0
+    default: 0
+    description: Number of retry attempts so far.
+
+  max_retries:
+    type: integer
+    minimum: 0
+    default: 3
+
+  last_error:
+    type: string
+    description: Most recent failure reason.
+
+  deadline:
+    type: string
+    format: date-time
+
+  created_at:
+    type: string
+    format: date-time
+
+  updated_at:
+    type: string
+    format: date-time
+
+  claimed_at:
+    type: string
+    format: date-time
+
+  completed_at:
+    type: string
+    format: date-time

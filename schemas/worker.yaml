@@ -1,0 +1,108 @@
+# Worker schema — persistent identity, profile, authority
+#
+# v0.1 scope: in-memory representation lives in src/personaos/domain/worker.py.
+# Postgres representation lives in src/personaos/db/models.py (generated from this YAML).
+# Per ADR 0002: this YAML is the source of truth.
+
+$schema: http://json-schema.org/draft-07/schema#
+title: Worker
+type: object
+additionalProperties: false
+
+required:
+  - id
+  - name
+  - role
+  - profile
+  - authority
+  - status
+  - version
+  - created_at
+
+properties:
+  id:
+    type: string
+    description: Stable worker identifier. Survives model + runtime changes.
+    pattern: '^[a-z0-9][a-z0-9-]*[a-z0-9]$'
+    examples: ["devops-01", "developer-02", "qa-01"]
+
+  name:
+    type: string
+    description: Human-readable worker name.
+    minLength: 1
+    maxLength: 100
+
+  role:
+    type: string
+    description: Worker role. Drives default authority and skill expectations.
+    enum: [devops, developer, qa, architect, security, custom]
+
+  profile:
+    type: object
+    additionalProperties: false
+    description: LLM-independent configuration. Survives model changes.
+    properties:
+      system_prompt:
+        type: string
+        description: The worker's operating instructions. Static across runs.
+      objectives:
+        type: array
+        items: { type: string }
+        description: What the worker is trying to achieve.
+      personality:
+        type: string
+        description: Behavioral style (e.g., "methodical, risk-aware").
+      operating_constraints:
+        type: array
+        items: { type: string }
+        description: Hard rules (e.g., "never delete production resources").
+
+  authority:
+    type: object
+    additionalProperties: false
+    description: What this worker is allowed to do. Enforced by security/policy.py.
+    properties:
+      tools:
+        type: array
+        items: { type: string }
+        description: Tool allow-list (e.g., "ssh:staging", "tools:terminal").
+      resource_scopes:
+        type: array
+        items: { type: string }
+        description: Resource patterns (e.g., "staging-*", "dev-cluster").
+      max_concurrent_tasks:
+        type: integer
+        minimum: 1
+        maximum: 16
+        default: 1
+      requires_approval_for:
+        type: array
+        items: { type: string }
+        description: Action patterns that always require human approval.
+
+  status:
+    type: string
+    description: Worker status. Scheduler skips non-active workers.
+    enum: [active, paused, quarantined, retired]
+
+  version:
+    type: integer
+    minimum: 1
+    description: Profile version. Bumped on every profile change.
+
+  created_at:
+    type: string
+    format: date-time
+
+  updated_at:
+    type: string
+    format: date-time
+
+  last_seen_at:
+    type: string
+    format: date-time
+    description: Last time the worker process reported a heartbeat.
+
+  node_id:
+    type: string
+    description: Currently assigned node. Transient — the worker outlives the node.

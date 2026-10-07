@@ -1,0 +1,59 @@
+# Single-machine deployment for PersonaOS v0.1.
+#
+# This is the same stack as the root docker-compose.yml, with a comment block
+# for the production-mode API and worker processes. In v0.1 the API and worker
+# run on the same host as Postgres.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: personaos-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: personaos
+      POSTGRES_USER: personaos
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports:
+      - "5432:5432"
+    volumes:
+      - personaos_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U personaos -d personaos"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    image: personaos:0.1.0
+    container_name: personaos-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://personaos:${POSTGRES_PASSWORD}@postgres:5432/personaos
+      LOG_LEVEL: INFO
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+    ports:
+      - "8000:8000"
+    command: ["personaos-api"]
+
+  worker:
+    image: personaos:0.1.0
+    container_name: personaos-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql+asyncpg://personaos:${POSTGRES_PASSWORD}@postgres:5432/personaos
+      LOG_LEVEL: INFO
+      WORKER_POLL_INTERVAL_SECONDS: 2.0
+      TASK_LEASE_TTL_SECONDS: 300
+    command: ["personaos-worker"]
+
+volumes:
+  personaos_pgdata:
