@@ -162,6 +162,8 @@ class Task(Base):
       - assigned_node   → text (no nodes table in v0.1; opaque runner ID)
       - checkpoint_ref  → task_checkpoints.ref (added in migration step 5
         via op.create_foreign_key to avoid circular dep)
+      - simulated_from  → tasks.id (SET NULL on source delete; added in
+        migration 0003 for task simulation / replay per ADR 0011)
     """
 
     __tablename__ = "tasks"
@@ -188,6 +190,12 @@ class Task(Base):
     assigned_node: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dependencies: Mapped[list] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    # Per ADR 0011 (Step 6): nullable self-FK to the source task. NULL on
+    # production tasks; set to source.id on simulation tasks. ON DELETE SET
+    # NULL preserves simulations when the source is deleted (audit invariant).
+    simulated_from: Mapped[Optional[str]] = mapped_column(
+        Text, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
     )
     input: Mapped[dict] = mapped_column(JSONB, nullable=False)
     checkpoint_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -229,6 +237,7 @@ class Task(Base):
         Index("ix_tasks_assigned_worker", "assigned_worker"),
         Index("ix_tasks_assigned_node", "assigned_node"),
         Index("ix_tasks_priority_created", "priority", "created_at"),
+        Index("ix_tasks_simulated_from", "simulated_from"),
     )
 
 

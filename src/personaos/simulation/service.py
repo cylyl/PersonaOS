@@ -1,30 +1,36 @@
 """Simulation and Replay Service.
 
-Per ADR 0011 and docs/specs/simulation-and-replay.md:
-  - Replays historical tasks deterministically using their snapshotted profile version
-  - Evaluates counterfactual profile versions without mutating historical DB rows
-  - Forks historical tasks into runnable tasks for the kernel
+Per ADR 0011:
+  - SimulationService: creates a NEW task linked to source via simulated_from and runs kernel
+  - ReplayService: coordinates non-destructive simulation and counterfactual replay
 """
 
 from __future__ import annotations
 
+import copy
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from personaos.db.models import Task as TaskModel
 from personaos.domain.task import Task
-from personaos.execution.adapters.base import Adapter
+from personaos.execution.adapters.base import Adapter, Result
 from personaos.execution.adapters.simulation import SimulationAdapter
 from personaos.execution.checkpoint import load as checkpoint_load
-from personaos.execution.result import Result
+from personaos.execution.kernel import WorkerExecutionKernel
 from personaos.registry.profile import ProfileError, ProfileRegistry
 from personaos.workload.service import WorkloadService
 
 
 class TaskNotFoundError(Exception):
     """Raised when a task requested for replay cannot be found."""
+
+
+class SourceTaskNotFoundError(Exception):
+    """Raised by SimulationService.replay when task_id doesn't exist."""
 
 
 @dataclass(frozen=True)
@@ -188,3 +194,111 @@ class ReplayService:
         )
 
         return forked_task
+
+
+@dataclass(frozen=True)
+class SimulationResult:
+    """Outcome of a replay.
+
+    Per ADR 0011:
+      - task_id: the NEW simulation task id (different from source)
+      - result: the adapter's output (SimulationAdapter returns a
+        deterministic Result)
+      - source_task_id: the source task id (immutable)
+      - source_profile_version: the snapshot version used
+    """
+
+    task_id: str
+    result: Result
+    source_task_id: str
+    source_profile_version: int
+
+
+class SimulationService:
+    """Replays a historical task without mutating it.
+
+    Per ADR 0011: closes the loop on Steps 3-5. Uses the SAME
+    WorkerExecutionKernel as production, only the Adapter differs.
+    """
+
+    def __init__(
+        self,
+        *,
+        session: AsyncSession,
+        kernel: WorkerExecutionKernel,
+        registry: ProfileRegistry,
+    ) -> None:
+        self._session = session
+        self._kernel = kernel
+        self._registry = registry
+
+    async def replay(self, task_id: str) -> SimulationResult:
+        """Replay the historical task.
+
+        Creates a NEW task with simulated_from=task_id. The source task
+        is NEVER mutated. Returns SimulationResult with the new task id,
+        the adapter's Result, and the source linkage.
+
+        Raises:
+            SourceTaskNotFoundError: if task_id doesn't exist.
+        """
+        source_row = (
+            await self._session.execute(
+                select(TaskModel).where(TaskModel.id == task_id)
+            )
+        ).scalar_one_or_none()
+        if source_row is None:
+            raise SourceTaskNotFoundError(
+                f"source task {task_id} not found"
+            )
+
+        source_profile_version = source_row.profile_version
+        source_assigned_worker = source_row.assigned_worker
+        source_input = (
+            copy.deepcopy(source_row.input) if source_row.input else {}
+        )
+        source_title = source_row.title
+        source_objective = source_row.objective
+        source_required_skills = list(source_row.required_skills or [])
+        source_required_capabilities = list(
+            source_row.required_capabilities or []
+        )
+        source_priority = source_row.priority
+        source_deadline = source_row.deadline
+
+        sim_row = TaskModel(
+            id=str(uuid.uuid4()),
+            title=source_title,
+            objective=source_objective,
+            input=source_input,
+            assigned_worker=source_assigned_worker,
+            profile_version=source_profile_version,
+            required_skills=source_required_skills,
+            required_capabilities=source_required_capabilities,
+            priority=source_priority,
+            type="simulation",
+            dependencies=[],
+            simulated_from=task_id,
+            status="queued",
+            max_retries=3,
+            retry_count=0,
+            result=None,
+            last_error=None,
+            checkpoint_ref=None,
+            assigned_node=None,
+            started_at=None,
+            completed_at=None,
+            deadline=source_deadline,
+        )
+        self._session.add(sim_row)
+        await self._session.flush()
+
+        sim_task = Task.from_orm(sim_row)
+        result = await self._kernel.execute(sim_task)
+
+        return SimulationResult(
+            task_id=sim_row.id,
+            result=result,
+            source_task_id=task_id,
+            source_profile_version=source_profile_version,
+        )
