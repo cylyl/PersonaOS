@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from personaos.db.models import Task as TaskModel
@@ -128,3 +128,88 @@ class WorkloadService:
             raise
 
         return Task.from_orm(task_row)
+
+    async def next_runnable(self) -> Optional[Task]:
+        """Return the next runnable candidate (FIFO), or None.
+
+        Per ADR 0013 — a task is runnable iff:
+
+          task.status == 'queued'
+          AND
+              task.dependencies is empty
+              OR for every dep_id in task.dependencies, the task with
+                 that id has status='completed'
+
+        Ordering: ``created_at ASC, id ASC`` (deterministic FIFO).
+        ``id`` is the tie-breaker for tasks created in the same
+        microsecond.
+
+        Read-only. Does NOT claim the task. The kernel still owns
+        the atomic claim via Phase 3 (``UPDATE WHERE status='queued'``).
+        Concurrent callers may receive the same task; the kernel's
+        atomic claim ensures only one wins.
+
+        Returns None when no task is runnable (empty queue, or all
+        queued tasks have unsatisfied dependencies — including
+        missing dep IDs or any dep with status != 'completed').
+
+        Implementation note: the jsonb_array_elements_text expansion
+        + LEFT JOIN against ``tasks dep`` is hard to express cleanly
+        in pure SQLAlchemy ORM, so we use raw SQL via ``text()``.
+        The query is read-only — no UPDATE/INSERT/DELETE.
+        """
+        # Raw SQL — the jsonb expansion + dep-existence check are
+        # awkward to express in SQLAlchemy ORM. Read-only query;
+        # kernel still owns the atomic claim.
+        sql = text(
+            """
+            SELECT id, title, objective, status, priority, type,
+                   required_skills, required_capabilities,
+                   assigned_worker, assigned_node,
+                   dependencies, input, checkpoint_ref, result,
+                   retry_count, max_retries, last_error,
+                   deadline, created_at, started_at, completed_at,
+                   profile_version
+            FROM tasks
+            WHERE status = 'queued'
+              AND (
+                    jsonb_array_length(dependencies) = 0
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements_text(dependencies) AS dep_id
+                        LEFT JOIN tasks dep ON dep.id = dep_id
+                        WHERE dep.id IS NULL              -- missing dep
+                           OR dep.status <> 'completed'    -- dep not done
+                    )
+              )
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            """
+        )
+        row = (await self._session.execute(sql)).first()
+        if row is None:
+            return None
+        return Task(
+            id=row.id,
+            title=row.title,
+            objective=row.objective,
+            status=row.status,
+            priority=row.priority,
+            type=row.type,
+            required_skills=list(row.required_skills or []),
+            required_capabilities=list(row.required_capabilities or []),
+            assigned_worker=row.assigned_worker,
+            assigned_node=row.assigned_node,
+            dependencies=list(row.dependencies or []),
+            input=row.input,
+            checkpoint_ref=row.checkpoint_ref,
+            result=row.result,
+            retry_count=row.retry_count,
+            max_retries=row.max_retries,
+            last_error=row.last_error,
+            deadline=row.deadline,
+            created_at=row.created_at,
+            started_at=row.started_at,
+            completed_at=row.completed_at,
+            profile_version=row.profile_version,
+        )

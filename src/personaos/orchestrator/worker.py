@@ -40,13 +40,11 @@ from __future__ import annotations
 
 import asyncio
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from personaos.db.models import Task as TaskModel
-from personaos.domain.task import Task
 from personaos.execution.kernel import TaskStatusError, WorkerExecutionKernel
 from personaos.orchestrator.metrics import OrchestratorMetrics
+from personaos.workload.service import WorkloadService
 
 
 class WorkerOrchestrator:
@@ -113,41 +111,42 @@ class WorkerOrchestrator:
     async def process_one(self) -> bool:
         """One iteration: find + invoke + handle the concurrency boundary.
 
+        Per ADR 0013 (Step 8): delegates the "next runnable candidate"
+        query to ``WorkloadService.next_runnable()`` instead of doing
+        a raw ``SELECT ... WHERE status='queued'``. The workload layer
+        owns the runnable predicate (status='queued' AND dependencies
+        satisfied). The orchestrator still doesn't claim; the kernel's
+        Phase 3 is the atomic claim.
+
         Returns True if a task was processed (``kernel.execute()``
-        returned successfully). Returns False if the queue was empty or
-        a ``TaskStatusError`` was caught (concurrency conflict — another
-        orchestrator won the race for the same task).
+        returned successfully). Returns False if no runnable work was
+        found (empty queue OR every queued task has unsatisfied deps)
+        OR a ``TaskStatusError`` was caught (concurrency conflict —
+        another orchestrator won the race for the same task).
 
         The atomic claim is the kernel's Phase 3
         (``UPDATE tasks SET status='in_progress' WHERE id=? AND status='queued'``).
         This method does NOT introduce any new claim path.
         """
-        # 1. Find one queued task (best-effort SELECT — no locks).
-        #    ORDER BY created_at gives FIFO. LIMIT 1 keeps the SELECT
-        #    cheap and avoids pulling a batch we can't process.
-        task_row = (
-            await self._session.execute(
-                select(TaskModel)
-                .where(TaskModel.status == "queued")
-                .order_by(TaskModel.created_at)
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if task_row is None:
+        # 1. Find one runnable candidate (delegates to WorkloadService).
+        #    Per ADR 0013: status='queued' AND dependencies satisfied.
+        #    Read-only — kernel still owns the atomic claim.
+        workload = WorkloadService(self._session)
+        task = await workload.next_runnable()
+        if task is None:
             return False
 
         # 2. Pass to the kernel. The kernel's Phase 3 is the atomic
         #    claim — same mechanism as direct kernel invocation, no
         #    parallel claim path introduced here.
-        task = Task.from_orm(task_row)
         try:
             await self._kernel.execute(task)
         except TaskStatusError:
             # Concurrency boundary: another orchestrator's kernel
             # already transitioned this task to 'in_progress' (or
-            # 'completed') between our SELECT and our kernel's UPDATE.
-            # This is a CLAIM CONFLICT, not a task failure — record
-            # it and move on.
+            # 'completed') between our next_runnable() and our
+            # kernel's UPDATE. This is a CLAIM CONFLICT, not a task
+            # failure — record it and move on.
             self._metrics.claim_conflicts += 1
             return False
 
