@@ -35,7 +35,9 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from personaos.db.models import Worker as WorkerModel
+from personaos.domain.task import Task
 from personaos.domain.worker import Persona, WorkerProfile, Worker
+from personaos.execution.context import WorkerExecutionContext
 
 
 # Default profiles directory; can be overridden via env var or constructor arg.
@@ -248,6 +250,27 @@ class ProfileRegistry:
         )
         await self._session.commit()
         # NOTE: profile file at profiles/{id}/v{version}.yaml is NEVER touched
+
+    async def resolve_execution_context(self, task: Task) -> WorkerExecutionContext:
+        """Load worker + snapshot profile, return a frozen context.
+
+        NEVER reads worker.current_profile_version. ALWAYS reads task.profile_version.
+
+        This is the ONLY way the runtime gets a profile — there is no
+        "load current profile" path in v0.1. If you find yourself wanting
+        to add one, step back and re-read ADR 0009 first.
+
+        Raises ProfileError if task has no assigned_worker.
+        Raises WorkerNotFoundError if the worker is gone.
+        Raises ProfileVersionNotFoundError if the snapshot version is missing on disk.
+        """
+        if not task.assigned_worker:
+            raise ProfileError(
+                f"task {task.id} has no assigned_worker; cannot resolve context"
+            )
+        worker = await self.get_worker(task.assigned_worker)
+        profile = self.get_profile_version(worker.id, task.profile_version)
+        return WorkerExecutionContext(worker=worker, profile=profile, task=task)
 
 
 # --- Module-level helpers (manual YAML serialization for v0.1) ---
