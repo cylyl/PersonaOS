@@ -8,14 +8,11 @@ Per ADR 0009: the adapter receives a frozen WorkerExecutionContext
 contract is in the type system — an adapter cannot accidentally read
 worker.current_profile_version because that field is not on the context.
 
+Per ADR 0010: the adapter returns a Result. The kernel handles success
+vs failure persistence.
+
 Concrete adapters (openclaw.py now; local.py, cloud.py later) implement
 this Protocol.
-
-TODO(v0.2): define the Result dataclass:
-  - status: Literal["completed", "failed", "needs_input"]
-  - output: dict | None
-  - error: str | None
-  - new_checkpoint: dict | None  # for resumption
 """
 
 from __future__ import annotations
@@ -23,6 +20,7 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from personaos.execution.context import WorkerExecutionContext
+from personaos.execution.result import Result
 
 
 class Adapter(Protocol):
@@ -32,4 +30,4 @@ class Adapter(Protocol):
         self,
         context: WorkerExecutionContext,
         checkpoint: Any | None,
-    ) -> Any: ...
+    ) -> Result: ...

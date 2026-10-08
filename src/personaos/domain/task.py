@@ -64,6 +64,7 @@ class Task:
     last_error: Optional[str] = None
     deadline: Optional[datetime] = None
     type: Optional[str] = None
+    checkpoint_ref: Optional[str] = None
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -109,6 +110,7 @@ class Task:
             last_error=task_row.last_error,
             deadline=task_row.deadline,
             type=task_row.type,
+            checkpoint_ref=task_row.checkpoint_ref,
             created_at=task_row.created_at,
             started_at=task_row.started_at,
             completed_at=task_row.completed_at,
