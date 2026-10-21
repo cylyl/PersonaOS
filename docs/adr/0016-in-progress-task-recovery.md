@@ -134,7 +134,8 @@ SET    status          = 'in_progress',
        -- Clear checkpoint so recovery execution starts fresh
        -- (or keep it — see §Checkpoint Recovery below)
        checkpoint_ref  = NULL,
-       started_at      = NOW()
+       started_at      = NOW(),
+       retry_count     = retry_count + 1
 WHERE  id              = :task_id
   AND  status          = 'in_progress'
   AND  generation      = :observed_generation      -- fenced: fails if a recovery-loop
@@ -149,6 +150,7 @@ RETURNING id, generation
 - `generation = :observed_generation` is the recovery-loop fence. The recovery worker reads the task (observing `generation = N`), then runs the reclaim UPDATE. If a concurrent operator reset or another recovery operation changed the generation between the read and the UPDATE, the WHERE fails (0 rows).
 - `generation + 1` increments the fence. The new owner holds `generation = N+1`. The stale owner holds `generation = N` and is fenced out of all subsequent writes.
 - `retry_count < max_retries` enforces the retry limit at reclaim time.
+- `retry_count = retry_count + 1` consumes one unit of the task's retry budget on each reclaim. The increment lives inside the same atomic SET clause as `generation = generation + 1` and the WHERE predicate, so a failed conditional update (rowcount=0) consumes neither a retry nor a generation. Without this increment, the retry budget would never be consumed by reclamation.
 - `side_effect_classification = 'IDEMPOTENT'` gates automatic reclamation on side-effect risk. Tasks with `UNKNOWN` or `HAS_SIDE_EFFECTS` are never auto-reclaimed.
 
 The two reclaimer predicates on `retry_count` (`< max_retries`) and the retry-exhaustion predicate (`>= max_retries`) are **mutually exclusive**. A single recovery worker that lands first wins; the other sees zero rows.
