@@ -99,4 +99,4 @@ class SimulationAdapter:
 
 
 # Protocol conformance marker (mypy-only)
-_: Adapter = SimulationAdapter()  # type: ignore[assignment]
+_: Adapter = SimulationAdapter()

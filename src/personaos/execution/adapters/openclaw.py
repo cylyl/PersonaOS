@@ -50,4 +50,4 @@ class OpenClawAdapter:
 
 
 # Protocol conformance marker (mypy-only)
-_: Adapter = OpenClawAdapter  # type: ignore[type-arg,assignment]
+_: Adapter = OpenClawAdapter  # type: ignore[assignment]

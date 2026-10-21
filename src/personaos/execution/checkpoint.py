@@ -16,13 +16,15 @@ from __future__ import annotations
 
 import uuid
 
+from typing import Any
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from personaos.db.models import TaskCheckpoint
 
 
-async def load(session: AsyncSession, ref: str | None) -> dict | None:
+async def load(session: AsyncSession, ref: str | None) -> dict[str, Any] | None:
     """Load a checkpoint by ref.
 
     Returns the state dict, or None if:
@@ -38,7 +40,7 @@ async def load(session: AsyncSession, ref: str | None) -> dict | None:
     return dict(cp.state)
 
 
-async def write(session: AsyncSession, task_id: str, state: dict) -> str:
+async def write(session: AsyncSession, task_id: str, state: dict[str, Any]) -> str:
     """Write a new checkpoint. Returns the ref.
 
     The ref is a fresh UUID; the caller should update task.checkpoint_ref
