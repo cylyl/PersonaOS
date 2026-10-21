@@ -99,6 +99,18 @@ class WorkerRunner:
         self._binding_id = str(uuid.uuid4())
 
         async with self._session_factory() as session:
+            # Drain any prior active bindings for this worker left over from ungraceful termination
+            await session.execute(
+                update(WorkerNode)
+                .where(
+                    WorkerNode.worker_id == self._worker_id,
+                    WorkerNode.unbound_at.is_(None),
+                )
+                .values(
+                    unbound_at=datetime.now(UTC),
+                    reason="stale_binding_superseded",
+                )
+            )
             binding = WorkerNode(
                 id=self._binding_id,
                 worker_id=self._worker_id,

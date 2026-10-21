@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -193,3 +194,73 @@ async def test_worker_runner_executes_tasks_and_heartbeats(
             ).scalar_one()
             assert t_db.status == "completed"
             assert t_db.result == {"deployed": True}
+
+
+@pytest.mark.asyncio
+async def test_worker_runner_supersedes_stale_bindings_on_restart(
+    migrated_db: None,
+    engine: AsyncEngine,
+    session_factory: async_sessionmaker[AsyncSession],
+    profiles_dir: Path,
+    clean_tables: None,
+) -> None:
+    """FINDING-04: When a worker restarts after an ungraceful crash,
+    prior active bindings are drained.
+    """
+    worker_id = "worker-crash-restart"
+    node_id = "node-us-east-1a"
+
+    # Register worker
+    async with session_factory() as session:
+        registry = ProfileRegistry(session=session, profiles_dir=profiles_dir)
+        profile = WorkerProfile(version=1, role="devops", runtime="openclaw")
+        await registry.register_worker(worker_id, profile)
+
+        # Seed an orphaned binding from a prior crashed process (unbound_at is NULL)
+        prior_binding = WorkerNode(
+            id="stale-bind-999",
+            worker_id=worker_id,
+            node_id=node_id,
+            bound_at=datetime.now(UTC),
+            unbound_at=None,
+        )
+        session.add(prior_binding)
+        await session.commit()
+
+    adapter = SimulationAdapter(result=Result(status="completed", output={}))
+
+    async with session_factory() as s_orch:
+        kernel = WorkerExecutionKernel(
+            session=s_orch, adapter=adapter, worker_id=worker_id, profiles_dir=profiles_dir
+        )
+        orchestrator = WorkerOrchestrator(session=s_orch, kernel=kernel)
+        runner = WorkerRunner(
+            orchestrator=orchestrator,
+            session_factory=session_factory,
+            worker_id=worker_id,
+            node_id=node_id,
+        )
+
+        runner_task = asyncio.create_task(runner.run())
+        await asyncio.sleep(0.1)
+
+        # Verify old binding was drained with reason "stale_binding_superseded"
+        async with session_factory() as s_check:
+            stale_row = (
+                await s_check.execute(
+                    select(WorkerNode).where(WorkerNode.id == "stale-bind-999")
+                )
+            ).scalar_one()
+            assert stale_row.unbound_at is not None
+            assert stale_row.reason == "stale_binding_superseded"
+
+            # And the new binding is active
+            active_row = (
+                await s_check.execute(
+                    select(WorkerNode).where(WorkerNode.id == runner.binding_id)
+                )
+            ).scalar_one()
+            assert active_row.unbound_at is None
+
+        runner.stop()
+        await runner_task
