@@ -162,8 +162,7 @@ SET    status            = CASE
            WHEN side_effect_classification = 'IDEMPOTENT'      THEN NOW()
            ELSE NULL
          END,
-       lock_expires_at    = NULL,
-       updated_at         = NOW()
+       lock_expires_at    = NULL
 WHERE  id                = :task_id
   AND  status            = 'in_progress'
   AND  generation        = :observed_generation      -- fenced: a stale recovery-loop

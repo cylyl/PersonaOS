@@ -76,7 +76,8 @@ Companion file: ``src/personaos/db/migrations/versions/0004_recovery_columns.py`
 #     ),
 #     Index(
 #         "ix_tasks_review_queue",
-#         text("updated_at DESC"),
+#         "priority",
+#         "created_at",
 #         postgresql_where=text("status = 'review'"),
 #     ),
 #
@@ -131,7 +132,8 @@ Companion file: ``src/personaos/db/migrations/versions/0004_recovery_columns.py`
 #         ),
 #         Index(
 #             "ix_tasks_review_queue",
-#             text("updated_at DESC"),
+#             "priority",
+#             "created_at",
 #             postgresql_where=text("status = 'review'"),
 #         ),
 #     )

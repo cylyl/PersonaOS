@@ -32,16 +32,16 @@ Reused (no schema change):
   - last_error            — already exists
   - status='review'       — already in tasks_status_check CHECK
   - assigned_worker       — already exists (ownership field, NOT renamed)
-  - updated_at            — already exists (NOT NULL, server_default now())
+  - created_at            — already exists (NOT NULL, server_default now())
 
 Two new partial indexes:
   - ix_tasks_recovery_scan ON (lock_expires_at) WHERE status = 'in_progress'
     Recovery-loop primary scan: WHERE status='in_progress' AND
     lock_expires_at < NOW(). Both reclaim eligibility and retry-exhaustion
     scans reduce to this predicate.
-  - ix_tasks_review_queue ON (updated_at DESC) WHERE status = 'review'
+  - ix_tasks_review_queue ON (priority, created_at) WHERE status = 'review'
     Operator review queue: SELECT ... FROM tasks WHERE status = 'review'
-    ORDER BY updated_at DESC LIMIT 100.
+    ORDER BY priority, created_at LIMIT 100.
 
 CRITICAL INVARIANT (from ADR 0016 §"Reclaim SQL" and Step 12b acceptance):
   The reclaim SQL atomically updates BOTH ``generation = generation + 1``
@@ -134,12 +134,12 @@ def upgrade() -> None:
         postgresql_where=sa.text("status = 'in_progress'"),
     )
 
-    # 6. ix_tasks_review_queue — partial index on updated_at DESC for
+    # 6. ix_tasks_review_queue — partial index on (priority, created_at) for
     #    tasks in the operator review queue.
     op.create_index(
         "ix_tasks_review_queue",
         "tasks",
-        [sa.text("updated_at DESC")],
+        ["priority", "created_at"],
         postgresql_where=sa.text("status = 'review'"),
     )
 
