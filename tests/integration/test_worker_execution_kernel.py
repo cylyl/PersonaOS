@@ -35,22 +35,21 @@ from typing import Any
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import select, text
+from sqlalchemy import text
 
 from personaos.db.models import Task as TaskModel
 from personaos.domain.task import Task
 from personaos.domain.worker import Persona, WorkerProfile
-from personaos.execution.context import WorkerExecutionContext
-from personaos.registry.profile import ProfileRegistry
-from personaos.workload.service import WorkloadService
 
 # Step 5b imports — these must be available now that 5b has landed.
 from personaos.execution.adapters.base import Result
+from personaos.execution.context import WorkerExecutionContext
 from personaos.execution.kernel import (
     TaskStatusError,
     WorkerExecutionKernel,
 )
-
+from personaos.registry.profile import ProfileRegistry
+from personaos.workload.service import WorkloadService
 
 # tests/integration/test_worker_execution_kernel.py → repo root → src/personaos/db/migrations
 REPO_ROOT = Path(__file__).parents[2]
@@ -150,14 +149,10 @@ async def _enqueue_task(
 ) -> Task:
     """Enqueue a task with minimal payload."""
     wl = WorkloadService(session=session)
-    return await wl.enqueue(
-        worker_id=worker_id, title=title, objective=objective, input={}
-    )
+    return await wl.enqueue(worker_id=worker_id, title=title, objective=objective, input={})
 
 
-def _make_kernel(
-    session, adapter, registry: ProfileRegistry
-) -> WorkerExecutionKernel:
+def _make_kernel(session, adapter, registry: ProfileRegistry) -> WorkerExecutionKernel:
     """Build a kernel wired to the registry's resolve_execution_context."""
     return WorkerExecutionKernel(
         session=session,
@@ -194,9 +189,7 @@ async def _task_full_row(session, task_id: str):
 # ---------- AC #1 + #4 + #8: queued task executes with its snapshot ----------
 
 
-async def test_queued_task_executes_with_its_snapshot(
-    profiles_dir, database_url, session_factory
-):
+async def test_queued_task_executes_with_its_snapshot(profiles_dir, database_url, session_factory):
     """Task enqueued under v2 executes with v2 profile, even after worker → v3.
 
     Proves:
@@ -226,9 +219,7 @@ async def test_queued_task_executes_with_its_snapshot(
         await reg.activate_profile_version("w1", 3)
 
         # Execute
-        adapter = CapturingAdapter(
-            result_to_return=Result(status="completed", output={"x": 1})
-        )
+        adapter = CapturingAdapter(result_to_return=Result(status="completed", output={"x": 1}))
         kernel = _make_kernel(session, adapter, reg)
         result = await kernel.execute(task)
 
@@ -244,9 +235,7 @@ async def test_queued_task_executes_with_its_snapshot(
 # ---------- AC #2 + #6: RUNNING → COMPLETED with result persistence ----------
 
 
-async def test_running_to_completed_persists_result(
-    profiles_dir, database_url, session_factory
-):
+async def test_running_to_completed_persists_result(profiles_dir, database_url, session_factory):
     """Successful execution transitions to 'completed' and persists result.output."""
     cfg = _alembic_config(database_url)
     await asyncio.to_thread(command.upgrade, cfg, "head")
@@ -254,9 +243,7 @@ async def test_running_to_completed_persists_result(
     async with session_factory() as session:
         reg = await _setup_worker_v1_v2_active(session, profiles_dir)
         task = await _enqueue_task(session)
-        adapter = CapturingAdapter(
-            result_to_return=Result(status="completed", output={"y": 2})
-        )
+        adapter = CapturingAdapter(result_to_return=Result(status="completed", output={"y": 2}))
         kernel = _make_kernel(session, adapter, reg)
         result = await kernel.execute(task)
 
@@ -272,9 +259,7 @@ async def test_running_to_completed_persists_result(
 # ---------- AC #3 + #7: RUNNING → FAILED with error persistence ----------
 
 
-async def test_running_to_failed_persists_error(
-    profiles_dir, database_url, session_factory
-):
+async def test_running_to_failed_persists_error(profiles_dir, database_url, session_factory):
     """Failed execution transitions to 'failed' and persists the error."""
     cfg = _alembic_config(database_url)
     await asyncio.to_thread(command.upgrade, cfg, "head")
@@ -282,9 +267,7 @@ async def test_running_to_failed_persists_error(
     async with session_factory() as session:
         reg = await _setup_worker_v1_v2_active(session, profiles_dir)
         task = await _enqueue_task(session)
-        adapter = CapturingAdapter(
-            result_to_return=Result(status="failed", error="test failure")
-        )
+        adapter = CapturingAdapter(result_to_return=Result(status="failed", error="test failure"))
         kernel = _make_kernel(session, adapter, reg)
         result = await kernel.execute(task)
 
@@ -300,9 +283,7 @@ async def test_running_to_failed_persists_error(
 # ---------- AC #5: adapter exception → task failure (kernel doesn't crash) ----------
 
 
-async def test_adapter_exception_becomes_task_failure(
-    profiles_dir, database_url, session_factory
-):
+async def test_adapter_exception_becomes_task_failure(profiles_dir, database_url, session_factory):
     """An adapter that raises converts to a failed task (kernel survives)."""
     cfg = _alembic_config(database_url)
     await asyncio.to_thread(command.upgrade, cfg, "head")
@@ -336,9 +317,7 @@ async def test_no_retry_on_failure(profiles_dir, database_url, session_factory):
     async with session_factory() as session:
         reg = await _setup_worker_v1_v2_active(session, profiles_dir)
         task = await _enqueue_task(session)
-        adapter = CapturingAdapter(
-            result_to_return=Result(status="failed", error="boom")
-        )
+        adapter = CapturingAdapter(result_to_return=Result(status="failed", error="boom"))
         kernel = _make_kernel(session, adapter, reg)
         await kernel.execute(task)
 
@@ -351,9 +330,7 @@ async def test_no_retry_on_failure(profiles_dir, database_url, session_factory):
 # ---------- State guard: kernel rejects non-queued tasks ----------
 
 
-async def test_kernel_rejects_non_queued_task(
-    profiles_dir, database_url, session_factory
-):
+async def test_kernel_rejects_non_queued_task(profiles_dir, database_url, session_factory):
     """Kernel raises TaskStatusError if task is not in 'queued' state.
 
     Uses the atomic check-and-transition in Phase 3 — even if the in-memory
@@ -368,9 +345,7 @@ async def test_kernel_rejects_non_queued_task(
         task = await _enqueue_task(session)
 
         # First execution transitions to completed
-        adapter = CapturingAdapter(
-            result_to_return=Result(status="completed", output={"a": 1})
-        )
+        adapter = CapturingAdapter(result_to_return=Result(status="completed", output={"a": 1}))
         kernel = _make_kernel(session, adapter, reg)
         await kernel.execute(task)
 
@@ -386,9 +361,7 @@ async def test_kernel_rejects_non_queued_task(
 # ---------- Events: kernel emits task.claimed/completed/failed ----------
 
 
-async def test_task_events_emitted_for_completed(
-    profiles_dir, database_url, session_factory
-):
+async def test_task_events_emitted_for_completed(profiles_dir, database_url, session_factory):
     """Successful execution emits task.claimed + task.completed."""
     cfg = _alembic_config(database_url)
     await asyncio.to_thread(command.upgrade, cfg, "head")
@@ -396,29 +369,26 @@ async def test_task_events_emitted_for_completed(
     async with session_factory() as session:
         reg = await _setup_worker_v1_v2_active(session, profiles_dir)
         task = await _enqueue_task(session)
-        adapter = CapturingAdapter(
-            result_to_return=Result(status="completed", output={"z": 3})
-        )
+        adapter = CapturingAdapter(result_to_return=Result(status="completed", output={"z": 3}))
         kernel = _make_kernel(session, adapter, reg)
         await kernel.execute(task)
 
         events = (
-            await session.execute(
-                text(
-                    "SELECT type FROM task_events WHERE task_id = :tid "
-                    "ORDER BY created_at"
-                ),
-                {"tid": task.id},
+            (
+                await session.execute(
+                    text("SELECT type FROM task_events WHERE task_id = :tid ORDER BY created_at"),
+                    {"tid": task.id},
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert "task.claimed" in events
         assert "task.completed" in events
         assert "task.failed" not in events
 
 
-async def test_task_events_emitted_for_failed(
-    profiles_dir, database_url, session_factory
-):
+async def test_task_events_emitted_for_failed(profiles_dir, database_url, session_factory):
     """Failed execution emits task.claimed + task.failed."""
     cfg = _alembic_config(database_url)
     await asyncio.to_thread(command.upgrade, cfg, "head")
@@ -426,21 +396,20 @@ async def test_task_events_emitted_for_failed(
     async with session_factory() as session:
         reg = await _setup_worker_v1_v2_active(session, profiles_dir)
         task = await _enqueue_task(session)
-        adapter = CapturingAdapter(
-            result_to_return=Result(status="failed", error="nope")
-        )
+        adapter = CapturingAdapter(result_to_return=Result(status="failed", error="nope"))
         kernel = _make_kernel(session, adapter, reg)
         await kernel.execute(task)
 
         events = (
-            await session.execute(
-                text(
-                    "SELECT type FROM task_events WHERE task_id = :tid "
-                    "ORDER BY created_at"
-                ),
-                {"tid": task.id},
+            (
+                await session.execute(
+                    text("SELECT type FROM task_events WHERE task_id = :tid ORDER BY created_at"),
+                    {"tid": task.id},
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert "task.claimed" in events
         assert "task.failed" in events
         assert "task.completed" not in events
@@ -481,9 +450,7 @@ async def test_checkpoint_written_if_result_has_new_checkpoint(
         # A new checkpoint row exists with the snapshotted state
         cp_row = (
             await session.execute(
-                text(
-                    "SELECT task_id, state FROM task_checkpoints WHERE ref = :ref"
-                ),
+                text("SELECT task_id, state FROM task_checkpoints WHERE ref = :ref"),
                 {"ref": cp_ref},
             )
         ).first()
@@ -493,11 +460,15 @@ async def test_checkpoint_written_if_result_has_new_checkpoint(
 
         # A task.checkpointed event was emitted
         events = (
-            await session.execute(
-                text("SELECT type FROM task_events WHERE task_id = :tid"),
-                {"tid": task.id},
+            (
+                await session.execute(
+                    text("SELECT type FROM task_events WHERE task_id = :tid"),
+                    {"tid": task.id},
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert "task.checkpointed" in events
 
 
@@ -524,9 +495,7 @@ async def test_checkpoint_loaded_if_task_has_checkpoint_ref(
             {"tid": task.id},
         )
         await session.execute(
-            text(
-                "UPDATE tasks SET checkpoint_ref = 'cp-resume' WHERE id = :tid"
-            ),
+            text("UPDATE tasks SET checkpoint_ref = 'cp-resume' WHERE id = :tid"),
             {"tid": task.id},
         )
         await session.commit()
@@ -547,3 +516,117 @@ async def test_checkpoint_loaded_if_task_has_checkpoint_ref(
 
         # The adapter received the checkpoint state
         assert adapter.captured_checkpoint == {"step": 3}
+
+
+# ---------- In-flight Heartbeat Tests (FINDING-01) ----------
+
+
+class AsyncSleepAdapter:
+    """Adapter that sleeps asynchronously before returning result."""
+
+    def __init__(self, sleep_seconds: float, output: dict[str, Any] | None = None) -> None:
+        self.sleep_seconds = sleep_seconds
+        self.output = output or {"done": True}
+        self.executed = False
+
+    async def execute(self, context: Any = None, checkpoint: Any = None) -> Result:
+        await asyncio.sleep(self.sleep_seconds)
+        self.executed = True
+        return Result(status="completed", output=self.output)
+
+
+async def test_in_flight_heartbeat_extends_lease_for_long_running_adapter(
+    profiles_dir, database_url, session_factory
+):
+    """FINDING-01: In-flight adapter execution periodically extends task lease.
+
+    Without the in-flight heartbeat loop, an adapter executing for longer than
+    lease_ttl would allow lock_expires_at to lapse into the past, exposing it
+    to premature orphan reclaim. With the loop, lock_expires_at is continually
+    refreshed.
+    """
+    from datetime import timedelta
+
+    cfg = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    async with session_factory() as session:
+        reg = await _setup_worker_v1_v2_active(session, profiles_dir)
+        task = await _enqueue_task(session)
+        task_id = task.id
+
+        # Lease TTL is 0.4s, heartbeat interval is 0.08s, adapter sleeps 0.5s (> lease_ttl)
+        adapter = AsyncSleepAdapter(sleep_seconds=0.5, output={"status": "ok"})
+        kernel = WorkerExecutionKernel(
+            session=session,
+            adapter=adapter,
+            resolve_context=reg.resolve_execution_context,
+            lease_ttl=timedelta(seconds=0.4),
+            heartbeat_interval=0.08,
+            session_factory=session_factory,
+        )
+
+        res = await kernel.execute(task)
+        assert res.status == "completed"
+        assert adapter.executed is True
+
+        # Verify task is completed in database and not expired
+        row = (
+            await session.execute(
+                text("SELECT status, result, lock_expires_at FROM tasks WHERE id = :id"),
+                {"id": task_id},
+            )
+        ).first()
+        assert row is not None
+        assert row.status == "completed"
+        assert row.lock_expires_at is None
+
+
+async def test_in_flight_heartbeat_aborts_when_task_reclaimed(
+    profiles_dir, database_url, session_factory
+):
+    """FINDING-01: If a task is reclaimed/fenced while adapter is running,
+    the in-flight heartbeat detects generation mismatch, cancels the adapter,
+    and raises StaleWorkerError.
+    """
+    from datetime import timedelta
+
+    from personaos.execution.kernel import StaleWorkerError
+
+    cfg = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    async with session_factory() as session:
+        reg = await _setup_worker_v1_v2_active(session, profiles_dir)
+        task = await _enqueue_task(session)
+        task_id = task.id
+
+        # Adapter that sleeps for 5 seconds
+        adapter = AsyncSleepAdapter(sleep_seconds=5.0)
+        kernel = WorkerExecutionKernel(
+            session=session,
+            adapter=adapter,
+            resolve_context=reg.resolve_execution_context,
+            lease_ttl=timedelta(seconds=0.5),
+            heartbeat_interval=0.05,
+            session_factory=session_factory,
+        )
+
+        exec_coro = asyncio.create_task(kernel.execute(task))
+        # Let worker claim the task and start running adapter
+        await asyncio.sleep(0.1)
+
+        # External actor (e.g. recovery worker) increments generation
+        async with session_factory() as s2:
+            await s2.execute(
+                text("UPDATE tasks SET generation = generation + 1 WHERE id = :id"),
+                {"id": task_id},
+            )
+            await s2.commit()
+
+        # Worker A's next heartbeat should detect fence and raise StaleWorkerError
+        with pytest.raises(StaleWorkerError):
+            await exec_coro
+
+        # Adapter was cancelled before finishing its 5s sleep
+        assert adapter.executed is False

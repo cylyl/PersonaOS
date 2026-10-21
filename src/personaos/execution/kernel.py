@@ -20,24 +20,28 @@ Per ADR 0016 (v0.2):
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
-from datetime import datetime, timedelta, timezone
+from collections.abc import Awaitable, Callable
+from datetime import timedelta
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Any
 
 from sqlalchemy import select, text, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.engine import CursorResult
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.sql import func
 
 from personaos.db.models import Task as TaskModel
 from personaos.domain.task import Task
 from personaos.domain.worker import Worker, WorkerProfile
+from personaos.events.store import emit_task_event
 from personaos.execution.adapters.base import Adapter
 from personaos.execution.checkpoint import load as checkpoint_load
 from personaos.execution.checkpoint import write as checkpoint_write
 from personaos.execution.context import WorkerExecutionContext
 from personaos.execution.result import Result
-from personaos.events.store import emit_task_event
 from personaos.registry.profile import ProfileRegistry
 
 
@@ -62,12 +66,19 @@ class WorkerExecutionKernel:
         *,
         session: AsyncSession,
         adapter: Adapter,
-        resolve_context: Optional[ResolveContext] = None,
-        worker_id: Optional[str] = None,
-        profiles_dir: Optional[Path] = None,
+        resolve_context: ResolveContext | None = None,
+        worker_id: str | None = None,
+        profiles_dir: Path | None = None,
         lease_ttl: timedelta = timedelta(minutes=15),
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+        heartbeat_interval: float | None = None,
     ) -> None:
         self._session = session
+        self._session_factory = session_factory
+        if self._session_factory is None and getattr(self._session, "bind", None) is not None:
+            bind = self._session.bind
+            if isinstance(bind, AsyncEngine):
+                self._session_factory = async_sessionmaker(bind, expire_on_commit=False)
         self._adapter = adapter
         if resolve_context is not None:
             self._resolve_context = resolve_context
@@ -75,6 +86,7 @@ class WorkerExecutionKernel:
             reg = ProfileRegistry(session=session, profiles_dir=profiles_dir)
             self._resolve_context = reg.resolve_execution_context
         else:
+
             async def _default_resolve(t: Task) -> WorkerExecutionContext:
                 w = Worker(
                     id=self._worker_id or "worker",
@@ -91,10 +103,12 @@ class WorkerExecutionKernel:
                     runtime="openclaw",
                 )
                 return WorkerExecutionContext(worker=w, profile=p, task=t)
+
             self._resolve_context = _default_resolve
 
         self._worker_id = worker_id
         self._lease_ttl = lease_ttl
+        self._heartbeat_interval = heartbeat_interval
         self._generation: int = 0
 
     async def execute(self, task: Task) -> Result:
@@ -121,9 +135,7 @@ class WorkerExecutionKernel:
             )
             claimed = update_result.first()
             if claimed is None:
-                raise TaskStatusError(
-                    f"task {task.id} is not in 'queued' state (or doesn't exist)"
-                )
+                raise TaskStatusError(f"task {task.id} is not in 'queued' state (or doesn't exist)")
             self._generation = claimed[0]
             if not self._worker_id and claimed[1]:
                 self._worker_id = claimed[1]
@@ -141,15 +153,58 @@ class WorkerExecutionKernel:
 
         checkpoint_state = await checkpoint_load(self._session, task.checkpoint_ref)
 
+        stop_heartbeat = asyncio.Event()
+        interval = (
+            self._heartbeat_interval
+            if self._heartbeat_interval is not None
+            else min(60.0, max(0.05, self._lease_ttl.total_seconds() / 3.0))
+        )
+
+        async def _heartbeat_loop() -> None:
+            while not stop_heartbeat.is_set():
+                try:
+                    await asyncio.wait_for(stop_heartbeat.wait(), timeout=interval)
+                    break
+                except TimeoutError:
+                    pass
+                try:
+                    await self.heartbeat(task)
+                except StaleWorkerError:
+                    raise
+                except Exception:
+                    pass
+
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
         try:
-            result = await self._adapter.execute(
-                context=context, checkpoint=checkpoint_state
+            adapter_task = asyncio.create_task(
+                self._adapter.execute(context=context, checkpoint=checkpoint_state)
             )
+            done, pending = await asyncio.wait(
+                [adapter_task, heartbeat_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                exc = heartbeat_task.exception()
+                if exc is not None:
+                    adapter_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await adapter_task
+                    raise exc
+            # Otherwise adapter_task finished
+            result = await adapter_task
+        except StaleWorkerError:
+            raise
         except Exception as e:
             result = Result(
                 status="failed",
                 error=f"{type(e).__name__}: {e}",
             )
+        finally:
+            stop_heartbeat.set()
+            if not heartbeat_task.done():
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
 
         if result.status == "completed":
             await self.complete(task, result)
@@ -181,12 +236,9 @@ class WorkerExecutionKernel:
                     actor_id=expected_worker or "kernel",
                 )
 
-            stmt = (
-                update(TaskModel)
-                .where(
-                    TaskModel.id == task.id,
-                    TaskModel.generation == expected_gen,
-                )
+            stmt = update(TaskModel).where(
+                TaskModel.id == task.id,
+                TaskModel.generation == expected_gen,
             )
             if expected_worker:
                 stmt = stmt.where(TaskModel.assigned_worker == expected_worker)
@@ -200,7 +252,10 @@ class WorkerExecutionKernel:
                     lock_expires_at=None,
                 )
             )
-            if res.rowcount == 0:
+            rowcount = (
+                res.rowcount if isinstance(res, CursorResult) else getattr(res, "rowcount", 0)
+            )
+            if rowcount == 0:
                 raise StaleWorkerError(f"task {task.id} was reclaimed; write rejected")
 
             await emit_task_event(
@@ -220,12 +275,9 @@ class WorkerExecutionKernel:
         expected_worker = self._worker_id or task.assigned_worker
 
         try:
-            stmt = (
-                update(TaskModel)
-                .where(
-                    TaskModel.id == task.id,
-                    TaskModel.generation == expected_gen,
-                )
+            stmt = update(TaskModel).where(
+                TaskModel.id == task.id,
+                TaskModel.generation == expected_gen,
             )
             if expected_worker:
                 stmt = stmt.where(TaskModel.assigned_worker == expected_worker)
@@ -239,7 +291,10 @@ class WorkerExecutionKernel:
                     lock_expires_at=None,
                 )
             )
-            if res.rowcount == 0:
+            rowcount = (
+                res.rowcount if isinstance(res, CursorResult) else getattr(res, "rowcount", 0)
+            )
+            if rowcount == 0:
                 raise StaleWorkerError(f"task {task.id} was reclaimed; write rejected")
 
             await emit_task_event(
@@ -259,31 +314,36 @@ class WorkerExecutionKernel:
         expected_worker = self._worker_id or task.assigned_worker
         ttl_seconds = int(self._lease_ttl.total_seconds())
 
-        try:
-            stmt = (
-                update(TaskModel)
-                .where(
-                    TaskModel.id == task.id,
-                    TaskModel.status == "in_progress",
-                    TaskModel.generation == expected_gen,
-                )
+        async def _do_heartbeat(session: AsyncSession) -> None:
+            stmt = update(TaskModel).where(
+                TaskModel.id == task.id,
+                TaskModel.status == "in_progress",
+                TaskModel.generation == expected_gen,
             )
             if expected_worker:
                 stmt = stmt.where(TaskModel.assigned_worker == expected_worker)
 
-            res = await self._session.execute(
-                stmt.values(
-                    lock_expires_at=func.now() + text(f"interval '{ttl_seconds} seconds'")
-                )
+            res = await session.execute(
+                stmt.values(lock_expires_at=func.now() + text(f"interval '{ttl_seconds} seconds'"))
             )
-            if res.rowcount == 0:
+            rowcount = (
+                res.rowcount if isinstance(res, CursorResult) else getattr(res, "rowcount", 0)
+            )
+            if rowcount == 0:
                 raise StaleWorkerError(f"task {task.id} was reclaimed; heartbeat rejected")
-            await self._session.commit()
-        except Exception:
-            await self._session.rollback()
-            raise
+            await session.commit()
 
-    async def checkpoint_write(self, task: Task, ref: str, state: dict) -> None:
+        if self._session_factory is not None:
+            async with self._session_factory() as session:
+                await _do_heartbeat(session)
+        else:
+            try:
+                await _do_heartbeat(self._session)
+            except Exception:
+                await self._session.rollback()
+                raise
+
+    async def checkpoint_write(self, task: Task, ref: str, state: dict[str, Any]) -> None:
         """Fenced checkpoint write: writes checkpoint state and updates checkpoint_ref."""
         expected_gen = self._generation if self._generation > 0 else getattr(task, "generation", 1)
         expected_worker = self._worker_id or task.assigned_worker
@@ -297,19 +357,19 @@ class WorkerExecutionKernel:
                 {"ref": ref, "tid": task.id, "state": json.dumps(state)},
             )
 
-            stmt = (
-                update(TaskModel)
-                .where(
-                    TaskModel.id == task.id,
-                    TaskModel.status == "in_progress",
-                    TaskModel.generation == expected_gen,
-                )
+            stmt = update(TaskModel).where(
+                TaskModel.id == task.id,
+                TaskModel.status == "in_progress",
+                TaskModel.generation == expected_gen,
             )
             if expected_worker:
                 stmt = stmt.where(TaskModel.assigned_worker == expected_worker)
 
             res = await self._session.execute(stmt.values(checkpoint_ref=ref))
-            if res.rowcount == 0:
+            rowcount = (
+                res.rowcount if isinstance(res, CursorResult) else getattr(res, "rowcount", 0)
+            )
+            if rowcount == 0:
                 raise StaleWorkerError(f"task {task.id} was reclaimed; checkpoint write rejected")
             await self._session.commit()
         except Exception:
@@ -319,9 +379,7 @@ class WorkerExecutionKernel:
     async def reclaim(self, task: Task) -> None:
         """Atomic recovery reclaim per ADR 0016 / spec."""
         row = (
-            await self._session.execute(
-                select(TaskModel).where(TaskModel.id == task.id)
-            )
+            await self._session.execute(select(TaskModel).where(TaskModel.id == task.id))
         ).scalar_one_or_none()
         if row is None:
             raise TaskStatusError(f"Task {task.id} not found")
@@ -329,7 +387,8 @@ class WorkerExecutionKernel:
         # Side-effect classification safety gate
         if row.side_effect_classification != "IDEMPOTENT":
             raise TaskStatusError(
-                f"Task {task.id} classification '{row.side_effect_classification}' is not IDEMPOTENT; auto-reclaim blocked"
+                f"Task {task.id} classification '{row.side_effect_classification}' "
+                "is not IDEMPOTENT; auto-reclaim blocked"
             )
 
         # Retry exhaustion check
@@ -339,7 +398,9 @@ class WorkerExecutionKernel:
                 UPDATE tasks
                 SET status = CASE
                       WHEN side_effect_classification = 'IDEMPOTENT' THEN 'failed'
-                      WHEN side_effect_classification IN ('UNKNOWN', 'HAS_SIDE_EFFECTS') THEN 'review'
+                      WHEN side_effect_classification IN (
+                          'UNKNOWN', 'HAS_SIDE_EFFECTS'
+                      ) THEN 'review'
                     END,
                     last_error = COALESCE(last_error, 'max retries exceeded after crash recovery'),
                     exhaustion_reason = 'retry_limit_exhausted',
