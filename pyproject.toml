@@ -65,7 +65,7 @@ warn_unused_configs = true
 exclude = ["src/personaos/db/migrations/versions/"]
 
 [[tool.mypy.overrides]]
-module = "testcontainers.*"
+module = ["testcontainers.*", "yaml.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]

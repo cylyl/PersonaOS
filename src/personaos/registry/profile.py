@@ -28,7 +28,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 import yaml
 from sqlalchemy import select, update
@@ -36,9 +36,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from personaos.db.models import Worker as WorkerModel
 from personaos.domain.task import Task
-from personaos.domain.worker import Persona, WorkerProfile, Worker
+from personaos.domain.worker import Persona, Worker, WorkerProfile
 from personaos.execution.context import WorkerExecutionContext
-
 
 # Default profiles directory; can be overridden via env var or constructor arg.
 # Layout: {profiles_dir}/{worker_id}/v{N}.yaml
@@ -82,10 +81,12 @@ class ProfileRegistry:
     def __init__(
         self,
         session: AsyncSession,
-        profiles_dir: Optional[Path] = None,
+        profiles_dir: Path | None = None,
     ) -> None:
         self._session = session
-        self._profiles_dir = profiles_dir or DEFAULT_PROFILES_DIR
+        self._profiles_dir = profiles_dir or Path(
+            os.environ.get("PERSONAOS_PROFILES_DIR", "profiles")
+        )
 
     # --- File-system operations (sync, never block on the DB) ---
 
@@ -280,7 +281,7 @@ class ProfileRegistry:
 # --- Module-level helpers (manual YAML serialization for v0.1) ---
 
 
-def _persona_to_dict(persona: Persona) -> dict:
+def _persona_to_dict(persona: Persona) -> dict[str, Any]:
     """Serialize Persona → JSONB-friendly dict."""
     return {
         "style": persona.style,
@@ -294,7 +295,7 @@ def _persona_to_dict(persona: Persona) -> dict:
 
 def _dump_profile_yaml(profile: WorkerProfile) -> str:
     """Serialize WorkerProfile to YAML. Manual (no pydantic for v0.1)."""
-    data = {
+    data: dict[str, Any] = {
         "version": profile.version,
         "role": profile.role,
         "description": profile.description,
@@ -307,12 +308,13 @@ def _dump_profile_yaml(profile: WorkerProfile) -> str:
         "max_concurrent_tasks": profile.max_concurrent_tasks,
         "metadata": dict(profile.metadata),
     }
-    return yaml.safe_dump(
+    dumped = yaml.safe_dump(
         _strip_empty(data), sort_keys=False, allow_unicode=True
     )
+    return str(dumped)
 
 
-def _load_profile_yaml(data: dict) -> WorkerProfile:
+def _load_profile_yaml(data: dict[str, Any]) -> WorkerProfile:
     """Parse YAML dict → WorkerProfile. Manual (no pydantic for v0.1)."""
     persona_data = data.get("persona") or {}
     persona = Persona(
@@ -338,9 +340,9 @@ def _load_profile_yaml(data: dict) -> WorkerProfile:
     )
 
 
-def _strip_empty(d: dict) -> dict:
+def _strip_empty(d: dict[str, Any]) -> dict[str, Any]:
     """Drop None / empty-dict / empty-list / empty-string values for cleaner YAML."""
-    result: dict = {}
+    result: dict[str, Any] = {}
     for k, v in d.items():
         if v is None:
             continue
