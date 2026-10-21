@@ -39,10 +39,14 @@ Stop semantics:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from personaos.db.models import Task as TaskModel
 from personaos.execution.kernel import TaskStatusError, WorkerExecutionKernel
+from personaos.execution.result import Result
 from personaos.orchestrator.metrics import OrchestratorMetrics
 from personaos.workload.service import WorkloadService
 
@@ -136,6 +140,24 @@ class WorkerOrchestrator:
             if stale.side_effect_classification == "IDEMPOTENT":
                 try:
                     await self._kernel.reclaim(stale)
+                    # Transition to completed if recovery execution produced a result
+                    row = (
+                        await self._session.execute(
+                            select(TaskModel).where(
+                                TaskModel.id == stale.id,
+                                TaskModel.generation == self._kernel._generation,
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if row and row.status == "in_progress" and row.result is not None:
+                        stale_reclaimed = dataclasses.replace(
+                            stale,
+                            checkpoint_ref=None,
+                            generation=self._kernel._generation,
+                        )
+                        await self._kernel.complete(
+                            stale_reclaimed, Result(status="completed", output=row.result)
+                        )
                     self._metrics.tasks_processed += 1
                     return True
                 except TaskStatusError:
