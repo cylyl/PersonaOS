@@ -17,12 +17,13 @@ this Protocol.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from personaos.execution.context import WorkerExecutionContext
 from personaos.execution.result import Result
 
 
+@runtime_checkable
 class Adapter(Protocol):
     """Runtime adapter contract. Receives a frozen execution context."""
 

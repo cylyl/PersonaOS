@@ -251,10 +251,13 @@ class ProfileRegistry:
         await self._session.commit()
         # NOTE: profile file at profiles/{id}/v{version}.yaml is NEVER touched
 
-    async def resolve_execution_context(self, task: Task) -> WorkerExecutionContext:
+    async def resolve_execution_context(
+        self, task: Task, profile_version_override: int | None = None
+    ) -> WorkerExecutionContext:
         """Load worker + snapshot profile, return a frozen context.
 
-        NEVER reads worker.current_profile_version. ALWAYS reads task.profile_version.
+        NEVER reads worker.current_profile_version. ALWAYS reads task.profile_version
+        (or profile_version_override when performing counterfactual replay/simulation).
 
         This is the ONLY way the runtime gets a profile — there is no
         "load current profile" path in v0.1. If you find yourself wanting
@@ -269,7 +272,8 @@ class ProfileRegistry:
                 f"task {task.id} has no assigned_worker; cannot resolve context"
             )
         worker = await self.get_worker(task.assigned_worker)
-        profile = self.get_profile_version(worker.id, task.profile_version)
+        version = profile_version_override or task.profile_version
+        profile = self.get_profile_version(worker.id, version)
         return WorkerExecutionContext(worker=worker, profile=profile, task=task)
 
 

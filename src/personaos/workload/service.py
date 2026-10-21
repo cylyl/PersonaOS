@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from personaos.db.models import Task as TaskModel
 from personaos.db.models import Worker as WorkerModel
 from personaos.domain.task import Task
+from personaos.events.store import emit_task_event
 from personaos.registry.profile import WorkerNotFoundError
 
 
@@ -55,6 +56,7 @@ class WorkloadService:
         dependencies: Optional[list[str]] = None,
         deadline: Optional[datetime] = None,
         max_retries: int = 3,
+        profile_version: Optional[int] = None,
     ) -> Task:
         """Enqueue a task; snapshot workers.current_profile_version atomically.
 
@@ -65,8 +67,6 @@ class WorkloadService:
           - A concurrent activation cannot interleave between snapshot and INSERT.
 
         Raises WorkerNotFoundError if worker_id doesn't exist.
-
-        TODO(Step 5): emit task.created event here (per ADR 0006).
         """
         # Use the autobegin pattern (matches register_worker() in
         # registry/profile.py). This is robust against the session
@@ -81,9 +81,15 @@ class WorkloadService:
                 .where(WorkerModel.id == worker_id)
                 .with_for_update()
             )
-            profile_version = result.scalar_one_or_none()
-            if profile_version is None:
+            worker_current_version = result.scalar_one_or_none()
+            if worker_current_version is None:
                 raise WorkerNotFoundError(f"worker {worker_id} not found")
+
+            assigned_version = (
+                profile_version
+                if profile_version is not None
+                else worker_current_version
+            )
 
             # 2. INSERT task with the snapshotted version (same transaction)
             task_row = TaskModel(
@@ -92,7 +98,7 @@ class WorkloadService:
                 objective=objective,
                 input=input,
                 assigned_worker=worker_id,
-                profile_version=profile_version,
+                profile_version=assigned_version,
                 required_skills=list(required_skills or []),
                 required_capabilities=list(required_capabilities or []),
                 priority=priority,
@@ -104,6 +110,15 @@ class WorkloadService:
             )
             self._session.add(task_row)
             await self._session.flush()
+
+            # Emit task.created event per ADR 0006 / ADR 0010
+            await emit_task_event(
+                self._session,
+                task_id=task_row.id,
+                event_type="task.created",
+                actor_id=worker_id,
+                payload={"title": title, "profile_version": assigned_version},
+            )
 
             # 3. Commit — ends the autobegun transaction
             await self._session.commit()
