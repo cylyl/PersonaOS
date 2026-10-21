@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from personaos.db.models import Task as TaskModel
@@ -48,15 +49,15 @@ class WorkloadService:
         worker_id: str,
         title: str,
         objective: str,
-        input: dict,
-        required_skills: Optional[list[str]] = None,
-        required_capabilities: Optional[list[str]] = None,
+        input: dict[str, Any],  # noqa: A002
+        required_skills: list[str] | None = None,
+        required_capabilities: list[str] | None = None,
         priority: str = "medium",
-        type: Optional[str] = None,
-        dependencies: Optional[list[str]] = None,
-        deadline: Optional[datetime] = None,
+        type: str | None = None,  # noqa: A002
+        dependencies: list[str] | None = None,
+        deadline: datetime | None = None,
         max_retries: int = 3,
-        profile_version: Optional[int] = None,
+        profile_version: int | None = None,
         side_effect_classification: str = "UNKNOWN",
     ) -> Task:
         """Enqueue a task; snapshot workers.current_profile_version atomically.
@@ -131,7 +132,7 @@ class WorkloadService:
 
         return Task.from_orm(task_row)
 
-    async def next_runnable(self) -> Optional[Task]:
+    async def next_runnable(self) -> Task | None:
         """Return the next runnable candidate (FIFO), or None.
 
         Per ADR 0013 — a task is runnable iff:
@@ -192,6 +193,78 @@ class WorkloadService:
         row = (await self._session.execute(sql)).first()
         if row is None:
             return None
+        return self._row_to_task(row)
+
+    async def find_stale_in_progress(self, limit: int = 10) -> list[Task]:
+        """Find in-progress tasks whose leases have expired (lock_expires_at < NOW()).
+
+        Per ADR 0016: Orphan-detection query.
+        Returns tasks where status='in_progress', lock_expires_at is set,
+        and lock_expires_at < NOW(), ordered by lock_expires_at ASC, id ASC.
+        """
+        sql = text(
+            """
+            SELECT id, title, objective, status, priority, type,
+                   required_skills, required_capabilities,
+                   assigned_worker, assigned_node,
+                   dependencies, input, checkpoint_ref, result,
+                   retry_count, max_retries, last_error,
+                   deadline, created_at, started_at, completed_at,
+                   profile_version, lock_expires_at, generation,
+                   side_effect_classification, exhaustion_reason
+            FROM tasks
+            WHERE status = 'in_progress'
+              AND lock_expires_at IS NOT NULL
+              AND lock_expires_at < NOW()
+            ORDER BY lock_expires_at ASC, id ASC
+            LIMIT :limit
+            """
+        )
+        res = await self._session.execute(sql, {"limit": limit})
+        rows = res.fetchall()
+        return [self._row_to_task(row) for row in rows]
+
+    async def route_stale_to_review(
+        self,
+        task: Task,
+        reason: str = "lease_expired_non_idempotent",
+    ) -> bool:
+        """Route an unclassified or side-effecting stale task to the review queue.
+
+        Fenced by generation: only updates if task.generation matches DB state.
+        Returns True if row was updated.
+        """
+        stmt = (
+            update(TaskModel)
+            .where(
+                TaskModel.id == task.id,
+                TaskModel.status == "in_progress",
+                TaskModel.generation == task.generation,
+                TaskModel.lock_expires_at < func.now(),
+            )
+            .values(
+                status="review",
+                generation=TaskModel.generation + 1,
+                last_error=reason,
+                lock_expires_at=None,
+            )
+        )
+        res = await self._session.execute(stmt)
+        rowcount = res.rowcount if isinstance(res, CursorResult) else getattr(res, "rowcount", 0)
+        if rowcount > 0:
+            await emit_task_event(
+                self._session,
+                task_id=task.id,
+                event_type="task.failed",
+                actor_id="recovery",
+                payload={"action": "routed_to_review", "reason": reason},
+            )
+            await self._session.commit()
+            return True
+        return False
+
+    @staticmethod
+    def _row_to_task(row: Any) -> Task:
         return Task(
             id=row.id,
             title=row.title,

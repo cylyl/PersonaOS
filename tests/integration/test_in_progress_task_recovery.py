@@ -67,6 +67,7 @@ from personaos.execution.kernel import (
     TaskStatusError,
     WorkerExecutionKernel,
 )
+from personaos.orchestrator.worker import WorkerOrchestrator
 from personaos.registry.profile import ProfileError, ProfileRegistry
 from personaos.workload.service import WorkloadService
 
@@ -1214,3 +1215,96 @@ async def test_worker_receives_stale_worker_error_on_heartbeat_after_reclaim(
             await exec_task
         except asyncio.CancelledError:
             pass
+
+
+# ---------- Automated Crash Recovery (FINDING-03) ----------
+
+
+async def test_orchestrator_automatically_reclaims_stale_idempotent_task(
+    profiles_dir, database_url, session_factory
+):
+    """FINDING-03: WorkerOrchestrator automatically detects and reclaims stale tasks."""
+    cfg = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    async with session_factory() as s1:
+        await _register_worker_and_v1_profile(s1, profiles_dir)
+        task = await _enqueue(
+            s1,
+            title="auto-reclaim test",
+            side_effect_classification="IDEMPOTENT",
+        )
+        task_id = task.id
+
+        # Simulate crashed worker: in_progress with expired lock_expires_at
+        await s1.execute(
+            update(TaskModel)
+            .where(TaskModel.id == task_id)
+            .values(
+                status="in_progress",
+                generation=1,
+                lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+            )
+        )
+        await s1.commit()
+
+    # Recovery worker orchestrator runs process_one()
+    async with session_factory() as s2:
+        persona_recovery = await _register_worker_and_v1_profile(s2, profiles_dir)
+        kernel = _build_kernel(s2, OkAdapter(output={"recovered": True}), persona_recovery)
+        orchestrator = WorkerOrchestrator(session=s2, kernel=kernel)
+
+        processed = await orchestrator.process_one()
+        assert processed is True
+        assert orchestrator.metrics.tasks_processed == 1
+
+        # Check DB state: generation incremented, recovered result saved
+        row = await _task_row(s2, task_id)
+        assert row.generation == 2
+        assert row.result == {"recovered": True}
+
+
+async def test_orchestrator_routes_stale_non_idempotent_task_to_review(
+    profiles_dir, database_url, session_factory
+):
+    """FINDING-03: Stale task with side effects is automatically routed to review queue."""
+    cfg = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    async with session_factory() as s1:
+        await _register_worker_and_v1_profile(s1, profiles_dir)
+        task = await _enqueue(
+            s1,
+            title="auto-review test",
+            side_effect_classification="HAS_SIDE_EFFECTS",
+        )
+        task_id = task.id
+
+        # Simulate crashed worker: in_progress with expired lock_expires_at
+        await s1.execute(
+            update(TaskModel)
+            .where(TaskModel.id == task_id)
+            .values(
+                status="in_progress",
+                generation=1,
+                lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+            )
+        )
+        await s1.commit()
+
+    # Recovery orchestrator runs process_one()
+    async with session_factory() as s2:
+        persona_recovery = await _register_worker_and_v1_profile(s2, profiles_dir)
+        kernel = _build_kernel(s2, OkAdapter(), persona_recovery)
+        orchestrator = WorkerOrchestrator(session=s2, kernel=kernel)
+
+        processed = await orchestrator.process_one()
+        assert processed is True
+        assert orchestrator.metrics.tasks_processed == 1
+
+        # Check DB state: safely routed to 'review', lock cleared, generation incremented
+        row = await _task_row(s2, task_id)
+        assert row.status == "review"
+        assert row.generation == 2
+        assert row.lock_expires_at is None
+

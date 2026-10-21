@@ -128,15 +128,42 @@ class WorkerOrchestrator:
         (``UPDATE tasks SET status='in_progress' WHERE id=? AND status='queued'``).
         This method does NOT introduce any new claim path.
         """
-        # 1. Find one runnable candidate (delegates to WorkloadService).
+        # 1. Check for stale in-progress tasks needing reclaim/recovery
+        workload = WorkloadService(self._session)
+        stale_tasks = await workload.find_stale_in_progress(limit=1)
+        if stale_tasks:
+            stale = stale_tasks[0]
+            if stale.side_effect_classification == "IDEMPOTENT":
+                try:
+                    await self._kernel.reclaim(stale)
+                    self._metrics.tasks_processed += 1
+                    return True
+                except TaskStatusError:
+                    self._metrics.claim_conflicts += 1
+                    return False
+            else:
+                routed = await workload.route_stale_to_review(
+                    stale,
+                    reason=(
+                        "side-effect safety: auto-reclaim blocked "
+                        f"({stale.side_effect_classification})"
+                    ),
+                )
+                if routed:
+                    self._metrics.tasks_processed += 1
+                    return True
+                else:
+                    self._metrics.claim_conflicts += 1
+                    return False
+
+        # 2. Find one runnable candidate (delegates to WorkloadService).
         #    Per ADR 0013: status='queued' AND dependencies satisfied.
         #    Read-only — kernel still owns the atomic claim.
-        workload = WorkloadService(self._session)
         task = await workload.next_runnable()
         if task is None:
             return False
 
-        # 2. Pass to the kernel. The kernel's Phase 3 is the atomic
+        # 3. Pass to the kernel. The kernel's Phase 3 is the atomic
         #    claim — same mechanism as direct kernel invocation, no
         #    parallel claim path introduced here.
         try:
