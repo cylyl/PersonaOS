@@ -550,8 +550,9 @@ async def test_concurrent_dependency_completion_preserves_consistent_state(
     inconsistent state.
 
     Multiple readers + one writer (dep completion) → all readers see
-    consistent answers. No reader sees a torn state (e.g., a dep that
-    was 'in_progress' at read-start but 'completed' at read-end).
+    valid outcomes (either pre-completion None or post-completion child).
+    No reader sees a torn state (e.g., a dep that was 'in_progress' at
+    read-start but 'completed' at read-end).
     """
     cfg = _alembic_config(database_url)
     await asyncio.to_thread(command.upgrade, cfg, "head")
@@ -566,6 +567,9 @@ async def test_concurrent_dependency_completion_preserves_consistent_state(
             objective="parent task",
             input={"p": 1},
         )
+        # Mark parent as in_progress (kernel would do this on claim)
+        await _set_task_status(session, parent.id, "in_progress")
+
         child = await wl.enqueue(
             worker_id="w1",
             title="child",
@@ -574,31 +578,45 @@ async def test_concurrent_dependency_completion_preserves_consistent_state(
             dependencies=[parent.id],
         )
 
-        # Run multiple concurrent reads — all should return None
-        # (parent is queued, child is not yet runnable)
-        async def read():
-            return await wl.next_runnable()
+    # Each concurrent reader uses its own AsyncSession (SQLAlchemy session
+    # is not thread-safe across concurrent coroutines)
+    async def read():
+        async with session_factory() as s:
+            reader_wl = WorkloadService(session=s)
+            return await reader_wl.next_runnable()
 
-        results = await asyncio.gather(*[read() for _ in range(5)])
-        for r in results:
-            assert r is None, (
-                "before completion, child should not be runnable"
-            )
+    # 1. Before completion: parent is in_progress, child is not yet runnable -> all None
+    results = await asyncio.gather(*[read() for _ in range(5)])
+    for r in results:
+        assert r is None, (
+            "before completion, child should not be runnable"
+        )
 
-        # Mark parent completed
-        await _set_task_status(session, parent.id, "completed")
+    # 2. Interleaved concurrent reads + writer completion:
+    # All readers observe valid outcomes (either None or child), never torn state
+    async def writer():
+        await asyncio.sleep(0.01)
+        async with session_factory() as s_write:
+            await _set_task_status(s_write, parent.id, "completed")
 
-        # All concurrent reads should consistently return the child
-        results = await asyncio.gather(*[read() for _ in range(5)])
-        for r in results:
-            assert r is not None
-            assert r.id == child.id, (
-                "after completion, child should be runnable"
-            )
+    gathered = await asyncio.gather(*[read() for _ in range(5)], writer())
+    for r in gathered[:-1]:
+        assert r is None or r.id == child.id, (
+            f"reader must see valid outcome (None or child.id), got {r}"
+        )
 
-        # No state mutation from concurrent reads
-        assert await _task_status(session, parent.id) == "completed"
-        assert await _task_status(session, child.id) == "queued"
+    # 3. After completion has committed: all concurrent reads consistently return the child
+    results = await asyncio.gather(*[read() for _ in range(5)])
+    for r in results:
+        assert r is not None
+        assert r.id == child.id, (
+            "after completion, child should be runnable"
+        )
+
+    # No state mutation from concurrent reads
+    async with session_factory() as s_check:
+        assert await _task_status(s_check, parent.id) == "completed"
+        assert await _task_status(s_check, child.id) == "queued"
 
 
 # ---------- AC #10: next_runnable() remains read-only for the dep graph ----------

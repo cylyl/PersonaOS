@@ -9,6 +9,7 @@ dist/
 .pyc
 
 # Virtual environments
+.venv
 .venv/
 venv/
 env/
