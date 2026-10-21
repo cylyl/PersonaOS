@@ -37,9 +37,7 @@ async def check_health(session: SessionDep) -> HealthResponse:
         ) from exc
 
     try:
-        rev_res = await session.execute(
-            text("SELECT version_num FROM alembic_version LIMIT 1")
-        )
+        rev_res = await session.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))
         row = rev_res.first()
         if row:
             last_migration = row[0]

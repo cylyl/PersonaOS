@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,10 +44,10 @@ class ReplayResult:
     replayed_status: str
     matched: bool
     replayed_result: Result
-    original_output: Optional[dict] = None
-    replayed_output: Optional[dict] = None
-    original_error: Optional[str] = None
-    replayed_error: Optional[str] = None
+    original_output: dict | None = None
+    replayed_output: dict | None = None
+    original_error: str | None = None
+    replayed_error: str | None = None
     diff: dict[str, Any] = field(default_factory=dict)
 
 
@@ -58,7 +58,7 @@ class ReplayService:
         self,
         session: AsyncSession,
         registry: ProfileRegistry,
-        default_adapter: Optional[Adapter] = None,
+        default_adapter: Adapter | None = None,
     ) -> None:
         self._session = session
         self._registry = registry
@@ -67,8 +67,8 @@ class ReplayService:
     async def replay(
         self,
         task_id: str,
-        adapter: Optional[Adapter] = None,
-        profile_version_override: Optional[int] = None,
+        adapter: Adapter | None = None,
+        profile_version_override: int | None = None,
     ) -> ReplayResult:
         """Replay a historical task non-destructively.
 
@@ -94,15 +94,11 @@ class ReplayService:
         # Load initial checkpoint if any
         checkpoint_state = None
         if task.checkpoint_ref:
-            checkpoint_state = await checkpoint_load(
-                self._session, task.checkpoint_ref
-            )
+            checkpoint_state = await checkpoint_load(self._session, task.checkpoint_ref)
 
         # Execute via adapter (catching any exception as failure)
         try:
-            result = await active_adapter.execute(
-                context=context, checkpoint=checkpoint_state
-            )
+            result = await active_adapter.execute(context=context, checkpoint=checkpoint_state)
         except Exception as e:
             result = Result(status="failed", error=f"{type(e).__name__}: {e}")
 
@@ -155,8 +151,8 @@ class ReplayService:
         self,
         task_id: str,
         *,
-        profile_version_override: Optional[int] = None,
-        priority: Optional[str] = None,
+        profile_version_override: int | None = None,
+        priority: str | None = None,
     ) -> Task:
         """Create a new queued task for replay/simulation.
 
@@ -168,9 +164,7 @@ class ReplayService:
             raise TaskNotFoundError(f"task {task_id} not found")
 
         if not task_row.assigned_worker:
-            raise ProfileError(
-                f"task {task_id} has no assigned_worker; cannot fork for replay"
-            )
+            raise ProfileError(f"task {task_id} has no assigned_worker; cannot fork for replay")
 
         target_version = (
             profile_version_override
@@ -243,26 +237,18 @@ class SimulationService:
             SourceTaskNotFoundError: if task_id doesn't exist.
         """
         source_row = (
-            await self._session.execute(
-                select(TaskModel).where(TaskModel.id == task_id)
-            )
+            await self._session.execute(select(TaskModel).where(TaskModel.id == task_id))
         ).scalar_one_or_none()
         if source_row is None:
-            raise SourceTaskNotFoundError(
-                f"source task {task_id} not found"
-            )
+            raise SourceTaskNotFoundError(f"source task {task_id} not found")
 
         source_profile_version = source_row.profile_version
         source_assigned_worker = source_row.assigned_worker
-        source_input = (
-            copy.deepcopy(source_row.input) if source_row.input else {}
-        )
+        source_input = copy.deepcopy(source_row.input) if source_row.input else {}
         source_title = source_row.title
         source_objective = source_row.objective
         source_required_skills = list(source_row.required_skills or [])
-        source_required_capabilities = list(
-            source_row.required_capabilities or []
-        )
+        source_required_capabilities = list(source_row.required_capabilities or [])
         source_priority = source_row.priority
         source_deadline = source_row.deadline
 

@@ -88,9 +88,7 @@ class WorkloadService:
                 raise WorkerNotFoundError(f"worker {worker_id} not found")
 
             assigned_version = (
-                profile_version
-                if profile_version is not None
-                else worker_current_version
+                profile_version if profile_version is not None else worker_current_version
             )
 
             # 2. INSERT task with the snapshotted version (same transaction)

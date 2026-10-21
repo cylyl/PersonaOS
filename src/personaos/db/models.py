@@ -19,7 +19,6 @@ This is the hand-written v0.1 starting point; matches `dd2118d` exactly.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
 from sqlalchemy import (
     CheckConstraint,
@@ -52,13 +51,9 @@ class Worker(Base):
     id: Mapped[str] = mapped_column(Text, primary_key=True)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str] = mapped_column(Text, nullable=False)
-    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    status: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default=text("'idle'")
-    )
-    runtime: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default=text("'openclaw'")
-    )
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'idle'"))
+    runtime: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'openclaw'"))
     max_concurrent_tasks: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("1")
     )
@@ -71,7 +66,7 @@ class Worker(Base):
     personality: Mapped[dict] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
-    memory_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    memory_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     current_profile_version: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("1")
     )
@@ -81,9 +76,7 @@ class Worker(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    last_seen_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -134,10 +127,8 @@ class WorkerNode(Base):
     bound_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    unbound_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    unbound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         Index("ix_worker_nodes_worker", "worker_id"),
@@ -171,69 +162,47 @@ class Task(Base):
     id: Mapped[str] = mapped_column(Text, primary_key=True)
     title: Mapped[str] = mapped_column(Text, nullable=False)
     objective: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default=text("'queued'")
-    )
-    priority: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default=text("'medium'")
-    )
-    type: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'queued'"))
+    priority: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'medium'"))
+    type: Mapped[str | None] = mapped_column(Text, nullable=True)
     required_skills: Mapped[list] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
     required_capabilities: Mapped[list] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
-    assigned_worker: Mapped[Optional[str]] = mapped_column(
+    assigned_worker: Mapped[str | None] = mapped_column(
         Text, ForeignKey("workers.id", ondelete="SET NULL"), nullable=True
     )
-    assigned_node: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    assigned_node: Mapped[str | None] = mapped_column(Text, nullable=True)
     dependencies: Mapped[list] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
     # Per ADR 0011 (Step 6): nullable self-FK to the source task. NULL on
     # production tasks; set to source.id on simulation tasks. ON DELETE SET
     # NULL preserves simulations when the source is deleted (audit invariant).
-    simulated_from: Mapped[Optional[str]] = mapped_column(
+    simulated_from: Mapped[str | None] = mapped_column(
         Text, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
     )
     input: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    checkpoint_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    result: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    retry_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
-    max_retries: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("3")
-    )
-    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    lock_expires_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    generation: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
+    checkpoint_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    max_retries: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3"))
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lock_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     side_effect_classification: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'UNKNOWN'")
     )
-    exhaustion_reason: Mapped[Optional[str]] = mapped_column(
-        Text, nullable=True
-    )
-    deadline: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    exhaustion_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    started_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    completed_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    profile_version: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("1")
-    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    profile_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
 
     __table_args__ = (
         CheckConstraint(
@@ -281,7 +250,7 @@ class TaskCheckpoint(Base):
         Text, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
     )
     state: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    last_step: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_step: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -311,9 +280,7 @@ class TaskEvent(Base):
     )
     type: Mapped[str] = mapped_column(Text, nullable=False)
     actor_id: Mapped[str] = mapped_column(Text, nullable=False)
-    payload: Mapped[dict] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
-    )
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

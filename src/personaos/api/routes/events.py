@@ -26,9 +26,7 @@ async def list_events(
     if task_id:
         query = query.where(TaskEvent.task_id == task_id)
     query = (
-        query.order_by(TaskEvent.created_at.desc(), TaskEvent.id.desc())
-        .limit(limit)
-        .offset(offset)
+        query.order_by(TaskEvent.created_at.desc(), TaskEvent.id.desc()).limit(limit).offset(offset)
     )
     result = await session.execute(query)
     return list(result.scalars().all())

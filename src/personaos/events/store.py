@@ -12,13 +12,10 @@ feedback, clearer error messages).
 
 from __future__ import annotations
 
-from typing import Optional
-
 from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from personaos.db.models import TaskEvent
-
 
 _TASK_EVENT_TYPES = (
     "task.created",
@@ -35,7 +32,7 @@ async def emit_task_event(
     task_id: str,
     event_type: str,
     actor_id: str,
-    payload: Optional[dict] = None,
+    payload: dict | None = None,
 ) -> None:
     """Emit a task lifecycle event.
 
@@ -45,9 +42,7 @@ async def emit_task_event(
     Raises ValueError if event_type is not one of the 5 v0.1 types.
     """
     if event_type not in _TASK_EVENT_TYPES:
-        raise ValueError(
-            f"event_type must be one of {_TASK_EVENT_TYPES}, got {event_type!r}"
-        )
+        raise ValueError(f"event_type must be one of {_TASK_EVENT_TYPES}, got {event_type!r}")
     await session.execute(
         insert(TaskEvent).values(
             task_id=task_id,

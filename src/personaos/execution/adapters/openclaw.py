@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Any
 from personaos.execution.context import WorkerExecutionContext
 from personaos.execution.result import Result
 
-
 if TYPE_CHECKING:
     from personaos.execution.adapters.base import Adapter
 
@@ -46,10 +45,9 @@ class OpenClawAdapter:
         OpenClaw's wire format. Parses response into Result.
         """
         raise NotImplementedError(
-            "OpenClawAdapter.execute lands in Step 6; "
-            "Step 5 only establishes the Result signature."
+            "OpenClawAdapter.execute lands in Step 6; Step 5 only establishes the Result signature."
         )
 
 
 # Protocol conformance marker (mypy-only)
-_: "Adapter" = OpenClawAdapter  # type: ignore[type-arg,assignment]
+_: Adapter = OpenClawAdapter  # type: ignore[type-arg,assignment]

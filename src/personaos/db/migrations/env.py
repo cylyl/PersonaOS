@@ -23,9 +23,7 @@ try:
 
     _default_url = settings.database_url
 except Exception:  # pragma: no cover
-    _default_url = (
-        "postgresql+asyncpg://personaos:personaos@localhost:5432/personaos"
-    )
+    _default_url = "postgresql+asyncpg://personaos:personaos@localhost:5432/personaos"
 
 config = context.config
 

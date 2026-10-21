@@ -41,9 +41,7 @@ from personaos.execution.context import WorkerExecutionContext
 
 # Default profiles directory; can be overridden via env var or constructor arg.
 # Layout: {profiles_dir}/{worker_id}/v{N}.yaml
-DEFAULT_PROFILES_DIR = Path(
-    os.environ.get("PERSONAOS_PROFILES_DIR", "profiles")
-)
+DEFAULT_PROFILES_DIR = Path(os.environ.get("PERSONAOS_PROFILES_DIR", "profiles"))
 
 
 @dataclass(frozen=True)
@@ -114,9 +112,7 @@ class ProfileRegistry:
         """Load a specific historical version (immutable read)."""
         path = self._profile_path(worker_id, version)
         if not path.exists():
-            raise ProfileVersionNotFoundError(
-                f"profile {path} does not exist"
-            )
+            raise ProfileVersionNotFoundError(f"profile {path} does not exist")
         with path.open(encoding="utf-8") as f:
             data = yaml.safe_load(f)
         return _load_profile_yaml(data)
@@ -147,9 +143,7 @@ class ProfileRegistry:
         Raises ProfileError if the worker already exists.
         """
         if initial_profile.version != 1:
-            raise ValueError(
-                f"register_worker requires version=1, got {initial_profile.version}"
-            )
+            raise ValueError(f"register_worker requires version=1, got {initial_profile.version}")
 
         existing = await self._session.execute(
             select(WorkerModel).where(WorkerModel.id == worker_id)
@@ -178,9 +172,7 @@ class ProfileRegistry:
 
     async def get_worker(self, worker_id: str) -> Worker:
         """Read the workers row + return as a Worker dataclass."""
-        result = await self._session.execute(
-            select(WorkerModel).where(WorkerModel.id == worker_id)
-        )
+        result = await self._session.execute(select(WorkerModel).where(WorkerModel.id == worker_id))
         worker = result.scalar_one_or_none()
         if worker is None:
             raise WorkerNotFoundError(f"worker {worker_id} not found")
@@ -211,9 +203,7 @@ class ProfileRegistry:
         if profile.version < 1:
             raise ValueError(f"version must be >= 1, got {profile.version}")
         path = self._write_profile_file(worker_id, profile)
-        return ProfileVersion(
-            worker_id=worker_id, version=profile.version, path=path
-        )
+        return ProfileVersion(worker_id=worker_id, version=profile.version, path=path)
 
     async def activate_profile_version(
         self,
@@ -269,9 +259,7 @@ class ProfileRegistry:
         Raises ProfileVersionNotFoundError if the snapshot version is missing on disk.
         """
         if not task.assigned_worker:
-            raise ProfileError(
-                f"task {task.id} has no assigned_worker; cannot resolve context"
-            )
+            raise ProfileError(f"task {task.id} has no assigned_worker; cannot resolve context")
         worker = await self.get_worker(task.assigned_worker)
         version = profile_version_override or task.profile_version
         profile = self.get_profile_version(worker.id, version)
@@ -308,9 +296,7 @@ def _dump_profile_yaml(profile: WorkerProfile) -> str:
         "max_concurrent_tasks": profile.max_concurrent_tasks,
         "metadata": dict(profile.metadata),
     }
-    dumped = yaml.safe_dump(
-        _strip_empty(data), sort_keys=False, allow_unicode=True
-    )
+    dumped = yaml.safe_dump(_strip_empty(data), sort_keys=False, allow_unicode=True)
     return str(dumped)
 
 

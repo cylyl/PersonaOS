@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -31,18 +30,16 @@ class Persona:
     dataclass only carries the behavioral subset.
     """
 
-    style: Optional[str] = None
-    communication: Optional[str] = None
-    autonomy: Optional[str] = None  # one of: "low" | "medium" | "high"
+    style: str | None = None
+    communication: str | None = None
+    autonomy: str | None = None  # one of: "low" | "medium" | "high"
     behavior: dict = field(default_factory=dict)
     goals: list[str] = field(default_factory=list)
     constraints: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.autonomy is not None and self.autonomy not in ("low", "medium", "high"):
-            raise ValueError(
-                f"persona.autonomy must be low/medium/high, got {self.autonomy!r}"
-            )
+            raise ValueError(f"persona.autonomy must be low/medium/high, got {self.autonomy!r}")
 
 
 @dataclass(frozen=True)
@@ -58,10 +55,10 @@ class WorkerProfile:
     role: str
     runtime: str
     max_concurrent_tasks: int = 1
-    description: Optional[str] = None
+    description: str | None = None
     persona: Persona = field(default_factory=Persona)
-    model: Optional[str] = None  # LLM model reference (placeholder in v0.1)
-    instructions: Optional[str] = None
+    model: str | None = None  # LLM model reference (placeholder in v0.1)
+    instructions: str | None = None
     skills: list[str] = field(default_factory=list)
     permissions: list[str] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
@@ -70,9 +67,7 @@ class WorkerProfile:
         if self.version < 1:
             raise ValueError(f"version must be >= 1, got {self.version}")
         if self.max_concurrent_tasks < 1:
-            raise ValueError(
-                f"max_concurrent_tasks must be >= 1, got {self.max_concurrent_tasks}"
-            )
+            raise ValueError(f"max_concurrent_tasks must be >= 1, got {self.max_concurrent_tasks}")
 
 
 @dataclass(frozen=True)
@@ -90,11 +85,11 @@ class Worker:
     runtime: str
     max_concurrent_tasks: int
     current_profile_version: int
-    description: Optional[str] = None
+    description: str | None = None
     capabilities: list[str] = field(default_factory=list)
     permissions: list[str] = field(default_factory=list)
     personality: dict = field(default_factory=dict)
-    memory_id: Optional[str] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-    last_seen_at: Optional[datetime] = None
+    memory_id: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    last_seen_at: datetime | None = None

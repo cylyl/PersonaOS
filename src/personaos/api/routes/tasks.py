@@ -81,9 +81,7 @@ async def list_tasks(
         query = query.where(TaskModel.priority == priority)
 
     query = (
-        query.order_by(TaskModel.created_at.desc(), TaskModel.id.desc())
-        .limit(limit)
-        .offset(offset)
+        query.order_by(TaskModel.created_at.desc(), TaskModel.id.desc()).limit(limit).offset(offset)
     )
     result = await session.execute(query)
     return list(result.scalars().all())
@@ -112,9 +110,7 @@ async def get_task(
     session: SessionDep,
 ) -> TaskModel:
     """Get a task by its identifier."""
-    result = await session.execute(
-        select(TaskModel).where(TaskModel.id == task_id)
-    )
+    result = await session.execute(select(TaskModel).where(TaskModel.id == task_id))
     task = result.scalar_one_or_none()
     if task is None:
         raise HTTPException(
@@ -130,9 +126,7 @@ async def list_task_checkpoints(
     session: SessionDep,
 ) -> list[TaskCheckpoint]:
     """List durable checkpoints for a task ordered chronologically."""
-    task_res = await session.execute(
-        select(TaskModel.id).where(TaskModel.id == task_id)
-    )
+    task_res = await session.execute(select(TaskModel.id).where(TaskModel.id == task_id))
     if task_res.scalar_one_or_none() is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -175,9 +169,7 @@ async def approve_task(
     updated_task = res.scalar_one_or_none()
     if updated_task is None:
         existing = (
-            await session.execute(
-                select(TaskModel.status).where(TaskModel.id == task_id)
-            )
+            await session.execute(select(TaskModel.status).where(TaskModel.id == task_id))
         ).scalar_one_or_none()
         if existing is None:
             raise HTTPException(
@@ -233,9 +225,7 @@ async def reject_task(
     updated_task = res.scalar_one_or_none()
     if updated_task is None:
         existing = (
-            await session.execute(
-                select(TaskModel.status).where(TaskModel.id == task_id)
-            )
+            await session.execute(select(TaskModel.status).where(TaskModel.id == task_id))
         ).scalar_one_or_none()
         if existing is None:
             raise HTTPException(

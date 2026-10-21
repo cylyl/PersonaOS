@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 from personaos.execution.context import WorkerExecutionContext
 from personaos.execution.result import Result
 
-
 if TYPE_CHECKING:
     from personaos.execution.adapters.base import Adapter
 
@@ -82,9 +81,7 @@ class SimulationAdapter:
                 output=dict(self.result.output) if self.result.output else None,
                 error=self.result.error,
                 new_checkpoint=(
-                    dict(self.result.new_checkpoint)
-                    if self.result.new_checkpoint
-                    else None
+                    dict(self.result.new_checkpoint) if self.result.new_checkpoint else None
                 ),
             )
 
@@ -102,4 +99,4 @@ class SimulationAdapter:
 
 
 # Protocol conformance marker (mypy-only)
-_: "Adapter" = SimulationAdapter()  # type: ignore[assignment]
+_: Adapter = SimulationAdapter()  # type: ignore[assignment]

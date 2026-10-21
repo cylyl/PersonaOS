@@ -103,9 +103,7 @@ async def get_worker(
     session: SessionDep,
 ) -> WorkerDetailResponse:
     """Get worker details including profile metadata and available versions."""
-    res = await session.execute(
-        select(WorkerModel).where(WorkerModel.id == worker_id)
-    )
+    res = await session.execute(select(WorkerModel).where(WorkerModel.id == worker_id))
     worker = res.scalar_one_or_none()
     if worker is None:
         raise HTTPException(
@@ -277,9 +275,7 @@ async def quarantine_worker(
     req: WorkerQuarantineRequest | None = None,
 ) -> WorkerModel:
     """Quarantine a worker (disallowing task execution)."""
-    res = await session.execute(
-        select(WorkerModel).where(WorkerModel.id == worker_id)
-    )
+    res = await session.execute(select(WorkerModel).where(WorkerModel.id == worker_id))
     worker = res.scalar_one_or_none()
     if worker is None:
         raise HTTPException(
@@ -288,9 +284,7 @@ async def quarantine_worker(
         )
 
     await session.execute(
-        update(WorkerModel)
-        .where(WorkerModel.id == worker_id)
-        .values(status="quarantined")
+        update(WorkerModel).where(WorkerModel.id == worker_id).values(status="quarantined")
     )
     await session.flush()
     worker.status = "quarantined"
@@ -303,9 +297,7 @@ async def unquarantine_worker(
     session: SessionDep,
 ) -> WorkerModel:
     """Lift quarantine from a worker (restoring status to idle)."""
-    res = await session.execute(
-        select(WorkerModel).where(WorkerModel.id == worker_id)
-    )
+    res = await session.execute(select(WorkerModel).where(WorkerModel.id == worker_id))
     worker = res.scalar_one_or_none()
     if worker is None:
         raise HTTPException(
@@ -314,9 +306,7 @@ async def unquarantine_worker(
         )
 
     await session.execute(
-        update(WorkerModel)
-        .where(WorkerModel.id == worker_id)
-        .values(status="idle")
+        update(WorkerModel).where(WorkerModel.id == worker_id).values(status="idle")
     )
     await session.flush()
     worker.status = "idle"

@@ -11,7 +11,6 @@ Step 5 lifecycle.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
@@ -25,6 +24,6 @@ class Result:
     """
 
     status: str
-    output: Optional[dict] = None
-    error: Optional[str] = None
-    new_checkpoint: Optional[dict] = None
+    output: dict | None = None
+    error: str | None = None
+    new_checkpoint: dict | None = None

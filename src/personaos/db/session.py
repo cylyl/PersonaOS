@@ -60,9 +60,7 @@ def make_session_factory(
     expire_on_commit=False so attribute access after commit doesn't trigger
     a lazy refresh (which would require an async round-trip).
     """
-    return async_sessionmaker(
-        engine, expire_on_commit=False, class_=AsyncSession
-    )
+    return async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
 async def get_session(

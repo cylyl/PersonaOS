@@ -15,7 +15,6 @@ state and what format to use.
 from __future__ import annotations
 
 import uuid
-from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from personaos.db.models import TaskCheckpoint
 
 
-async def load(session: AsyncSession, ref: Optional[str]) -> Optional[dict]:
+async def load(session: AsyncSession, ref: str | None) -> dict | None:
     """Load a checkpoint by ref.
 
     Returns the state dict, or None if:
@@ -32,9 +31,7 @@ async def load(session: AsyncSession, ref: Optional[str]) -> Optional[dict]:
     """
     if ref is None:
         return None
-    result = await session.execute(
-        select(TaskCheckpoint).where(TaskCheckpoint.ref == ref)
-    )
+    result = await session.execute(select(TaskCheckpoint).where(TaskCheckpoint.ref == ref))
     cp = result.scalar_one_or_none()
     if cp is None:
         return None

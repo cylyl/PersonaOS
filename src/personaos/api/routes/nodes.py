@@ -49,9 +49,7 @@ async def bind_worker_node(
     session: SessionDep,
 ) -> WorkerNode:
     """Bind a worker to an execution node."""
-    w_res = await session.execute(
-        select(WorkerModel.id).where(WorkerModel.id == req.worker_id)
-    )
+    w_res = await session.execute(select(WorkerModel.id).where(WorkerModel.id == req.worker_id))
     if w_res.scalar_one_or_none() is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

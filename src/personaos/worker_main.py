@@ -80,9 +80,7 @@ async def async_main(args: argparse.Namespace) -> None:
     session_factory = make_session_factory(engine)
 
     # Initialize runtime adapter
-    adapter: Adapter = (
-        SimulationAdapter() if args.adapter == "simulation" else OpenClawAdapter()
-    )
+    adapter: Adapter = SimulationAdapter() if args.adapter == "simulation" else OpenClawAdapter()
 
     async with session_factory() as orchestrator_session:
         kernel = WorkerExecutionKernel(

@@ -33,11 +33,10 @@ Static isolation: this module MUST NOT import ``OpenClawAdapter``,
 
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from personaos.execution.context import WorkerExecutionContext
 from personaos.execution.result import Result
-
 
 if TYPE_CHECKING:
     from personaos.execution.adapters.base import Adapter
@@ -81,4 +80,4 @@ class SimulationAdapter:
 
 
 # Protocol conformance marker (mypy-only)
-_: "Adapter" = SimulationAdapter  # type: ignore[type-arg,assignment]
+_: Adapter = SimulationAdapter  # type: ignore[type-arg,assignment]

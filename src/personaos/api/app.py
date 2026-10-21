@@ -66,8 +66,7 @@ def create_app(
     app = FastAPI(
         title="PersonaOS Control Plane",
         description=(
-            "PersonaOS v0.1 — Worker, Node, Task, Scheduler, Checkpoint, "
-            "Event control plane API."
+            "PersonaOS v0.1 — Worker, Node, Task, Scheduler, Checkpoint, Event control plane API."
         ),
         version="0.1.0",
         lifespan=lifespan,
@@ -103,9 +102,7 @@ def create_app(
 
     # Exception handlers mapping domain errors to HTTP semantics
     @app.exception_handler(WorkerNotFoundError)
-    async def worker_not_found_handler(
-        request: Request, exc: WorkerNotFoundError
-    ) -> JSONResponse:
+    async def worker_not_found_handler(request: Request, exc: WorkerNotFoundError) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content={"detail": str(exc)},
@@ -130,18 +127,14 @@ def create_app(
         )
 
     @app.exception_handler(TaskStatusError)
-    async def task_status_error_handler(
-        request: Request, exc: TaskStatusError
-    ) -> JSONResponse:
+    async def task_status_error_handler(request: Request, exc: TaskStatusError) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exc)},
         )
 
     @app.exception_handler(StaleWorkerError)
-    async def stale_worker_error_handler(
-        request: Request, exc: StaleWorkerError
-    ) -> JSONResponse:
+    async def stale_worker_error_handler(request: Request, exc: StaleWorkerError) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exc)},

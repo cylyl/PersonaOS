@@ -13,9 +13,7 @@ class HealthResponse(BaseModel):
 
     status: str = Field(..., description="Overall health: ok | degraded | down")
     db: str = Field(..., description="Database connectivity: ok | down")
-    last_migration: str | None = Field(
-        None, description="Current Alembic revision"
-    )
+    last_migration: str | None = Field(None, description="Current Alembic revision")
     version: str = Field("0.1.0", description="PersonaOS version")
 
 
@@ -44,9 +42,7 @@ class WorkerCreateRequest(BaseModel):
     description: str | None = Field(None, description="Role description")
     max_concurrent_tasks: int = Field(1, ge=1, description="Max concurrent tasks")
     skills: list[str] = Field(default_factory=list, description="Skills list")
-    permissions: list[str] = Field(
-        default_factory=list, description="Permissions list"
-    )
+    permissions: list[str] = Field(default_factory=list, description="Permissions list")
     persona: WorkerPersonaSchema = Field(default_factory=WorkerPersonaSchema)
     instructions: str | None = None
     model: str | None = None
@@ -68,9 +64,7 @@ class WorkerProfileCreateRequest(BaseModel):
     skills: list[str] = Field(default_factory=list)
     permissions: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    activate: bool = Field(
-        False, description="Whether to activate immediately upon creation"
-    )
+    activate: bool = Field(False, description="Whether to activate immediately upon creation")
 
 
 class WorkerResponse(BaseModel):
@@ -106,9 +100,7 @@ class WorkerQuarantineRequest(BaseModel):
     """Request payload to quarantine a worker."""
 
     reason: str | None = Field(None, description="Reason for quarantine")
-    quarantined_by: str | None = Field(
-        None, description="Actor requesting quarantine"
-    )
+    quarantined_by: str | None = Field(None, description="Actor requesting quarantine")
 
 
 class TaskCreateRequest(BaseModel):
@@ -124,9 +116,7 @@ class TaskCreateRequest(BaseModel):
     required_capabilities: list[str] = Field(default_factory=list)
     priority: str = Field("medium", description="low, medium, high, critical")
     type: str | None = Field(None, description="Optional task type")
-    dependencies: list[str] = Field(
-        default_factory=list, description="IDs of prerequisite tasks"
-    )
+    dependencies: list[str] = Field(default_factory=list, description="IDs of prerequisite tasks")
     deadline: datetime | None = None
     max_retries: int = Field(3, ge=0)
     profile_version: int | None = Field(

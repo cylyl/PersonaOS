@@ -20,9 +20,7 @@ class Settings(BaseSettings):
     )
 
     # Database
-    database_url: str = (
-        "postgresql+asyncpg://personaos:personaos@localhost:5432/personaos"
-    )
+    database_url: str = "postgresql+asyncpg://personaos:personaos@localhost:5432/personaos"
     database_pool_size: int = 5
     database_max_overflow: int = 10
 
