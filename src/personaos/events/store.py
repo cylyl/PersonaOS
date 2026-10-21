@@ -12,6 +12,8 @@ feedback, clearer error messages).
 
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,7 +34,7 @@ async def emit_task_event(
     task_id: str,
     event_type: str,
     actor_id: str,
-    payload: dict | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> None:
     """Emit a task lifecycle event.
 

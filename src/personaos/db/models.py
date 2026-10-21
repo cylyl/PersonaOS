@@ -19,6 +19,7 @@ This is the hand-written v0.1 starting point; matches `dd2118d` exactly.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     CheckConstraint,
@@ -57,13 +58,13 @@ class Worker(Base):
     max_concurrent_tasks: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("1")
     )
-    capabilities: Mapped[list] = mapped_column(
+    capabilities: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
-    permissions: Mapped[list] = mapped_column(
+    permissions: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
-    personality: Mapped[dict] = mapped_column(
+    personality: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
     memory_id: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -165,17 +166,17 @@ class Task(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'queued'"))
     priority: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'medium'"))
     type: Mapped[str | None] = mapped_column(Text, nullable=True)
-    required_skills: Mapped[list] = mapped_column(
+    required_skills: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
-    required_capabilities: Mapped[list] = mapped_column(
+    required_capabilities: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
     assigned_worker: Mapped[str | None] = mapped_column(
         Text, ForeignKey("workers.id", ondelete="SET NULL"), nullable=True
     )
     assigned_node: Mapped[str | None] = mapped_column(Text, nullable=True)
-    dependencies: Mapped[list] = mapped_column(
+    dependencies: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
     # Per ADR 0011 (Step 6): nullable self-FK to the source task. NULL on
@@ -184,9 +185,9 @@ class Task(Base):
     simulated_from: Mapped[str | None] = mapped_column(
         Text, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
     )
-    input: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    input: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     checkpoint_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
-    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     max_retries: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3"))
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -249,7 +250,7 @@ class TaskCheckpoint(Base):
     task_id: Mapped[str] = mapped_column(
         Text, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False
     )
-    state: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    state: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     last_step: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -280,7 +281,9 @@ class TaskEvent(Base):
     )
     type: Mapped[str] = mapped_column(Text, nullable=False)
     actor_id: Mapped[str] = mapped_column(Text, nullable=False)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

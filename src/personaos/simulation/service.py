@@ -17,10 +17,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from personaos.db.models import Task as TaskModel
 from personaos.domain.task import Task
-from personaos.execution.adapters.base import Adapter, Result
+from personaos.execution.adapters.base import Adapter
 from personaos.execution.adapters.simulation import SimulationAdapter
 from personaos.execution.checkpoint import load as checkpoint_load
 from personaos.execution.kernel import WorkerExecutionKernel
+from personaos.execution.result import Result
 from personaos.registry.profile import ProfileError, ProfileRegistry
 from personaos.workload.service import WorkloadService
 
@@ -44,8 +45,8 @@ class ReplayResult:
     replayed_status: str
     matched: bool
     replayed_result: Result
-    original_output: dict | None = None
-    replayed_output: dict | None = None
+    original_output: dict[str, Any] | None = None
+    replayed_output: dict[str, Any] | None = None
     original_error: str | None = None
     replayed_error: str | None = None
     diff: dict[str, Any] = field(default_factory=dict)

@@ -15,7 +15,6 @@ state and what format to use.
 from __future__ import annotations
 
 import uuid
-
 from typing import Any
 
 from sqlalchemy import select

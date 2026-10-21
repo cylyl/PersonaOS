@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 _TASK_STATUSES = (
     "queued",
@@ -48,7 +48,7 @@ class Task:
     id: str
     title: str
     objective: str
-    input: dict
+    input: dict[str, Any]
     profile_version: int
     status: str
     priority: str
@@ -57,7 +57,7 @@ class Task:
     required_skills: list[str] = field(default_factory=list)
     required_capabilities: list[str] = field(default_factory=list)
     dependencies: list[str] = field(default_factory=list)
-    result: dict | None = None
+    result: dict[str, Any] | None = None
     retry_count: int = 0
     max_retries: int = 3
     last_error: str | None = None

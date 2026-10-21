@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -33,7 +34,7 @@ class Persona:
     style: str | None = None
     communication: str | None = None
     autonomy: str | None = None  # one of: "low" | "medium" | "high"
-    behavior: dict = field(default_factory=dict)
+    behavior: dict[str, Any] = field(default_factory=dict)
     goals: list[str] = field(default_factory=list)
     constraints: list[str] = field(default_factory=list)
 
@@ -61,7 +62,7 @@ class WorkerProfile:
     instructions: str | None = None
     skills: list[str] = field(default_factory=list)
     permissions: list[str] = field(default_factory=list)
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.version < 1:
@@ -88,7 +89,7 @@ class Worker:
     description: str | None = None
     capabilities: list[str] = field(default_factory=list)
     permissions: list[str] = field(default_factory=list)
-    personality: dict = field(default_factory=dict)
+    personality: dict[str, Any] = field(default_factory=dict)
     memory_id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
