@@ -57,6 +57,7 @@ class WorkloadService:
         deadline: Optional[datetime] = None,
         max_retries: int = 3,
         profile_version: Optional[int] = None,
+        side_effect_classification: str = "UNKNOWN",
     ) -> Task:
         """Enqueue a task; snapshot workers.current_profile_version atomically.
 
@@ -106,6 +107,7 @@ class WorkloadService:
                 dependencies=list(dependencies or []),
                 deadline=deadline,
                 max_retries=max_retries,
+                side_effect_classification=side_effect_classification,
                 status="queued",
             )
             self._session.add(task_row)
@@ -169,7 +171,8 @@ class WorkloadService:
                    dependencies, input, checkpoint_ref, result,
                    retry_count, max_retries, last_error,
                    deadline, created_at, started_at, completed_at,
-                   profile_version
+                   profile_version, lock_expires_at, generation,
+                   side_effect_classification, exhaustion_reason
             FROM tasks
             WHERE status = 'queued'
               AND (
@@ -212,4 +215,8 @@ class WorkloadService:
             started_at=row.started_at,
             completed_at=row.completed_at,
             profile_version=row.profile_version,
+            lock_expires_at=row.lock_expires_at,
+            generation=row.generation,
+            side_effect_classification=row.side_effect_classification,
+            exhaustion_reason=row.exhaustion_reason,
         )

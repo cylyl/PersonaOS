@@ -207,6 +207,18 @@ class Task(Base):
         Integer, nullable=False, server_default=text("3")
     )
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lock_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    side_effect_classification: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'UNKNOWN'")
+    )
+    exhaustion_reason: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
     deadline: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -233,11 +245,26 @@ class Task(Base):
             "priority IN ('low', 'medium', 'high', 'critical')",
             name="tasks_priority_check",
         ),
+        CheckConstraint(
+            "side_effect_classification IN ('UNKNOWN', 'IDEMPOTENT', 'HAS_SIDE_EFFECTS')",
+            name="tasks_side_effect_classification_check",
+        ),
         Index("ix_tasks_status", "status"),
         Index("ix_tasks_assigned_worker", "assigned_worker"),
         Index("ix_tasks_assigned_node", "assigned_node"),
         Index("ix_tasks_priority_created", "priority", "created_at"),
         Index("ix_tasks_simulated_from", "simulated_from"),
+        Index(
+            "ix_tasks_recovery_scan",
+            "lock_expires_at",
+            postgresql_where=text("status = 'in_progress'"),
+        ),
+        Index(
+            "ix_tasks_review_queue",
+            "priority",
+            "created_at",
+            postgresql_where=text("status = 'review'"),
+        ),
     )
 
 

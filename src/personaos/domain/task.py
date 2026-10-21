@@ -65,6 +65,10 @@ class Task:
     deadline: Optional[datetime] = None
     type: Optional[str] = None
     checkpoint_ref: Optional[str] = None
+    lock_expires_at: Optional[datetime] = None
+    generation: int = 0
+    side_effect_classification: str = "UNKNOWN"
+    exhaustion_reason: Optional[str] = None
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -111,6 +115,10 @@ class Task:
             deadline=task_row.deadline,
             type=task_row.type,
             checkpoint_ref=task_row.checkpoint_ref,
+            lock_expires_at=getattr(task_row, "lock_expires_at", None),
+            generation=getattr(task_row, "generation", 0),
+            side_effect_classification=getattr(task_row, "side_effect_classification", "UNKNOWN"),
+            exhaustion_reason=getattr(task_row, "exhaustion_reason", None),
             created_at=task_row.created_at,
             started_at=task_row.started_at,
             completed_at=task_row.completed_at,

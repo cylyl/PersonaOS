@@ -62,8 +62,12 @@ from personaos.domain.task import Task
 from personaos.domain.worker import Persona, WorkerProfile
 from personaos.execution.adapters.base import Result
 from personaos.execution.context import WorkerExecutionContext
-from personaos.execution.kernel import TaskStatusError, WorkerExecutionKernel
-from personaos.registry.profile import ProfileRegistry
+from personaos.execution.kernel import (
+    StaleWorkerError,
+    TaskStatusError,
+    WorkerExecutionKernel,
+)
+from personaos.registry.profile import ProfileError, ProfileRegistry
 from personaos.workload.service import WorkloadService
 
 REPO_ROOT = Path(__file__).parents[2]
@@ -76,6 +80,13 @@ pytestmark = pytest.mark.usefixtures("clean_tables")
 # ---------- Helpers ----------
 
 
+@pytest.fixture
+def profiles_dir(tmp_path, monkeypatch):
+    d = tmp_path / "profiles"
+    monkeypatch.setenv("PERSONAOS_PROFILES_DIR", str(d))
+    return d
+
+
 def _alembic_config(database_url):
     cfg = Config(str(ALEMBIC_INI))
     cfg.set_main_option("sqlalchemy.url", database_url)
@@ -83,46 +94,63 @@ def _alembic_config(database_url):
     return cfg
 
 
-async def _register_worker_and_v1_profile(session: AsyncSession, profiles_dir: Path):
-    persona = Persona(id="worker-11a")
-    profile = WorkerProfile(
-        id="profile-11a",
-        name="TestProfile",
-        version=1,
-        description="Step 11a test profile",
-        created_at=datetime.now(timezone.utc),
-        skills=[],
-        capabilities={},
-    )
-    reg = ProfileRegistry(session, profiles_dir=profiles_dir)
-    await persona.register_worker(session)
-    await persona.register_profile(session, profile)
-    return persona
+from dataclasses import dataclass
+
+@dataclass
+class _WorkerHandle:
+    id: str
+
+_worker_counter = 0
+_last_worker_id: str = "worker-11a-1"
+
+
+async def _register_worker_and_v1_profile(
+    session: AsyncSession, profiles_dir: Path, worker_id: str | None = None
+) -> _WorkerHandle:
+    global _worker_counter, _last_worker_id
+    if worker_id is None:
+        _worker_counter += 1
+        worker_id = f"worker-11a-{_worker_counter}"
+    _last_worker_id = worker_id
+    reg = ProfileRegistry(session=session, profiles_dir=profiles_dir)
+    try:
+        await reg.register_worker(
+            worker_id,
+            WorkerProfile(
+                version=1,
+                role="devops",
+                runtime="openclaw",
+                max_concurrent_tasks=1,
+                persona=Persona(autonomy="medium"),
+            ),
+        )
+    except Exception:
+        pass
+    return _WorkerHandle(id=worker_id)
 
 
 async def _enqueue(
     session: AsyncSession,
     title: str = "11a test task",
     side_effect_classification: str = "UNKNOWN",
+    worker_id: str | None = None,
 ) -> Task:
     """Enqueue a task with explicit side-effect classification.
 
     classification: 'UNKNOWN' | 'IDEMPOTENT' | 'HAS_SIDE_EFFECTS'
     """
+    global _last_worker_id
+    if worker_id is None:
+        worker_id = _last_worker_id
     wl = WorkloadService(session)
     task = await wl.enqueue(
+        worker_id=worker_id,
         title=title,
         objective="Step 11a acceptance test",
         input={},
         priority="medium",
+        side_effect_classification=side_effect_classification,
     )
-    if side_effect_classification != "UNKNOWN":
-        await session.execute(
-            update(TaskModel)
-            .where(TaskModel.id == task.id)
-            .values(side_effect_classification=side_effect_classification)
-        )
-        await session.commit()
     return task
 
 
@@ -134,17 +162,20 @@ async def _status(session: AsyncSession, task_id: str) -> str:
 
 
 async def _task_row(session: AsyncSession, task_id: str) -> TaskModel:
-    row = await session.execute(select(TaskModel).where(TaskModel.id == task_id))
-    return row.one()
+    row = await session.execute(
+        select(TaskModel)
+        .where(TaskModel.id == task_id)
+        .execution_options(populate_existing=True)
+    )
+    return row.scalar_one()
 
 
-async def _build_kernel(session: AsyncSession, adapter, persona: Persona):
+def _build_kernel(session: AsyncSession, adapter, persona: _WorkerHandle):
     """Build a WorkerExecutionKernel for the given persona."""
     return WorkerExecutionKernel(
         session=session,
         adapter=adapter,
         worker_id=persona.id,
-        profiles_dir=profiles_dir,  # provided via profiles_dir fixture
     )
 
 
@@ -158,7 +189,7 @@ class OkAdapter:
         self.output = output or {}
 
     async def execute(self, context: WorkerExecutionContext, checkpoint=None) -> Result:
-        return Result(status="completed", output=self.output, checkpoint=checkpoint)
+        return Result(status="completed", output=self.output)
 
 
 class SlowAdapter:
@@ -170,7 +201,7 @@ class SlowAdapter:
 
     async def execute(self, context: WorkerExecutionContext, checkpoint=None) -> Result:
         await asyncio.sleep(self.delay)
-        return Result(status="completed", output=self.output, checkpoint=checkpoint)
+        return Result(status="completed", output=self.output)
 
 
 class FailAdapter:
@@ -186,7 +217,6 @@ class FailAdapter:
 # ---------- AC #1: worker crash is eventually detectable ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires lock_expires_at column + orphan-detection query; not yet implemented")
 async def test_worker_crash_is_eventually_detectable(
     profiles_dir, database_url, session_factory
 ):
@@ -218,7 +248,8 @@ async def test_worker_crash_is_eventually_detectable(
             update(TaskModel)
             .where(TaskModel.id == task_id)
             .values(
-                lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=30)
+                status="in_progress",
+                lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=30),
             )
         )
         await s1.commit()
@@ -240,7 +271,6 @@ async def test_worker_crash_is_eventually_detectable(
 # ---------- AC #2: healthy slow worker is not reclaimed prematurely ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires lock_expires_at column + heartbeat; not yet implemented")
 async def test_healthy_slow_worker_is_not_reclaimed_prematurely(
     profiles_dir, database_url, session_factory
 ):
@@ -263,16 +293,17 @@ async def test_healthy_slow_worker_is_not_reclaimed_prematurely(
         task_id = task.id
 
         # Worker A claims: sets lock_expires_at to now + 15 min
-        kernel = _build_kernel(s1, OkAdapter(), persona)
-        await kernel.execute(task)
-
-        # Verify lock_expires_at is in the future
-        row = await _task_row(s1, task_id)
-        assert row.lock_expires_at is not None
-        assert row.lock_expires_at > datetime.now(timezone.utc)
+        kernel = _build_kernel(s1, SlowAdapter(delay=60), persona)
+        exec_task = asyncio.create_task(kernel.execute(task))
+        await asyncio.sleep(0.2)
 
     # Within TTL window: not stale
     async with session_factory() as s2:
+        # Verify lock_expires_at is in the future
+        row = await _task_row(s2, task_id)
+        assert row.lock_expires_at is not None
+        assert row.lock_expires_at > datetime.now(timezone.utc)
+
         stale = await s2.execute(
             select(TaskModel.id).where(
                 TaskModel.status == "in_progress",
@@ -284,11 +315,16 @@ async def test_healthy_slow_worker_is_not_reclaimed_prematurely(
             "Healthy worker must not be reclaimed before lock_expires_at"
         )
 
+    exec_task.cancel()
+    try:
+        await exec_task
+    except asyncio.CancelledError:
+        pass
+
 
 # ---------- AC #3: stale worker cannot overwrite newer result (complete) ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires generation column + fencing check on complete(); not yet implemented")
 async def test_stale_worker_cannot_overwrite_newer_result_via_complete(
     profiles_dir, database_url, session_factory
 ):
@@ -308,7 +344,7 @@ async def test_stale_worker_cannot_overwrite_newer_result_via_complete(
 
     async with session_factory() as s1:
         persona_a = await _register_worker_and_v1_profile(s1, profiles_dir)
-        task = await _enqueue(s1, title="fencing complete test")
+        task = await _enqueue(s1, title="fencing complete test", side_effect_classification="IDEMPOTENT")
         task_id = task.id
 
         # Worker A claims and completes
@@ -351,7 +387,6 @@ async def test_stale_worker_cannot_overwrite_newer_result_via_complete(
 # ---------- AC #4: stale worker cannot overwrite newer result (fail) ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires generation column + fencing check on fail(); not yet implemented")
 async def test_stale_worker_cannot_overwrite_newer_result_via_fail(
     profiles_dir, database_url, session_factory
 ):
@@ -371,7 +406,7 @@ async def test_stale_worker_cannot_overwrite_newer_result_via_fail(
 
     async with session_factory() as s1:
         persona_a = await _register_worker_and_v1_profile(s1, profiles_dir)
-        task = await _enqueue(s1, title="fencing fail test")
+        task = await _enqueue(s1, title="fencing fail test", side_effect_classification="IDEMPOTENT")
         task_id = task.id
 
         kernel_a = _build_kernel(s1, OkAdapter(output={"from": "A"}), persona_a)
@@ -413,7 +448,6 @@ async def test_stale_worker_cannot_overwrite_newer_result_via_fail(
 # ---------- AC #5: stale worker cannot refresh heartbeat after ownership transfer ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires heartbeat() with generation check; not yet implemented")
 async def test_stale_worker_cannot_heartbeat_after_ownership_transfer(
     profiles_dir, database_url, session_factory
 ):
@@ -431,53 +465,53 @@ async def test_stale_worker_cannot_heartbeat_after_ownership_transfer(
     cfg = _alembic_config(database_url)
     await asyncio.to_thread(command.upgrade, cfg, "head")
 
-    async with session_factory() as s1:
-        persona_a = await _register_worker_and_v1_profile(s1, profiles_dir)
-        task = await _enqueue(s1, title="heartbeat fencing test")
+    async with session_factory() as s_setup:
+        persona_a = await _register_worker_and_v1_profile(s_setup, profiles_dir)
+        task = await _enqueue(s_setup, title="heartbeat fencing test", side_effect_classification="IDEMPOTENT")
         task_id = task.id
 
-        kernel_a = _build_kernel(s1, SlowAdapter(delay=60), persona_a)
+    async with session_factory() as s_worker:
+        kernel_a = _build_kernel(s_worker, SlowAdapter(delay=60), persona_a)
         # Start execution but don't wait — let claim happen
-        import asyncio
         exec_task = asyncio.create_task(kernel_a.execute(task))
-        await asyncio.sleep(0.2)  # claim completes, slow adapter runs in background
+        await asyncio.sleep(0.3)  # claim completes, slow adapter runs in background
 
         # Backdate to stale
-        await s1.execute(
-            update(TaskModel)
-            .where(TaskModel.id == task_id)
-            .values(
-                lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=30),
-                status="in_progress",
+        async with session_factory() as s_backdate:
+            await s_backdate.execute(
+                update(TaskModel)
+                .where(TaskModel.id == task_id)
+                .values(
+                    lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=30),
+                    status="in_progress",
+                )
             )
-        )
-        await s1.commit()
+            await s_backdate.commit()
 
-    # Worker B reclaims
-    async with session_factory() as s2:
-        persona_b = await _register_worker_and_v1_profile(s2, profiles_dir)
-        kernel_b = _build_kernel(s2, OkAdapter(), persona_b)
-        await kernel_b.reclaim(task)
-        row = await _task_row(s2, task_id)
-        assert row.generation == 2
+        # Worker B reclaims
+        async with session_factory() as s2:
+            persona_b = await _register_worker_and_v1_profile(s2, profiles_dir)
+            kernel_b = _build_kernel(s2, OkAdapter(), persona_b)
+            await kernel_b.reclaim(task)
+            row = await _task_row(s2, task_id)
+            assert row.generation == 2
 
-    # Worker A (stale) heartbeat -> fenced
-    async with session_factory() as s3:
-        kernel_a2 = _build_kernel(s3, SlowAdapter(delay=60), persona_a)
-        with pytest.raises(StaleWorkerError):
-            await kernel_a2.heartbeat(task)
+        # Worker A (stale) heartbeat -> fenced
+        async with session_factory() as s3:
+            kernel_a2 = _build_kernel(s3, SlowAdapter(delay=60), persona_a)
+            with pytest.raises(StaleWorkerError):
+                await kernel_a2.heartbeat(task)
 
-    exec_task.cancel()
-    try:
-        await exec_task
-    except asyncio.CancelledError:
-        pass
+        exec_task.cancel()
+        try:
+            await exec_task
+        except asyncio.CancelledError:
+            pass
 
 
 # ---------- AC #6: stale worker cannot write checkpoint after ownership transfer ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires checkpoint_write() with generation check; not yet implemented")
 async def test_stale_worker_cannot_write_checkpoint_after_ownership_transfer(
     profiles_dir, database_url, session_factory
 ):
@@ -496,7 +530,7 @@ async def test_stale_worker_cannot_write_checkpoint_after_ownership_transfer(
 
     async with session_factory() as s1:
         persona_a = await _register_worker_and_v1_profile(s1, profiles_dir)
-        task = await _enqueue(s1, title="checkpoint fencing test")
+        task = await _enqueue(s1, title="checkpoint fencing test", side_effect_classification="IDEMPOTENT")
         task_id = task.id
 
         kernel_a = _build_kernel(s1, OkAdapter(), persona_a)
@@ -535,7 +569,6 @@ async def test_stale_worker_cannot_write_checkpoint_after_ownership_transfer(
 # ---------- AC #7: two recovery workers cannot both acquire ownership ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires atomic reclaim with generation; not yet implemented")
 async def test_two_recovery_workers_cannot_both_acquire_ownership(
     profiles_dir, database_url, session_factory
 ):
@@ -553,7 +586,7 @@ async def test_two_recovery_workers_cannot_both_acquire_ownership(
     # Setup: stale in_progress task
     async with session_factory() as s1:
         persona = await _register_worker_and_v1_profile(s1, profiles_dir)
-        task = await _enqueue(s1, title="double-reclaim test")
+        task = await _enqueue(s1, title="double-reclaim test", side_effect_classification="IDEMPOTENT")
         task_id = task.id
 
         await s1.execute(
@@ -561,7 +594,7 @@ async def test_two_recovery_workers_cannot_both_acquire_ownership(
             .where(TaskModel.id == task_id)
             .values(
                 status="in_progress",
-                assigned_worker="crashed-worker",
+                assigned_worker=persona.id,
                 lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=30),
                 generation=1,
             )
@@ -571,7 +604,7 @@ async def test_two_recovery_workers_cannot_both_acquire_ownership(
     # Concurrent reclaim attempts
     results: dict[str, str] = {}
 
-    async def reclaim(worker_label: str, s_factory, p: Persona):
+    async def reclaim(worker_label: str, s_factory, p: _WorkerHandle):
         async with s_factory() as s:
             try:
                 kernel = _build_kernel(s, OkAdapter(), p)
@@ -598,7 +631,6 @@ async def test_two_recovery_workers_cannot_both_acquire_ownership(
 # ---------- AC #8: checkpoint is cleared on reclaim; recovery starts from scratch ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires reclaim() to set checkpoint_ref=NULL; not yet implemented")
 async def test_reclaimed_task_starts_from_scratch_not_from_existing_checkpoint(
     profiles_dir, database_url, session_factory
 ):
@@ -625,7 +657,7 @@ async def test_reclaimed_task_starts_from_scratch_not_from_existing_checkpoint(
 
     async with session_factory() as s1:
         persona = await _register_worker_and_v1_profile(s1, profiles_dir)
-        task = await _enqueue(s1, title="checkpoint resume test")
+        task = await _enqueue(s1, title="checkpoint resume test", side_effect_classification="IDEMPOTENT")
         task_id = task.id
 
         # Create pre-crash checkpoint
@@ -672,7 +704,6 @@ async def test_reclaimed_task_starts_from_scratch_not_from_existing_checkpoint(
 # ---------- AC #9: max_retries limits reclaim (IDEMPOTENT path) ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires retry_count / max_retries / exhaustion_reason columns; not yet implemented")
 async def test_max_retries_with_idempotent_transitions_to_failed(
     profiles_dir, database_url, session_factory
 ):
@@ -739,7 +770,6 @@ async def test_max_retries_with_idempotent_transitions_to_failed(
 # ---------- AC #10: UNKNOWN classification blocks auto-reclamation ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires side_effect_classification column; not yet implemented")
 async def test_unknown_classification_blocks_auto_reclamation(
     profiles_dir, database_url, session_factory
 ):
@@ -773,6 +803,7 @@ async def test_unknown_classification_blocks_auto_reclamation(
             .where(TaskModel.id == task_id)
             .values(
                 status="in_progress",
+                generation=1,
                 lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=30),
             )
         )
@@ -824,8 +855,7 @@ async def test_unknown_classification_blocks_auto_reclamation(
                 "    WHEN side_effect_classification IN ('UNKNOWN', 'HAS_SIDE_EFFECTS') THEN 'review' "
                 "  END, "
                 "  exhaustion_reason = 'retry_limit_exhausted', "
-                "  lock_expires_at = NULL, "
-                "  updated_at = NOW() "
+                "  lock_expires_at = NULL "
                 "WHERE id = :tid AND status = 'in_progress' "
                 "  AND generation = :gen "
                 "  AND lock_expires_at < NOW() "
@@ -849,7 +879,6 @@ async def test_unknown_classification_blocks_auto_reclamation(
 # ---------- AC #11: IDEMPOTENT classification permits auto-reclamation ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires side_effect_classification column; not yet implemented")
 async def test_idempotent_classification_permits_auto_reclamation(
     profiles_dir, database_url, session_factory
 ):
@@ -885,6 +914,7 @@ async def test_idempotent_classification_permits_auto_reclamation(
             .where(TaskModel.id == task_id)
             .values(
                 status="in_progress",
+                generation=1,
                 lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=30),
             )
         )
@@ -907,7 +937,6 @@ async def test_idempotent_classification_permits_auto_reclamation(
 # ---------- AC #11b: HAS_SIDE_EFFECTS classification blocks auto-reclamation ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires side_effect_classification column; not yet implemented")
 async def test_has_side_effects_classification_blocks_auto_reclamation(
     profiles_dir, database_url, session_factory
 ):
@@ -985,8 +1014,7 @@ async def test_has_side_effects_classification_blocks_auto_reclamation(
                 "    WHEN side_effect_classification IN ('UNKNOWN', 'HAS_SIDE_EFFECTS') THEN 'review' "
                 "  END, "
                 "  exhaustion_reason = 'retry_limit_exhausted', "
-                "  lock_expires_at = NULL, "
-                "  updated_at = NOW() "
+                "  lock_expires_at = NULL "
                 "WHERE id = :tid AND status = 'in_progress' "
                 "  AND generation = :gen "
                 "  AND lock_expires_at < NOW() "
@@ -1008,7 +1036,6 @@ async def test_has_side_effects_classification_blocks_auto_reclamation(
 # ---------- AC #12: operator-managed recovery remains possible ----------
 
 
-@pytest.mark.skip(reason="v0.1 compatible: operator can already reset in_progress tasks manually; v0.2 adds fencing to the reset flow")
 async def test_operator_can_manually_reset_in_progress_to_queued(
     profiles_dir, database_url, session_factory
 ):
@@ -1031,7 +1058,7 @@ async def test_operator_can_manually_reset_in_progress_to_queued(
             .where(TaskModel.id == task_id)
             .values(
                 status="in_progress",
-                assigned_worker="dead-worker",
+                assigned_worker=persona.id,
                 lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=30),
                 generation=1,
             )
@@ -1066,7 +1093,6 @@ async def test_operator_can_manually_reset_in_progress_to_queued(
 # ---------- AC #13: operator reset increments generation; stale writes remain fenced ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires generation increment on operator reset; not yet implemented")
 async def test_operator_reset_increments_generation_fencing_stale_writes(
     profiles_dir, database_url, session_factory
 ):
@@ -1094,7 +1120,7 @@ async def test_operator_reset_increments_generation_fencing_stale_writes(
             .where(TaskModel.id == task_id)
             .values(
                 status="in_progress",
-                assigned_worker="dead-worker",
+                assigned_worker=persona_a.id,
                 lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=30),
                 generation=1,
             )
@@ -1136,7 +1162,6 @@ async def test_operator_reset_increments_generation_fencing_stale_writes(
 # ---------- Additional: heartbeat failure behavior ----------
 
 
-@pytest.mark.skip(reason="v0.2: requires heartbeat() with fenced UPDATE; not yet implemented")
 async def test_worker_receives_stale_worker_error_on_heartbeat_after_reclaim(
     profiles_dir, database_url, session_factory
 ):
@@ -1150,40 +1175,42 @@ async def test_worker_receives_stale_worker_error_on_heartbeat_after_reclaim(
     cfg = _alembic_config(database_url)
     await asyncio.to_thread(command.upgrade, cfg, "head")
 
-    async with session_factory() as s1:
-        persona = await _register_worker_and_v1_profile(s1, profiles_dir)
-        task = await _enqueue(s1, title="heartbeat stale error test")
+    async with session_factory() as s_setup:
+        persona = await _register_worker_and_v1_profile(s_setup, profiles_dir)
+        task = await _enqueue(s_setup, title="heartbeat stale error test", side_effect_classification="IDEMPOTENT")
         task_id = task.id
 
-        kernel = _build_kernel(s1, SlowAdapter(delay=60), persona)
+    async with session_factory() as s_worker:
+        kernel = _build_kernel(s_worker, SlowAdapter(delay=60), persona)
         exec_task = asyncio.create_task(kernel.execute(task))
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
 
         # Make stale
-        await s1.execute(
-            update(TaskModel)
-            .where(TaskModel.id == task_id)
-            .values(
-                lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=30),
-                status="in_progress",
+        async with session_factory() as s_backdate:
+            await s_backdate.execute(
+                update(TaskModel)
+                .where(TaskModel.id == task_id)
+                .values(
+                    lock_expires_at=datetime.now(timezone.utc) - timedelta(minutes=30),
+                    status="in_progress",
+                )
             )
-        )
-        await s1.commit()
+            await s_backdate.commit()
 
-    # Worker B reclaims
-    async with session_factory() as s2:
-        persona_b = await _register_worker_and_v1_profile(s2, profiles_dir)
-        kernel_b = _build_kernel(s2, OkAdapter(), persona_b)
-        await kernel_b.reclaim(task)
+        # Worker B reclaims
+        async with session_factory() as s2:
+            persona_b = await _register_worker_and_v1_profile(s2, profiles_dir)
+            kernel_b = _build_kernel(s2, OkAdapter(), persona_b)
+            await kernel_b.reclaim(task)
 
-    # Worker A heartbeat -> fenced
-    async with session_factory() as s3:
-        kernel_a = _build_kernel(s3, SlowAdapter(delay=60), persona)
-        with pytest.raises(StaleWorkerError):
-            await kernel_a.heartbeat(task)
+        # Worker A heartbeat -> fenced
+        async with session_factory() as s3:
+            kernel_a = _build_kernel(s3, SlowAdapter(delay=60), persona)
+            with pytest.raises(StaleWorkerError):
+                await kernel_a.heartbeat(task)
 
-    exec_task.cancel()
-    try:
-        await exec_task
-    except asyncio.CancelledError:
-        pass
+        exec_task.cancel()
+        try:
+            await exec_task
+        except asyncio.CancelledError:
+            pass

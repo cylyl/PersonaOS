@@ -401,6 +401,8 @@ async def test_all_indexes_present(database_url):
                         "ix_tasks_assigned_node",
                         "ix_tasks_priority_created",
                         "ix_tasks_simulated_from",
+                        "ix_tasks_recovery_scan",
+                        "ix_tasks_review_queue",
                     },
                     "task_checkpoints": {"ix_task_checkpoints_task"},
                     "task_events": {"ix_task_events_task_created"},
