@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from personaos.api.deps import SessionDep, WorkloadDep
 from personaos.api.schemas import (
@@ -155,42 +155,50 @@ async def approve_task(
 ) -> TaskModel:
     """Approve a task currently in review or blocked state.
 
-    Re-queues the task for worker re-claim.
+    Atomically re-queues the task with generation fencing and lease clearing.
     """
-    res = await session.execute(
-        select(TaskModel).where(TaskModel.id == task_id)
-    )
-    task = res.scalar_one_or_none()
-    if task is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task {task_id} not found",
+    stmt = (
+        update(TaskModel)
+        .where(
+            TaskModel.id == task_id,
+            TaskModel.status.in_(["review", "blocked"]),
         )
-    if task.status not in ("review", "blocked"):
+        .values(
+            status="queued",
+            generation=TaskModel.generation + 1,
+            lock_expires_at=None,
+            assigned_worker=None,
+        )
+        .returning(TaskModel)
+    )
+    res = await session.execute(stmt)
+    updated_task = res.scalar_one_or_none()
+    if updated_task is None:
+        existing = (
+            await session.execute(
+                select(TaskModel.status).where(TaskModel.id == task_id)
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Task {task_id} not found",
+            )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot approve task in state {task.status!r}; must be 'review' or 'blocked'",
+            detail=f"Cannot approve task in state {existing!r}; must be 'review' or 'blocked'",
         )
 
     actor = (req and req.actor_id) or "system:operator"
-    await session.execute(
-        update(TaskModel)
-        .where(TaskModel.id == task_id)
-        .values(status="queued")
-    )
-    await session.flush()
-    task.status = "queued"
-
-    # Emit task event
     await emit_task_event(
         session,
-        task_id=task.id,
+        task_id=updated_task.id,
         event_type="task.created",
         actor_id=actor,
         payload={"action": "approved", "reason": req.reason if req else None},
     )
-
-    return task
+    await session.flush()
+    return updated_task
 
 
 @router.post("/{task_id}/reject", response_model=TaskResponse)
@@ -201,41 +209,50 @@ async def reject_task(
 ) -> TaskModel:
     """Reject a task currently in review or blocked state.
 
-    Transitions status to 'failed'.
+    Atomically transitions status to 'failed' with generation fencing.
     """
-    res = await session.execute(
-        select(TaskModel).where(TaskModel.id == task_id)
-    )
-    task = res.scalar_one_or_none()
-    if task is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task {task_id} not found",
-        )
-    if task.status not in ("review", "blocked"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot reject task in state {task.status!r}; must be 'review' or 'blocked'",
-        )
-
     actor = (req and req.actor_id) or "system:operator"
     reason = (req and req.reason) or "Rejected by operator"
 
-    await session.execute(
+    stmt = (
         update(TaskModel)
-        .where(TaskModel.id == task_id)
-        .values(status="failed", last_error=reason)
+        .where(
+            TaskModel.id == task_id,
+            TaskModel.status.in_(["review", "blocked"]),
+        )
+        .values(
+            status="failed",
+            generation=TaskModel.generation + 1,
+            last_error=reason,
+            lock_expires_at=None,
+            completed_at=func.now(),
+        )
+        .returning(TaskModel)
     )
-    await session.flush()
-    task.status = "failed"
-    task.last_error = reason
+    res = await session.execute(stmt)
+    updated_task = res.scalar_one_or_none()
+    if updated_task is None:
+        existing = (
+            await session.execute(
+                select(TaskModel.status).where(TaskModel.id == task_id)
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Task {task_id} not found",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot reject task in state {existing!r}; must be 'review' or 'blocked'",
+        )
 
     await emit_task_event(
         session,
-        task_id=task.id,
+        task_id=updated_task.id,
         event_type="task.failed",
         actor_id=actor,
         payload={"action": "rejected", "reason": reason},
     )
-
-    return task
+    await session.flush()
+    return updated_task

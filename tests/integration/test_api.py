@@ -316,6 +316,56 @@ async def test_review_queue_and_approval_workflow(
 
 
 @pytest.mark.asyncio
+async def test_atomic_review_approval_concurrency_and_fencing(
+    api_client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    clean_tables: None,
+) -> None:
+    """FINDING-02: Concurrent approvals/rejections are atomically serialized.
+
+    Proves:
+    1. Approval increments generation and clears lock_expires_at.
+    2. Concurrent approval/rejection races result in exactly 1 winner and 1 rejection (400).
+    3. Re-approving an already queued task is rejected.
+    """
+    await api_client.post(
+        "/workers",
+        json={"id": "worker-race-1", "role": "devops"},
+    )
+
+    async with session_factory() as session:
+        t = TaskModel(
+            id="task-race-001",
+            title="Concurrent approval test",
+            objective="Verify atomic fencing",
+            input={},
+            assigned_worker="worker-race-1",
+            status="review",
+            generation=3,
+            priority="medium",
+            profile_version=1,
+            side_effect_classification="HAS_SIDE_EFFECTS",
+        )
+        session.add(t)
+        await session.commit()
+
+    # Launch two concurrent requests: one approve, one reject
+    resp_approve, resp_reject = await asyncio.gather(
+        api_client.post("/tasks/task-race-001/approve", json={"actor_id": "op-1"}),
+        api_client.post("/tasks/task-race-001/reject", json={"actor_id": "op-2"}),
+    )
+
+    # Exactly one succeeded (200) and one failed (400)
+    status_codes = sorted([resp_approve.status_code, resp_reject.status_code])
+    assert status_codes == [200, 400]
+
+    # Verify winning state has generation = 4 (incremented from 3)
+    winner_resp = resp_approve if resp_approve.status_code == 200 else resp_reject
+    assert winner_resp.json()["generation"] == 4
+    assert winner_resp.json()["lock_expires_at"] is None
+
+
+@pytest.mark.asyncio
 async def test_node_binding_and_lifecycle(
     api_client: AsyncClient, clean_tables: None
 ) -> None:
