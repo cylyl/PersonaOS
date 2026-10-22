@@ -35,7 +35,7 @@ from typing import Any
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from personaos.db.models import Task as TaskModel
 from personaos.domain.task import Task
@@ -630,3 +630,217 @@ async def test_in_flight_heartbeat_aborts_when_task_reclaimed(
 
         # Adapter was cancelled before finishing its 5s sleep
         assert adapter.executed is False
+
+
+# ---------- Finding 1 + Blocker 3: Ambiguous Non-Idempotent Failure Routes to Review ----------
+
+
+class SideEffectThenCrashAdapter:
+    """Simulates an external side effect followed by abrupt subprocess death / crash."""
+
+    def __init__(self) -> None:
+        self.side_effects_executed: int = 0
+
+    async def execute(
+        self,
+        context: WorkerExecutionContext,
+        checkpoint: Any | None = None,
+    ) -> Result:
+        # Step 1: External side effect occurs (e.g. cloud resource mutation)
+        self.side_effects_executed += 1
+
+        # Step 2: Subprocess terminates / dies abruptly in-flight after prompt acceptance
+        return Result(
+            status="failed",
+            error=(
+                "OpenClaw subprocess terminated unexpectedly (SIGKILL/exit 42) "
+                "after prompt acceptance"
+            ),
+            output={
+                "ambiguous": True,
+                "phase": "in_flight_prompt_accepted",
+                "resource_id": "arn:aws:s3:::prod-bucket-1234",
+            },
+        )
+
+
+async def test_kernel_routes_ambiguous_failure_to_review(
+    profiles_dir, database_url, session_factory
+) -> None:
+    """Ambiguous non-idempotent task failure routes to review without automatic replay.
+
+    Proves:
+      1. Non-idempotent task (HAS_SIDE_EFFECTS) with ambiguous in-flight failure routes to 'review'.
+      2. Status is 'review', exhaustion_reason is 'ambiguous_in_flight_failure'.
+      3. Completed_at and lock_expires_at are cleared (NULL).
+      4. WorkloadService.next_runnable() excludes the task (no automatic replay).
+      5. Kernel.reclaim() blocks auto-reclamation.
+      6. External side effect is executed exactly once (no duplicated external execution).
+    """
+    cfg = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    worker_id = "worker-side-effects-001"
+
+    async with session_factory() as session:
+        reg = await _setup_worker_v1_v2_active(session, profiles_dir, worker_id=worker_id)
+        wl = WorkloadService(session=session)
+        task = await wl.enqueue(
+            worker_id=worker_id,
+            title="Deploy S3 Bucket",
+            objective="Create production assets bucket",
+            input={"bucket": "prod-bucket-1234"},
+            side_effect_classification="HAS_SIDE_EFFECTS",
+        )
+        task_id = task.id
+
+        adapter = SideEffectThenCrashAdapter()
+        kernel = WorkerExecutionKernel(
+            session=session,
+            adapter=adapter,
+            resolve_context=reg.resolve_execution_context,
+            worker_id=worker_id,
+        )
+
+        result = await kernel.execute(task)
+
+        # Assert adapter returned ambiguous failure and executed side effect once
+        assert result.status == "failed"
+        assert result.output is not None
+        assert result.output.get("ambiguous") is True
+        assert adapter.side_effects_executed == 1
+
+        # Verify PostgreSQL database state: routed to 'review', not silently 'failed'
+        row = (
+            await session.execute(
+                select(TaskModel).where(TaskModel.id == task_id)
+            )
+        ).scalar_one()
+
+        assert row.status == "review"
+        assert row.exhaustion_reason == "ambiguous_in_flight_failure"
+        assert row.completed_at is None
+        assert row.lock_expires_at is None
+
+        # Verify task_events: task.failed event emitted with payload.action == 'routed_to_review'
+        from personaos.db.models import TaskEvent
+
+        events = (
+            (
+                await session.execute(
+                    select(TaskEvent)
+                    .where(TaskEvent.task_id == task_id, TaskEvent.type == "task.failed")
+                    .order_by(TaskEvent.created_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(events) >= 1
+        failed_event = events[0]
+        assert failed_event.type == "task.failed"
+        assert failed_event.payload == {
+            "action": "routed_to_review",
+            "exhaustion_reason": "ambiguous_in_flight_failure",
+        }
+
+        # Verify no automatic replay: task in 'review' is NOT runnable
+        next_runnable = await wl.next_runnable()
+        assert next_runnable is None
+
+        # Verify auto-reclaim is strictly blocked for non-idempotent task
+        with pytest.raises(TaskStatusError, match="auto-reclaim blocked"):
+            await kernel.reclaim(task)
+
+        # Verify external side effect was never replayed / duplicated
+        assert adapter.side_effects_executed == 1
+
+
+async def test_kernel_routes_ambiguous_failure_with_openclaw_adapter_and_unknown_classification(
+    profiles_dir, database_url, session_factory, tmp_path
+) -> None:
+    """Proves OpenClawAdapter integrated with WorkerExecutionKernel routes UNKNOWN tasks to review.
+
+    Verifies:
+      1. Task side_effect_classification is 'UNKNOWN'.
+      2. Real OpenClawAdapter with mock subprocess crashes in-flight
+         (SIMULATE_SIDE_EFFECT_THEN_CRASH).
+      3. Adapter outputs ambiguous=True.
+      4. Kernel transitions task status in PostgreSQL to 'review' with completed_at=NULL.
+      5. TaskEvent emitted is 'task.failed' with payload.action='routed_to_review'.
+      6. No automated replay or accidental completion occurs.
+    """
+    import sys
+
+    from personaos.execution.adapters.openclaw import OpenClawAdapter, OpenClawConfig
+    from tests.unit.execution.test_openclaw_adapter import MOCK_OPENCLAW_SCRIPT
+
+    cfg = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    worker_id = "worker-openclaw-002"
+    mock_script = tmp_path / "mock_openclaw.py"
+    mock_script.write_text(MOCK_OPENCLAW_SCRIPT.strip(), encoding="utf-8")
+
+    async with session_factory() as session:
+        reg = await _setup_worker_v1_v2_active(session, profiles_dir, worker_id=worker_id)
+        wl = WorkloadService(session=session)
+        task = await wl.enqueue(
+            worker_id=worker_id,
+            title="Deploy Unknown Service",
+            objective="Deploy microservice with unknown side effect profile",
+            input={"instruction": "SIMULATE_SIDE_EFFECT_THEN_CRASH", "service": "billing"},
+            side_effect_classification="UNKNOWN",
+        )
+        task_id = task.id
+
+        config = OpenClawConfig(
+            command=(sys.executable, str(mock_script)),
+            gateway_url="",
+            timeout_seconds=5.0,
+        )
+        adapter = OpenClawAdapter(config=config)
+        kernel = WorkerExecutionKernel(
+            session=session,
+            adapter=adapter,
+            resolve_context=reg.resolve_execution_context,
+            worker_id=worker_id,
+        )
+
+        result = await kernel.execute(task)
+
+        # Verify adapter failure result
+        assert result.status == "failed"
+        assert result.output is not None
+        assert result.output.get("ambiguous") is True
+
+        # Verify PostgreSQL database state
+        row = (
+            await session.execute(
+                select(TaskModel).where(TaskModel.id == task_id)
+            )
+        ).scalar_one()
+
+        assert row.status == "review"
+        assert row.exhaustion_reason == "ambiguous_in_flight_failure"
+        assert row.completed_at is None
+        assert row.lock_expires_at is None
+
+        # Verify event payload
+        from personaos.db.models import TaskEvent
+
+        event = (
+            await session.execute(
+                select(TaskEvent)
+                .where(TaskEvent.task_id == task_id, TaskEvent.type == "task.failed")
+                .order_by(TaskEvent.created_at.desc())
+            )
+        ).scalars().first()
+        assert event is not None
+        assert event.payload == {
+            "action": "routed_to_review",
+            "exhaustion_reason": "ambiguous_in_flight_failure",
+        }
+
+        # Verify no automatic replay
+        assert await wl.next_runnable() is None

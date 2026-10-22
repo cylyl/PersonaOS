@@ -270,9 +270,37 @@ class WorkerExecutionKernel:
             raise
 
     async def fail(self, task: Task, result: Result) -> None:
-        """Fenced failure: persists error + transitions to failed + clears lease."""
+        """Fenced failure: persists error + transitions to failed or review + clears lease.
+
+        IMPORTANT for event consumers:
+        Consumers must NOT interpret every `task.failed` event as proof that the
+        task's final status is 'failed'. When a non-idempotent task ('UNKNOWN' or
+        'HAS_SIDE_EFFECTS') encounters an ambiguous in-flight failure, the task is
+        quarantined in 'review' status (completed_at is NULL). Due to the PostgreSQL
+        CHECK constraint on task_events.type ('task_events_type_check' only permits
+        the five v0.1 event types), the kernel emits 'task.failed' with:
+            payload={"action": "routed_to_review",
+                     "exhaustion_reason": "ambiguous_in_flight_failure"}
+        Consumers must check payload.action to distinguish terminal failures from
+        tasks quarantined for operator review.
+        """
         expected_gen = self._generation if self._generation > 0 else getattr(task, "generation", 1)
         expected_worker = self._worker_id or task.assigned_worker
+
+        is_ambiguous = bool(result.output and result.output.get("ambiguous") is True)
+        is_non_idempotent = getattr(task, "side_effect_classification", "UNKNOWN") in (
+            "UNKNOWN",
+            "HAS_SIDE_EFFECTS",
+        )
+
+        if is_ambiguous and is_non_idempotent:
+            target_status = "review"
+            exhaustion_reason = "ambiguous_in_flight_failure"
+            completed_at_val = None
+        else:
+            target_status = "failed"
+            exhaustion_reason = None
+            completed_at_val = func.now()
 
         try:
             stmt = update(TaskModel).where(
@@ -282,12 +310,18 @@ class WorkerExecutionKernel:
             if expected_worker:
                 stmt = stmt.where(TaskModel.assigned_worker == expected_worker)
 
+            result_payload = (
+                result.output
+                if result.output
+                else ({"error": result.error} if result.error else None)
+            )
             res = await self._session.execute(
                 stmt.values(
-                    status="failed",
-                    completed_at=func.now(),
-                    result={"error": result.error} if result.error else None,
+                    status=target_status,
+                    completed_at=completed_at_val,
+                    result=result_payload,
                     last_error=result.error,
+                    exhaustion_reason=exhaustion_reason,
                     lock_expires_at=None,
                 )
             )
@@ -302,6 +336,9 @@ class WorkerExecutionKernel:
                 task_id=task.id,
                 event_type="task.failed",
                 actor_id=expected_worker or "kernel",
+                payload={"action": "routed_to_review", "exhaustion_reason": exhaustion_reason}
+                if exhaustion_reason
+                else None,
             )
             await self._session.commit()
         except Exception:

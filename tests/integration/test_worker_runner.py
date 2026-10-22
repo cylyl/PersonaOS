@@ -90,21 +90,25 @@ async def test_worker_runner_startup_and_node_binding(
 
         # Start runner in background task
         runner_task = asyncio.create_task(runner.run())
-        await asyncio.sleep(0.1)
+        binding = None
+        for _ in range(50):
+            if runner.is_running and runner.binding_id:
+                async with session_factory() as s_poll:
+                    binding = (
+                        await s_poll.execute(
+                            select(WorkerNode).where(WorkerNode.id == runner.binding_id)
+                        )
+                    ).scalar_one_or_none()
+                    if binding is not None:
+                        break
+            await asyncio.sleep(0.05)
 
         assert runner.is_running is True
         assert runner.binding_id is not None
-
-        # Verify worker_nodes record is active
-        async with session_factory() as s_check:
-            binding = (
-                await s_check.execute(
-                    select(WorkerNode).where(WorkerNode.id == runner.binding_id)
-                )
-            ).scalar_one()
-            assert binding.worker_id == worker_id
-            assert binding.node_id == node_id
-            assert binding.unbound_at is None
+        assert binding is not None
+        assert binding.worker_id == worker_id
+        assert binding.node_id == node_id
+        assert binding.unbound_at is None
 
         # Trigger graceful stop
         runner.stop()
@@ -242,7 +246,22 @@ async def test_worker_runner_supersedes_stale_bindings_on_restart(
         )
 
         runner_task = asyncio.create_task(runner.run())
-        await asyncio.sleep(0.1)
+        active_row = None
+        for _ in range(50):
+            if runner.is_running and runner.binding_id:
+                async with session_factory() as s_poll:
+                    active_row = (
+                        await s_poll.execute(
+                            select(WorkerNode).where(WorkerNode.id == runner.binding_id)
+                        )
+                    ).scalar_one_or_none()
+                    if active_row is not None:
+                        break
+            await asyncio.sleep(0.05)
+
+        assert runner.is_running is True
+        assert runner.binding_id is not None
+        assert active_row is not None
 
         # Verify old binding was drained with reason "stale_binding_superseded"
         async with session_factory() as s_check:
@@ -255,11 +274,6 @@ async def test_worker_runner_supersedes_stale_bindings_on_restart(
             assert stale_row.reason == "stale_binding_superseded"
 
             # And the new binding is active
-            active_row = (
-                await s_check.execute(
-                    select(WorkerNode).where(WorkerNode.id == runner.binding_id)
-                )
-            ).scalar_one()
             assert active_row.unbound_at is None
 
         runner.stop()
