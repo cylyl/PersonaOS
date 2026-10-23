@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     # API
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    # None = internal/trusted mode; when set, requires Bearer token
+    operator_token: str | None = None
 
     # Worker
     worker_poll_interval_seconds: float = 2.0

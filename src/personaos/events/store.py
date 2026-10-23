@@ -2,8 +2,8 @@
 
 Per ADR 0006: events are append-only. State tables remain source of truth.
 
-v0.1 emits only the 5 task event types (CHECK-constrained):
-  task.created, task.claimed, task.checkpointed, task.completed, task.failed
+v0.1 / ADR 0018 emits task event types (CHECK-constrained):
+  task.created, task.claimed, task.checkpointed, task.completed, task.failed, task.requeued
 
 The CHECK constraint on task_events.type enforces valid values at the
 DB level. This module enforces them at the Python level too (faster
@@ -25,6 +25,7 @@ _TASK_EVENT_TYPES = (
     "task.checkpointed",
     "task.completed",
     "task.failed",
+    "task.requeued",
 )
 
 

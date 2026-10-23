@@ -174,6 +174,13 @@ async def test_task_events_type_check_constraint(database_url):
                     "VALUES ('t1', 'task.created', 'system')"
                 )
             )
+            # Valid Step 15 / ADR 0018 type
+            await conn.execute(
+                text(
+                    "INSERT INTO task_events (task_id, type, actor_id) "
+                    "VALUES ('t1', 'task.requeued', 'system')"
+                )
+            )
             # v0.2 type (worker.created) should be rejected
             with pytest.raises(Exception):
                 await conn.execute(
@@ -457,3 +464,51 @@ def test_upgrade_after_downgrade_is_idempotent(database_url):
     command.upgrade(cfg, "head")
     command.downgrade(cfg, "base")
     command.upgrade(cfg, "head")  # Must succeed
+
+
+async def test_migration_0005_upgrade_downgrade_data_preservation(database_url):
+    """Migration 0005: task.requeued is valid; downgrade preserves data without errors."""
+    cfg = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as conn:
+            # Seed worker and task
+            await conn.execute(
+                text("INSERT INTO workers (id, name, role) VALUES ('w1', 'W1', 'devops')")
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO tasks (id, title, objective, assigned_worker, input) "
+                    "VALUES ('t1', 'T', 'O', 'w1', '{}'::jsonb)"
+                )
+            )
+            # Insert task.requeued event
+            await conn.execute(
+                text(
+                    "INSERT INTO task_events (task_id, type, actor_id, payload) "
+                    "VALUES ('t1', 'task.requeued', 'op-alice', "
+                    "'{\"reason\": \"re-queued\"}'::jsonb)"
+                )
+            )
+
+        # Downgrade to 0004
+        await asyncio.to_thread(command.downgrade, cfg, "0004")
+
+        # Verify historical data was preserved as task.created with original_type marker
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT type, payload FROM task_events WHERE task_id = 't1'")
+                )
+            ).first()
+            assert row is not None
+            assert row[0] == "task.created"
+            assert row[1]["original_type"] == "task.requeued"
+            assert row[1]["reason"] == "re-queued"
+
+        # Upgrade back to head (0005)
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+    finally:
+        await engine.dispose()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -173,10 +173,110 @@ class TaskCheckpointResponse(BaseModel):
 
 
 class TaskActionRequest(BaseModel):
-    """Request payload for manual review actions (approve, reject)."""
+    """Request payload for legacy manual review actions."""
 
     reason: str | None = None
     actor_id: str | None = None
+
+
+class ClassificationAttestation(BaseModel):
+    """Accountable operator declaration for downgrading task classification to IDEMPOTENT."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    requested_classification: Literal["IDEMPOTENT"] = "IDEMPOTENT"
+    safety_justification: str = Field(
+        ...,
+        min_length=15,
+        max_length=1000,
+        description="Detailed operator attestation justifying why automatic replay is safe",
+    )
+    verification_reference: str | None = Field(
+        None, max_length=200, description="Ticket, commit, or run reference confirming safety"
+    )
+
+
+class TaskApproveRequest(BaseModel):
+    """Payload for approving and re-queuing a task from review state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(
+        ...,
+        min_length=10,
+        max_length=1000,
+        description="Operational justification for approval and re-queue",
+    )
+    expected_generation: int = Field(
+        ..., ge=0, description="Mandatory generation fence to prevent concurrent lost updates"
+    )
+    reassign_worker_id: str | None = Field(
+        None, description="Explicitly reassign task to a different valid worker ID"
+    )
+    reset_retries: bool = Field(
+        True, description="Reset retry_count to 0 to provide a fresh retry budget"
+    )
+    max_retries: int | None = Field(
+        None, ge=1, le=20, description="Optionally increase max_retries limit"
+    )
+    attestation: ClassificationAttestation | None = Field(
+        None, description="Mandatory attestation if changing classification to IDEMPOTENT"
+    )
+
+
+class TaskResolveRequest(BaseModel):
+    """Payload for manually marking a reviewed task completed with verified output."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(
+        ...,
+        min_length=10,
+        max_length=1000,
+        description="Verification notes explaining out-of-band success",
+    )
+    expected_generation: int = Field(
+        ..., ge=0, description="Mandatory generation fence to prevent concurrent lost updates"
+    )
+    result: dict[str, Any] = Field(
+        default_factory=dict, description="Verified output dictionary attested by the operator"
+    )
+
+
+class TaskRejectRequest(BaseModel):
+    """Payload for terminally failing a reviewed task."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(
+        ...,
+        min_length=10,
+        max_length=1000,
+        description="Rejection reason / failure description",
+    )
+    expected_generation: int = Field(
+        ..., ge=0, description="Mandatory generation fence to prevent concurrent lost updates"
+    )
+
+
+class TaskReviewContextResponse(BaseModel):
+    """Aggregated diagnostic view for operator decision making."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    task: TaskResponse
+    assigned_worker_id: str | None = None
+    worker_name: str | None = None
+    worker_role: str | None = None
+    worker_runtime: str | None = None
+    profile_version_snapshot: int = 1
+    worker_current_profile_version: int | None = None
+    is_snapshot_outdated: bool = False
+    execution_evidence: dict[str, Any] = Field(default_factory=dict)
+    recent_events: list[EventResponse] = Field(default_factory=list)
+    checkpoints_count: int = 0
+    latest_checkpoint: TaskCheckpointResponse | None = None
+    checkpoint_history: list[TaskCheckpointResponse] = Field(default_factory=list)
 
 
 class NodeBindRequest(BaseModel):

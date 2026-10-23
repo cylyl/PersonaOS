@@ -3,7 +3,26 @@
 Raised by services in registry/, workload/, security/, execution/.
 Caught at the API boundary (api/deps.py, api/routes/*) and translated to
 HTTP responses.
-
-TODO(v0.1): define WorkerNotFound, TaskNotFound, NodeLost, Quarantined,
-PolicyDenied, ApprovalRequired, LeaseExpired.
 """
+
+from __future__ import annotations
+
+
+class DomainError(Exception):
+    """Base exception for all PersonaOS domain errors."""
+
+
+class TaskNotFoundError(DomainError):
+    """Raised when a requested task does not exist."""
+
+
+class TaskStateConflictError(DomainError):
+    """Raised when a task is in an unexpected status or generation."""
+
+
+class InvalidActionError(DomainError):
+    """Raised when an operation is invalid given task policy or parameters."""
+
+
+class WorkerNotEligibleError(DomainError):
+    """Raised when a worker is not in an eligible state for task assignment."""

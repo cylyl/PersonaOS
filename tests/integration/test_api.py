@@ -285,10 +285,12 @@ async def test_review_queue_and_approval_workflow(
     # 2. Approve the task -> moves back to queued
     approve_resp = await api_client.post(
         "/tasks/task-rev-001/approve",
-        json={"reason": "Approved by security lead", "actor_id": "sec-lead-alice"},
+        json={"reason": "Approved by security lead for deployment", "expected_generation": 0},
     )
     assert approve_resp.status_code == 200
     assert approve_resp.json()["status"] == "queued"
+    assert approve_resp.json()["assigned_worker"] == "worker-op-1"
+    assert approve_resp.json()["profile_version"] == 1
 
     # 3. Seed another task and reject it
     async with session_factory() as session:
@@ -308,11 +310,11 @@ async def test_review_queue_and_approval_workflow(
 
     reject_resp = await api_client.post(
         "/tasks/task-rev-002/reject",
-        json={"reason": "Compliance policy violation", "actor_id": "dpo-bob"},
+        json={"reason": "Compliance policy violation detected", "expected_generation": 0},
     )
     assert reject_resp.status_code == 200
     assert reject_resp.json()["status"] == "failed"
-    assert reject_resp.json()["last_error"] == "Compliance policy violation"
+    assert reject_resp.json()["last_error"] == "Compliance policy violation detected"
 
 
 @pytest.mark.asyncio
@@ -325,7 +327,7 @@ async def test_atomic_review_approval_concurrency_and_fencing(
 
     Proves:
     1. Approval increments generation and clears lock_expires_at.
-    2. Concurrent approval/rejection races result in exactly 1 winner and 1 rejection (400).
+    2. Concurrent approval/rejection races result in exactly 1 winner and 1 rejection (409).
     3. Re-approving an already queued task is rejected.
     """
     await api_client.post(
@@ -351,13 +353,19 @@ async def test_atomic_review_approval_concurrency_and_fencing(
 
     # Launch two concurrent requests: one approve, one reject
     resp_approve, resp_reject = await asyncio.gather(
-        api_client.post("/tasks/task-race-001/approve", json={"actor_id": "op-1"}),
-        api_client.post("/tasks/task-race-001/reject", json={"actor_id": "op-2"}),
+        api_client.post(
+            "/tasks/task-race-001/approve",
+            json={"reason": "Approving race task safely", "expected_generation": 3},
+        ),
+        api_client.post(
+            "/tasks/task-race-001/reject",
+            json={"reason": "Rejecting race task safely", "expected_generation": 3},
+        ),
     )
 
-    # Exactly one succeeded (200) and one failed (400)
+    # Exactly one succeeded (200) and one failed with conflict (409)
     status_codes = sorted([resp_approve.status_code, resp_reject.status_code])
-    assert status_codes == [200, 400]
+    assert status_codes == [200, 409]
 
     # Verify winning state has generation = 4 (incremented from 3)
     winner_resp = resp_approve if resp_approve.status_code == 200 else resp_reject

@@ -291,7 +291,7 @@ class TaskEvent(Base):
     __table_args__ = (
         CheckConstraint(
             "type IN ('task.created', 'task.claimed', 'task.checkpointed', "
-            "'task.completed', 'task.failed')",
+            "'task.completed', 'task.failed', 'task.requeued')",
             name="task_events_type_check",
         ),
         Index("ix_task_events_task_created", "task_id", "created_at"),
