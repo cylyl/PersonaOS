@@ -36,6 +36,7 @@ from sqlalchemy.sql import func
 
 from personaos.db.models import Task as TaskModel
 from personaos.db.models import Worker as WorkerModel
+from personaos.domain.errors import WorkerNotEligibleError
 from personaos.domain.task import Task
 from personaos.domain.worker import Worker, WorkerProfile
 from personaos.events.store import emit_task_event
@@ -45,6 +46,10 @@ from personaos.execution.checkpoint import write as checkpoint_write
 from personaos.execution.context import WorkerExecutionContext
 from personaos.execution.result import Result
 from personaos.registry.profile import ProfileRegistry
+from personaos.security.approval import request_approval
+from personaos.security.policy import PolicyEngine, get_default_policy_engine
+from personaos.security.secrets import SecretsManager, get_default_secrets_manager
+from personaos.security.tool_policy import ToolPolicy
 
 
 class TaskStatusError(Exception):
@@ -75,6 +80,10 @@ class WorkerExecutionKernel:
         lease_ttl: timedelta = timedelta(minutes=15),
         session_factory: async_sessionmaker[AsyncSession] | None = None,
         heartbeat_interval: float | None = None,
+        policy_engine: PolicyEngine | None = None,
+        tool_policy: ToolPolicy | None = None,
+        secrets_manager: SecretsManager | None = None,
+        enforce_policy: bool = True,
     ) -> None:
         self._session = session
         self._session_factory = session_factory
@@ -83,6 +92,10 @@ class WorkerExecutionKernel:
             if isinstance(bind, AsyncEngine):
                 self._session_factory = async_sessionmaker(bind, expire_on_commit=False)
         self._adapter = adapter
+        self._policy_engine = policy_engine or get_default_policy_engine()
+        self._tool_policy = tool_policy or ToolPolicy(engine=self._policy_engine)
+        self._secrets_manager = secrets_manager or get_default_secrets_manager()
+        self._enforce_policy = enforce_policy
         if resolve_context is not None:
             self._resolve_context = resolve_context
         elif profiles_dir is not None:
@@ -117,14 +130,21 @@ class WorkerExecutionKernel:
 
     async def execute(self, task: Task) -> Result:
         """Execute a task end-to-end. Returns the Result."""
+        if self._worker_id:
+            worker_status_row = await self._session.get(WorkerModel, self._worker_id)
+            if worker_status_row and worker_status_row.status in ("quarantined", "retired"):
+                msg = (
+                    f"Worker {self._worker_id} is in status {worker_status_row.status!r}; "
+                    "execution rejected"
+                )
+                raise WorkerNotEligibleError(msg)
+
         effective_task = task
         if not effective_task.assigned_worker and self._worker_id:
             # Unassigned task claimed by worker: snapshot current profile version
             worker_row = await self._session.get(WorkerModel, self._worker_id)
             current_ver = (
-                worker_row.current_profile_version
-                if worker_row
-                else effective_task.profile_version
+                worker_row.current_profile_version if worker_row else effective_task.profile_version
             )
             effective_task = dataclasses.replace(
                 effective_task,
@@ -187,6 +207,80 @@ class WorkerExecutionKernel:
             await self._session.rollback()
             raise
 
+        # Pre-execution security policy evaluation
+        if self._enforce_policy:
+            action = task.type or "task:execute"
+            resource = str(task.input.get("resource") or task.id)
+            eval_context = {
+                "task": task,
+                "worker": context.worker,
+                "profile": context.profile,
+                "generation": self._generation,
+            }
+            decision = self._policy_engine.evaluate(
+                actor=context.worker,
+                action=action,
+                resource=resource,
+                context=eval_context,
+            )
+
+            if decision.is_denied:
+                await emit_task_event(
+                    self._session,
+                    task_id=task.id,
+                    event_type="policy.denied",
+                    actor_id=self._worker_id or "security:policy",
+                    payload={
+                        "policy_id": decision.policy_id,
+                        "rule_id": decision.rule_id,
+                        "reason": decision.reason,
+                        "action": action,
+                        "resource": resource,
+                    },
+                )
+                result = Result(
+                    status="failed",
+                    error=f"Security policy denied execution: {decision.reason}",
+                )
+                await self.fail(task, result)
+                return result
+
+            if decision.requires_approval:
+                await request_approval(
+                    self._session,
+                    task_id=task.id,
+                    reason=decision.reason,
+                    policy_id=decision.policy_id,
+                    rule_id=decision.rule_id,
+                    operator_id=self._worker_id or "security:policy",
+                    expected_generation=self._generation,
+                )
+                await self._session.commit()
+                return Result(
+                    status="failed",
+                    error=f"Approval required: {decision.reason}",
+                )
+
+            if decision.policy_id:
+                await emit_task_event(
+                    self._session,
+                    task_id=task.id,
+                    event_type="policy.allowed",
+                    actor_id=self._worker_id or "security:policy",
+                    payload={
+                        "policy_id": decision.policy_id,
+                        "rule_id": decision.rule_id,
+                        "action": action,
+                        "resource": resource,
+                    },
+                )
+                await self._session.commit()
+
+        # Resolve secret references in task input
+        resolved_input = self._secrets_manager.resolve_references(context.task.input)
+        adapter_task_input = dataclasses.replace(context.task, input=resolved_input)
+        adapter_context = dataclasses.replace(context, task=adapter_task_input)
+
         checkpoint_state = await checkpoint_load(self._session, task.checkpoint_ref)
 
         stop_heartbeat = asyncio.Event()
@@ -213,7 +307,7 @@ class WorkerExecutionKernel:
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
         try:
             adapter_task = asyncio.create_task(
-                self._adapter.execute(context=context, checkpoint=checkpoint_state)
+                self._adapter.execute(context=adapter_context, checkpoint=checkpoint_state)
             )
             done, pending = await asyncio.wait(
                 [adapter_task, heartbeat_task],
@@ -228,6 +322,14 @@ class WorkerExecutionKernel:
                     raise exc
             # Otherwise adapter_task finished
             result = await adapter_task
+            if result.output:
+                result = dataclasses.replace(
+                    result, output=self._secrets_manager.redact(result.output)
+                )
+            if result.error:
+                result = dataclasses.replace(
+                    result, error=self._secrets_manager.redact(result.error)
+                )
         except StaleWorkerError:
             raise
         except Exception as e:
@@ -449,8 +551,14 @@ class WorkerExecutionKernel:
             await self._session.rollback()
             raise
 
-    async def reclaim(self, task: Task) -> None:
-        """Atomic recovery reclaim per ADR 0016 / spec."""
+    async def reclaim(self, task: Task, *, resume_from_checkpoint: bool = False) -> None:
+        """Atomic recovery reclaim per ADR 0016 / ADR 0021.
+
+        If resume_from_checkpoint=True, preserves existing checkpoint_ref and loads
+        durable checkpoint state to resume adapter execution.
+        If resume_from_checkpoint=False (ADR 0016 default), resets checkpoint_ref to NULL
+        and starts recovery execution with checkpoint=None.
+        """
         row = (
             await self._session.execute(select(TaskModel).where(TaskModel.id == task.id))
         ).scalar_one_or_none()
@@ -502,14 +610,26 @@ class WorkerExecutionKernel:
         ttl_seconds = int(self._lease_ttl.total_seconds())
         worker_id_val = self._worker_id or "recovery-worker"
 
+        if worker_id_val != "recovery-worker":
+            w_row = await self._session.get(WorkerModel, worker_id_val)
+            if w_row and w_row.status in ("quarantined", "retired"):
+                msg = (
+                    f"Worker {worker_id_val} is in status {w_row.status!r}; "
+                    "recovery reclaim rejected"
+                )
+                raise TaskStatusError(msg)
+
+        checkpoint_clause = "" if resume_from_checkpoint else "checkpoint_ref = NULL,"
+        node_clause = ", assigned_node = :node_id" if self._node_id else ""
         reclaim_sql = text(
             f"""
             UPDATE tasks
             SET status = 'in_progress',
-                assigned_worker = :worker_id,
+                assigned_worker = :worker_id
+                {node_clause},
                 lock_expires_at = NOW() + interval '{ttl_seconds} seconds',
                 generation = generation + 1,
-                checkpoint_ref = NULL,
+                {checkpoint_clause}
                 started_at = NOW(),
                 retry_count = retry_count + 1
             WHERE id = :task_id
@@ -518,35 +638,64 @@ class WorkerExecutionKernel:
               AND lock_expires_at < NOW()
               AND side_effect_classification = 'IDEMPOTENT'
               AND retry_count < max_retries
-            RETURNING id, generation
+            RETURNING id, generation, checkpoint_ref
             """
         )
-        res = await self._session.execute(
-            reclaim_sql,
-            {
-                "task_id": task.id,
-                "worker_id": worker_id_val,
-                "observed_gen": row.generation,
-            },
-        )
+        params: dict[str, Any] = {
+            "task_id": task.id,
+            "worker_id": worker_id_val,
+            "observed_gen": row.generation,
+        }
+        if self._node_id:
+            params["node_id"] = self._node_id
+
+        res = await self._session.execute(reclaim_sql, params)
         claimed_row = res.first()
         if claimed_row is None:
             raise TaskStatusError(f"Task {task.id} could not be reclaimed (raced or not eligible)")
 
-        self._generation = claimed_row.generation
+        self._generation = claimed_row[1]
         self._worker_id = worker_id_val
         await self._session.commit()
 
-        # Recovery execution starts from scratch with checkpoint=None
+        # Recovery execution
         if self._adapter is not None:
             context = None
             if self._resolve_context is not None:
                 context = await self._resolve_context(task)
-            adapter_res = await self._adapter.execute(context=context, checkpoint=None)
+
+            checkpoint_state = None
+            saved_ref = claimed_row[2] if resume_from_checkpoint else None
+            if saved_ref:
+                checkpoint_state = await checkpoint_load(self._session, saved_ref)
+
+            adapter_res = await self._adapter.execute(context=context, checkpoint=checkpoint_state)
             if adapter_res and adapter_res.output:
+                new_ref = saved_ref
+                if adapter_res.new_checkpoint is not None:
+                    new_ref = await checkpoint_write(
+                        self._session, task_id=task.id, state=adapter_res.new_checkpoint
+                    )
+                    await emit_task_event(
+                        self._session,
+                        task_id=task.id,
+                        event_type="task.checkpointed",
+                        actor_id=self._worker_id or "recovery-worker",
+                        payload={"checkpoint_ref": new_ref},
+                    )
+
+                redacted_output = (
+                    self._secrets_manager.redact(adapter_res.output)
+                    if adapter_res.output and self._secrets_manager
+                    else adapter_res.output
+                )
+                vals: dict[str, Any] = {"result": redacted_output}
+                if new_ref != saved_ref:
+                    vals["checkpoint_ref"] = new_ref
+
                 await self._session.execute(
                     update(TaskModel)
                     .where(TaskModel.id == task.id, TaskModel.generation == self._generation)
-                    .values(result=adapter_res.output)
+                    .values(**vals)
                 )
                 await self._session.commit()

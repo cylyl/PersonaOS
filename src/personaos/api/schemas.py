@@ -222,6 +222,12 @@ class TaskApproveRequest(BaseModel):
     attestation: ClassificationAttestation | None = Field(
         None, description="Mandatory attestation if changing classification to IDEMPOTENT"
     )
+    resume_from_checkpoint: bool = Field(
+        True, description="Whether to resume task from existing checkpoint if available"
+    )
+    checkpoint_ref_override: str | None = Field(
+        None, description="Explicit checkpoint reference to resume from"
+    )
 
 
 class TaskResolveRequest(BaseModel):

@@ -159,7 +159,7 @@ class WorkerOrchestrator:
                     if row and row.status == "in_progress" and row.result is not None:
                         stale_reclaimed = dataclasses.replace(
                             stale,
-                            checkpoint_ref=None,
+                            checkpoint_ref=row.checkpoint_ref,
                             generation=self._kernel._generation,
                         )
                         await self._kernel.complete(

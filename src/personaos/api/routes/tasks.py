@@ -252,6 +252,8 @@ async def approve_task(
             reset_retries=req.reset_retries,
             max_retries=req.max_retries,
             attestation=req.attestation.model_dump() if req.attestation else None,
+            resume_from_checkpoint=req.resume_from_checkpoint,
+            checkpoint_ref_override=req.checkpoint_ref_override,
         )
         return updated
     except TaskNotFoundError as exc:

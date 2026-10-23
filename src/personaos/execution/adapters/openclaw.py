@@ -89,9 +89,15 @@ def _extract_chunk_text(update: dict[str, Any]) -> str:
 class _OpenClawProcessRunner:
     """Internal runner managing the lifecycle and JSON-RPC transport of an OpenClaw subprocess."""
 
-    def __init__(self, config: OpenClawConfig, context: WorkerExecutionContext) -> None:
+    def __init__(
+        self,
+        config: OpenClawConfig,
+        context: WorkerExecutionContext,
+        checkpoint: Any | None = None,
+    ) -> None:
         self.config = config
         self.context = context
+        self.checkpoint = checkpoint
         self.proc: asyncio.subprocess.Process | None = None
         self._pending_requests: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_id: int = 1
@@ -426,6 +432,16 @@ class _OpenClawProcessRunner:
                 ):
                     prompt_parts.append(str(self.context.task.input["instruction"]))
                 prompt_parts.append(f"Input: {json.dumps(self.context.task.input)}")
+
+            if self.checkpoint:
+                prompt_parts.append(
+                    "[RESUMPTION CONTEXT]\n"
+                    "This task is resuming from a prior execution checkpoint.\n"
+                    f"Saved checkpoint state: {json.dumps(self.checkpoint)}\n"
+                    "Do NOT re-execute already completed stages. "
+                    "Resume directly from the next pending stage."
+                )
+
             prompt_text = "\n\n".join(prompt_parts) if prompt_parts else self.context.task.title
 
             prompt_res = await asyncio.wait_for(
@@ -542,7 +558,7 @@ class OpenClawAdapter:
         checkpoint: Any | None = None,
     ) -> Result:
         """Execute task via OpenClaw ACP JSON-RPC over stdio."""
-        runner = _OpenClawProcessRunner(config=self._config, context=context)
+        runner = _OpenClawProcessRunner(config=self._config, context=context, checkpoint=checkpoint)
         return await runner.run()
 
 

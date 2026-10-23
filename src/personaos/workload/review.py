@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from personaos.db.models import Task as TaskModel
+from personaos.db.models import TaskCheckpoint
 from personaos.db.models import Worker as WorkerModel
 from personaos.domain.errors import (
     InvalidActionError,
@@ -42,6 +43,8 @@ class TaskReviewService:
         reset_retries: bool = True,
         max_retries: int | None = None,
         attestation: dict[str, Any] | None = None,
+        resume_from_checkpoint: bool = True,
+        checkpoint_ref_override: str | None = None,
     ) -> Task:
         """Approve and re-queue a task in 'review' status with generation fencing."""
         # 1. Fetch task under row-level lock
@@ -115,6 +118,27 @@ class TaskReviewService:
         prior_result = task_row.result
         prior_error = task_row.last_error
 
+        # Checkpoint handling per ADR 0021
+        target_checkpoint_ref: str | None = None
+        if checkpoint_ref_override is not None:
+            cp_exists = (
+                await self._session.execute(
+                    select(TaskCheckpoint.ref).where(
+                        TaskCheckpoint.ref == checkpoint_ref_override,
+                        TaskCheckpoint.task_id == task_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if cp_exists is None:
+                raise InvalidActionError(
+                    f"Checkpoint {checkpoint_ref_override!r} does not exist for task {task_id}"
+                )
+            target_checkpoint_ref = checkpoint_ref_override
+        elif resume_from_checkpoint:
+            target_checkpoint_ref = task_row.checkpoint_ref
+        else:
+            target_checkpoint_ref = None
+
         # 6. Apply atomic update
         task_row.status = "queued"
         task_row.generation = task_row.generation + 1
@@ -125,7 +149,7 @@ class TaskReviewService:
         if max_retries is not None:
             task_row.max_retries = max_retries
         task_row.lock_expires_at = None
-        task_row.checkpoint_ref = None  # Reset checkpoint for fresh run per ADR 0016
+        task_row.checkpoint_ref = target_checkpoint_ref
         task_row.exhaustion_reason = None
         task_row.result = None
         task_row.last_error = None
@@ -145,6 +169,7 @@ class TaskReviewService:
                 "attestation": attestation,
                 "prior_error": prior_error,
                 "prior_diagnostics": prior_result,
+                "resumed_from_checkpoint": target_checkpoint_ref,
             },
         )
         await self._session.flush()
