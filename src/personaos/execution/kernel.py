@@ -36,11 +36,12 @@ from sqlalchemy.sql import func
 
 from personaos.db.models import Task as TaskModel
 from personaos.db.models import Worker as WorkerModel
-from personaos.domain.errors import WorkerNotEligibleError
+from personaos.domain.errors import DependencyArtifactResolutionError, WorkerNotEligibleError
 from personaos.domain.task import Task
 from personaos.domain.worker import Worker, WorkerProfile
 from personaos.events.store import emit_task_event
 from personaos.execution.adapters.base import Adapter
+from personaos.execution.assembler import ExecutionContextAssembler
 from personaos.execution.checkpoint import load as checkpoint_load
 from personaos.execution.checkpoint import write as checkpoint_write
 from personaos.execution.context import WorkerExecutionContext
@@ -207,12 +208,24 @@ class WorkerExecutionKernel:
             await self._session.rollback()
             raise
 
+        # Enrich execution context with upstream results, resolved $dep references, and experience
+        assembler = ExecutionContextAssembler(self._session)
+        try:
+            context = await assembler.enrich(context)
+        except DependencyArtifactResolutionError as e:
+            result = Result(
+                status="failed",
+                error=f"Dependency artifact resolution failed: {e}",
+            )
+            await self.fail(task, result)
+            raise
+
         # Pre-execution security policy evaluation
         if self._enforce_policy:
             action = task.type or "task:execute"
-            resource = str(task.input.get("resource") or task.id)
+            resource = str(context.task.input.get("resource") or task.id)
             eval_context = {
-                "task": task,
+                "task": context.task,
                 "worker": context.worker,
                 "profile": context.profile,
                 "generation": self._generation,
@@ -663,6 +676,11 @@ class WorkerExecutionKernel:
             context = None
             if self._resolve_context is not None:
                 context = await self._resolve_context(task)
+                assembler = ExecutionContextAssembler(self._session)
+                context = await assembler.enrich(context)
+                resolved_input = self._secrets_manager.resolve_references(context.task.input)
+                adapter_task = dataclasses.replace(context.task, input=resolved_input)
+                context = dataclasses.replace(context, task=adapter_task)
 
             checkpoint_state = None
             saved_ref = claimed_row[2] if resume_from_checkpoint else None

@@ -11,7 +11,8 @@ live state from the context. Step 4 closes the loop on Step 3.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from personaos.domain.task import Task
 from personaos.domain.worker import Worker, WorkerProfile
@@ -33,3 +34,5 @@ class WorkerExecutionContext:
     worker: Worker
     profile: WorkerProfile
     task: Task
+    upstream_results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    recent_experience: list[dict[str, Any]] = field(default_factory=list)

@@ -38,3 +38,7 @@ class SecurityPolicyError(DomainError):
 
 class SecretNotFoundError(DomainError):
     """Raised when a referenced secret is not found in environment or secret store."""
+
+
+class DependencyArtifactResolutionError(DomainError):
+    """Raised when an upstream dependency output or input reference cannot be resolved."""

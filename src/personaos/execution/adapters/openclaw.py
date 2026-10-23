@@ -423,6 +423,63 @@ class _OpenClawProcessRunner:
             self._phase = "in_flight_prompt_accepted"
 
             prompt_parts: list[str] = []
+
+            # 1. [WORKER IDENTITY & PERSONA]
+            if self.context.worker or self.context.profile:
+                worker = self.context.worker
+                profile = self.context.profile
+                persona = profile.persona if profile else None
+
+                worker_id = worker.id if worker else "unknown"
+                worker_name = worker.name if worker else "Unknown Worker"
+                role = (
+                    profile.role
+                    if profile and profile.role
+                    else (worker.role if worker else "unknown")
+                )
+
+                identity_lines = [
+                    "[WORKER IDENTITY & PERSONA]",
+                    f"Worker ID: {worker_id} ({worker_name})",
+                    f"Role: {role}",
+                ]
+                if persona:
+                    autonomy = persona.autonomy or "medium"
+                    style = persona.style or "standard"
+                    comm = persona.communication or "concise"
+                    identity_lines.append(
+                        f"Autonomy: {autonomy} | Style: {style} | Communication: {comm}"
+                    )
+                    if persona.goals:
+                        identity_lines.append(f"Goals: {json.dumps(persona.goals)}")
+                    if persona.constraints:
+                        identity_lines.append(f"Constraints: {json.dumps(persona.constraints)}")
+                if profile and profile.instructions:
+                    identity_lines.append(f"Role Instructions: {profile.instructions}")
+                if profile and profile.skills:
+                    identity_lines.append(f"Skills: {json.dumps(profile.skills)}")
+
+                prompt_parts.append("\n".join(identity_lines))
+
+            # 2. [UPSTREAM DEPENDENCY ARTIFACTS]
+            if getattr(self.context, "upstream_results", None):
+                dep_artifacts_lines = [
+                    "[UPSTREAM DEPENDENCY ARTIFACTS]",
+                    "The following completed dependency task outputs are available:",
+                    json.dumps(self.context.upstream_results, indent=2),
+                ]
+                prompt_parts.append("\n".join(dep_artifacts_lines))
+
+            # 3. [RECENT WORKER EXPERIENCE]
+            if getattr(self.context, "recent_experience", None):
+                exp_lines = [
+                    "[RECENT WORKER EXPERIENCE]",
+                    "Recent completed tasks by this worker:",
+                    json.dumps(self.context.recent_experience, indent=2),
+                ]
+                prompt_parts.append("\n".join(exp_lines))
+
+            # 4. Task Objective and Input
             if self.context.task.objective:
                 prompt_parts.append(f"Objective: {self.context.task.objective}")
             if self.context.task.input:
@@ -433,6 +490,7 @@ class _OpenClawProcessRunner:
                     prompt_parts.append(str(self.context.task.input["instruction"]))
                 prompt_parts.append(f"Input: {json.dumps(self.context.task.input)}")
 
+            # 5. [RESUMPTION CONTEXT]
             if self.checkpoint:
                 prompt_parts.append(
                     "[RESUMPTION CONTEXT]\n"
