@@ -53,6 +53,10 @@ class WorkerRunner:
         self._session_factory = session_factory
         self._worker_id = worker_id
         self._node_id = node_id
+        if getattr(self._orchestrator, "_worker_id", None) is None:
+            self._orchestrator._worker_id = worker_id
+        if getattr(self._orchestrator, "_node_id", None) is None:
+            self._orchestrator._node_id = node_id
         self._heartbeat_interval = heartbeat_interval
         self._stop_requested = asyncio.Event()
         self._heartbeat_task: asyncio.Task[None] | None = None

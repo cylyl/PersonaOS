@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
@@ -34,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.sql import func
 
 from personaos.db.models import Task as TaskModel
+from personaos.db.models import Worker as WorkerModel
 from personaos.domain.task import Task
 from personaos.domain.worker import Worker, WorkerProfile
 from personaos.events.store import emit_task_event
@@ -68,6 +70,7 @@ class WorkerExecutionKernel:
         adapter: Adapter,
         resolve_context: ResolveContext | None = None,
         worker_id: str | None = None,
+        node_id: str | None = None,
         profiles_dir: Path | None = None,
         lease_ttl: timedelta = timedelta(minutes=15),
         session_factory: async_sessionmaker[AsyncSession] | None = None,
@@ -107,17 +110,33 @@ class WorkerExecutionKernel:
             self._resolve_context = _default_resolve
 
         self._worker_id = worker_id
+        self._node_id = node_id
         self._lease_ttl = lease_ttl
         self._heartbeat_interval = heartbeat_interval
         self._generation: int = 0
 
     async def execute(self, task: Task) -> Result:
         """Execute a task end-to-end. Returns the Result."""
-        context = await self._resolve_context(task)
+        effective_task = task
+        if not effective_task.assigned_worker and self._worker_id:
+            # Unassigned task claimed by worker: snapshot current profile version
+            worker_row = await self._session.get(WorkerModel, self._worker_id)
+            current_ver = (
+                worker_row.current_profile_version
+                if worker_row
+                else effective_task.profile_version
+            )
+            effective_task = dataclasses.replace(
+                effective_task,
+                assigned_worker=self._worker_id,
+                profile_version=current_ver,
+            )
+
+        context = await self._resolve_context(effective_task)
 
         # Atomic claim: queued -> in_progress
         ttl_seconds = int(self._lease_ttl.total_seconds())
-        update_vals = {
+        update_vals: dict[str, Any] = {
             "status": "in_progress",
             "started_at": func.now(),
             "generation": TaskModel.generation + 1,
@@ -125,17 +144,34 @@ class WorkerExecutionKernel:
         }
         if self._worker_id:
             update_vals["assigned_worker"] = self._worker_id
+        if self._node_id:
+            update_vals["assigned_node"] = self._node_id
+        if effective_task.profile_version != task.profile_version:
+            update_vals["profile_version"] = effective_task.profile_version
+
+        where_conditions = [TaskModel.id == task.id, TaskModel.status == "queued"]
+        if self._worker_id:
+            where_conditions.append(
+                (TaskModel.assigned_worker.is_(None))
+                | (TaskModel.assigned_worker == self._worker_id)
+            )
+        if self._node_id:
+            where_conditions.append(
+                (TaskModel.assigned_node.is_(None)) | (TaskModel.assigned_node == self._node_id)
+            )
 
         try:
             update_result = await self._session.execute(
                 update(TaskModel)
-                .where(TaskModel.id == task.id, TaskModel.status == "queued")
+                .where(*where_conditions)
                 .values(**update_vals)
                 .returning(TaskModel.generation, TaskModel.assigned_worker)
             )
             claimed = update_result.first()
             if claimed is None:
-                raise TaskStatusError(f"task {task.id} is not in 'queued' state (or doesn't exist)")
+                raise TaskStatusError(
+                    f"task {task.id} is not claimable (status != 'queued' or affinity mismatch)"
+                )
             self._generation = claimed[0]
             if not self._worker_id and claimed[1]:
                 self._worker_id = claimed[1]

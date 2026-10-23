@@ -48,6 +48,7 @@ from personaos.db.models import Task as TaskModel
 from personaos.execution.kernel import TaskStatusError, WorkerExecutionKernel
 from personaos.execution.result import Result
 from personaos.orchestrator.metrics import OrchestratorMetrics
+from personaos.workload.scheduler import WorkloadScheduler
 from personaos.workload.service import WorkloadService
 
 
@@ -69,6 +70,8 @@ class WorkerOrchestrator:
         session: AsyncSession,
         kernel: WorkerExecutionKernel,
         poll_interval: float = 0.1,
+        worker_id: str | None = None,
+        node_id: str | None = None,
     ) -> None:
         """Build the orchestrator.
 
@@ -82,10 +85,14 @@ class WorkerOrchestrator:
             poll_interval: Seconds to sleep when the queue is empty.
                 Default 0.1 (10 Hz). The default is bounded so a
                 misconfigured orchestrator can't spin a CPU.
+            worker_id: Optional worker identity for skill/capability scheduling.
+            node_id: Optional node identity for node-affinity scheduling.
         """
         self._session = session
         self._kernel = kernel
         self._poll_interval = poll_interval
+        self._worker_id = worker_id
+        self._node_id = node_id
         self._stop_requested = False
         self._running = False
         self._metrics = OrchestratorMetrics()
@@ -178,10 +185,23 @@ class WorkerOrchestrator:
                     self._metrics.claim_conflicts += 1
                     return False
 
-        # 2. Find one runnable candidate (delegates to WorkloadService).
-        #    Per ADR 0013: status='queued' AND dependencies satisfied.
+        # 2. Find one runnable candidate.
+        #    Per ADR 0019 (Step 16): if worker_id is available, delegate to
+        #    WorkloadScheduler matching skills, capabilities, affinity, node, and priority.
+        #    If worker_id is unset, fall back to WorkloadService.next_runnable().
         #    Read-only — kernel still owns the atomic claim.
-        task = await workload.next_runnable()
+        effective_worker_id = self._worker_id or getattr(self._kernel, "_worker_id", None)
+        effective_node_id = self._node_id or getattr(self._kernel, "_node_id", None)
+
+        if effective_worker_id:
+            scheduler = WorkloadScheduler(self._session)
+            task = await scheduler.find_candidate(
+                worker_id=effective_worker_id,
+                node_id=effective_node_id,
+            )
+        else:
+            task = await workload.next_runnable()
+
         if task is None:
             return False
 

@@ -31,6 +31,7 @@ from personaos.db.models import Worker as WorkerModel
 from personaos.domain.task import Task
 from personaos.events.store import emit_task_event
 from personaos.registry.profile import WorkerNotFoundError
+from personaos.workload.scheduler import WorkloadScheduler
 
 
 class WorkloadService:
@@ -46,7 +47,7 @@ class WorkloadService:
     async def enqueue(
         self,
         *,
-        worker_id: str,
+        worker_id: str | None = None,
         title: str,
         objective: str,
         input: dict[str, Any],  # noqa: A002
@@ -59,8 +60,9 @@ class WorkloadService:
         max_retries: int = 3,
         profile_version: int | None = None,
         side_effect_classification: str = "UNKNOWN",
+        assigned_node: str | None = None,
     ) -> Task:
-        """Enqueue a task; snapshot workers.current_profile_version atomically.
+        """Enqueue a task; snapshot workers.current_profile_version atomically if worker_id given.
 
         Uses SELECT ... FOR UPDATE on the worker row + INSERT in the same
         transaction. This guarantees:
@@ -76,20 +78,25 @@ class WorkloadService:
         # get_worker() read autobegins and doesn't commit. With explicit
         # begin() that pattern raises InvalidRequestError.
         try:
-            # 1. Lock the worker row + read current profile version
-            #    (autobegins if no transaction, continues if one is open)
-            result = await self._session.execute(
-                select(WorkerModel.current_profile_version)
-                .where(WorkerModel.id == worker_id)
-                .with_for_update()
-            )
-            worker_current_version = result.scalar_one_or_none()
-            if worker_current_version is None:
-                raise WorkerNotFoundError(f"worker {worker_id} not found")
+            if worker_id is not None:
+                # 1. Lock the worker row + read current profile version
+                #    (autobegins if no transaction, continues if one is open)
+                result = await self._session.execute(
+                    select(WorkerModel.current_profile_version)
+                    .where(WorkerModel.id == worker_id)
+                    .with_for_update()
+                )
+                worker_current_version = result.scalar_one_or_none()
+                if worker_current_version is None:
+                    raise WorkerNotFoundError(f"worker {worker_id} not found")
 
-            assigned_version = (
-                profile_version if profile_version is not None else worker_current_version
-            )
+                assigned_version = (
+                    profile_version if profile_version is not None else worker_current_version
+                )
+                actor_id = worker_id
+            else:
+                assigned_version = profile_version if profile_version is not None else 1
+                actor_id = "workload"
 
             # 2. INSERT task with the snapshotted version (same transaction)
             task_row = TaskModel(
@@ -98,6 +105,7 @@ class WorkloadService:
                 objective=objective,
                 input=input,
                 assigned_worker=worker_id,
+                assigned_node=assigned_node,
                 profile_version=assigned_version,
                 required_skills=list(required_skills or []),
                 required_capabilities=list(required_capabilities or []),
@@ -117,7 +125,7 @@ class WorkloadService:
                 self._session,
                 task_id=task_row.id,
                 event_type="task.created",
-                actor_id=worker_id,
+                actor_id=actor_id,
                 payload={"title": title, "profile_version": assigned_version},
             )
 
@@ -129,6 +137,19 @@ class WorkloadService:
             raise
 
         return Task.from_orm(task_row)
+
+    async def next_runnable_for_worker(
+        self,
+        worker_id: str,
+        node_id: str | None = None,
+    ) -> Task | None:
+        """Return the next runnable candidate matching worker skills, capabilities, and affinity.
+
+        Delegates candidate selection to WorkloadScheduler (ADR 0019).
+        Read-only; does not claim the task.
+        """
+        scheduler = WorkloadScheduler(self._session)
+        return await scheduler.find_candidate(worker_id=worker_id, node_id=node_id)
 
     async def next_runnable(self) -> Task | None:
         """Return the next runnable candidate (FIFO), or None.
