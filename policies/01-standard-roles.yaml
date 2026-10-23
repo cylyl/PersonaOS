@@ -1,0 +1,46 @@
+# Standard Roles Authorization Policy
+#
+# Adheres strictly to schemas/policy.yaml.
+# Baseline authorization for standard PersonaOS worker roles: devops, developer, qa, architect, security.
+
+id: standard-roles-policy
+name: Standard Roles Policy
+description: Default authorization rules for standard persona worker roles
+priority: 10
+default_effect: deny
+version: 1
+
+rules:
+  # 1. High-priority denial for destructive actions on production
+  - id: deny-production-destruction
+    description: Prohibit deletion or destruction of production resources
+    action: "*:destroy"
+    resource: "prod*"
+    effect: deny
+
+  # 2. Gate production deployments behind operator approval
+  - id: gate-production-deployment
+    description: Require operator approval before deploying to production
+    action: "task:deploy"
+    resource: "prod*"
+    effect: require_approval
+
+  - id: gate-production-deploy-env
+    description: Require operator approval for any task explicitly targeting production environment
+    action: "deploy*"
+    resource: "production*"
+    effect: require_approval
+
+  # 3. Allow standard task execution across all resources
+  - id: allow-task-execution
+    description: Allow standard task lifecycle execution for authorized roles
+    action: "task:*"
+    resource: "*"
+    effect: allow
+
+  # 4. Allow general untyped task execution
+  - id: allow-general-execution
+    description: Allow generic untyped execution
+    action: "*"
+    resource: "*"
+    effect: allow

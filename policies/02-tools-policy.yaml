@@ -1,0 +1,57 @@
+# Standard Tools Authorization Policy
+#
+# Adheres strictly to schemas/policy.yaml.
+# Fine-grained authorization for worker tool invocations.
+
+id: standard-tools-policy
+name: Standard Tools Policy
+description: Rules governing worker tool invocation and external integrations
+priority: 20
+default_effect: deny
+version: 1
+
+rules:
+  # 1. Explicitly deny destructive root tool actions on production
+  - id: deny-destructive-prod-rm
+    description: Never allow rm tools on production resources
+    action: "tool:rm"
+    resource: "prod*"
+    effect: deny
+
+  # 2. Gate high-risk tool actions behind operator approval
+  - id: gate-terraform-apply-prod
+    description: Require approval for terraform apply targeting production
+    action: "tool:terraform:apply"
+    resource: "prod*"
+    effect: require_approval
+
+  - id: gate-prod-kubectl-exec
+    description: Require approval for kubectl exec on production pods
+    action: "tool:kubectl:exec"
+    resource: "prod*"
+    effect: require_approval
+
+  # 3. Allow standard development and testing tools
+  - id: allow-git-tools
+    description: Allow git commands across all resources
+    action: "tool:git*"
+    resource: "*"
+    effect: allow
+
+  - id: allow-pytest-tools
+    description: Allow test execution tools
+    action: "tool:pytest*"
+    resource: "*"
+    effect: allow
+
+  - id: allow-read-tools
+    description: Allow inspection and read-only tools
+    action: "tool:*:read"
+    resource: "*"
+    effect: allow
+
+  - id: allow-general-staging-tools
+    description: Allow tool execution targeting staging environments
+    action: "tool:*"
+    resource: "staging*"
+    effect: allow

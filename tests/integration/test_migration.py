@@ -181,6 +181,25 @@ async def test_task_events_type_check_constraint(database_url):
                     "VALUES ('t1', 'task.requeued', 'system')"
                 )
             )
+            # Valid Step 17 / ADR 0020 types
+            await conn.execute(
+                text(
+                    "INSERT INTO task_events (task_id, type, actor_id) "
+                    "VALUES ('t1', 'policy.allowed', 'system')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO task_events (task_id, type, actor_id) "
+                    "VALUES ('t1', 'policy.denied', 'system')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO task_events (task_id, type, actor_id) "
+                    "VALUES ('t1', 'approval.requested', 'system')"
+                )
+            )
             # v0.2 type (worker.created) should be rejected
             with pytest.raises(Exception):
                 await conn.execute(

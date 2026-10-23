@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     # Worker
     worker_poll_interval_seconds: float = 2.0
     task_lease_ttl_seconds: int = 300
+    policies_dir: str | None = None
 
     # Logging
     log_level: str = "INFO"

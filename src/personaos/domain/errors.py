@@ -26,3 +26,15 @@ class InvalidActionError(DomainError):
 
 class WorkerNotEligibleError(DomainError):
     """Raised when a worker is not in an eligible state for task assignment."""
+
+
+class PermissionDeniedError(DomainError):
+    """Raised when an action or tool invocation is denied by security policy."""
+
+
+class SecurityPolicyError(DomainError):
+    """Raised when security policy evaluation encounters an invalid state or configuration."""
+
+
+class SecretNotFoundError(DomainError):
+    """Raised when a referenced secret is not found in environment or secret store."""

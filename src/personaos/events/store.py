@@ -1,9 +1,10 @@
 """Task event store — append-only event emission.
 
-Per ADR 0006: events are append-only. State tables remain source of truth.
+Per ADR 0006 & ADR 0020: events are append-only. State tables remain source of truth.
 
-v0.1 / ADR 0018 emits task event types (CHECK-constrained):
-  task.created, task.claimed, task.checkpointed, task.completed, task.failed, task.requeued
+Emits task event types (CHECK-constrained):
+  task.created, task.claimed, task.checkpointed, task.completed, task.failed,
+  task.requeued, policy.allowed, policy.denied, approval.requested
 
 The CHECK constraint on task_events.type enforces valid values at the
 DB level. This module enforces them at the Python level too (faster
@@ -26,6 +27,9 @@ _TASK_EVENT_TYPES = (
     "task.completed",
     "task.failed",
     "task.requeued",
+    "policy.allowed",
+    "policy.denied",
+    "approval.requested",
 )
 
 
@@ -37,12 +41,12 @@ async def emit_task_event(
     actor_id: str,
     payload: dict[str, Any] | None = None,
 ) -> None:
-    """Emit a task lifecycle event.
+    """Emit a task lifecycle or security event.
 
     The event row is INSERTed into task_events. The caller is responsible
     for the surrounding transaction (commit/rollback).
 
-    Raises ValueError if event_type is not one of the 5 v0.1 types.
+    Raises ValueError if event_type is not one of the allowed types.
     """
     if event_type not in _TASK_EVENT_TYPES:
         raise ValueError(f"event_type must be one of {_TASK_EVENT_TYPES}, got {event_type!r}")

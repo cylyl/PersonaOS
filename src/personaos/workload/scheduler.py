@@ -34,6 +34,12 @@ _CANDIDATE_SELECTION_SQL = text(
     WHERE t.status = 'queued'
       -- 1. Worker Affinity: unassigned OR pre-assigned to this worker
       AND (t.assigned_worker IS NULL OR t.assigned_worker = :worker_id)
+      -- 1b. Worker Eligibility: worker must exist and not be quarantined or retired
+      AND EXISTS (
+          SELECT 1 FROM workers w
+          WHERE w.id = :worker_id
+            AND w.status NOT IN ('quarantined', 'retired')
+      )
       -- 2. Node Affinity: unassigned OR pre-assigned to this node
       AND (
           CAST(:node_id AS text) IS NULL
