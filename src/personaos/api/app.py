@@ -8,6 +8,8 @@ Mounts routes from api/routes/:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -30,6 +32,7 @@ from personaos.config import settings
 from personaos.db.session import make_engine, make_session_factory
 from personaos.execution.kernel import StaleWorkerError, TaskStatusError
 from personaos.logging import configure_logging
+from personaos.orchestrator.supervisor import NodeSupervisor
 from personaos.registry.profile import (
     ProfileVersionExistsError,
     ProfileVersionNotFoundError,
@@ -58,10 +61,45 @@ def create_app(
             host=settings.api_host,
             port=settings.api_port,
         )
-        yield
-        if owns_engine and engine is not None:
-            logger.info("disposing_database_engine")
-            await engine.dispose()
+        supervisor_task: asyncio.Task[None] | None = None
+        supervisor_stop_event: asyncio.Event | None = None
+
+        if settings.enable_node_supervision:
+            supervisor = NodeSupervisor(
+                session_factory=session_factory,
+                default_heartbeat_timeout_seconds=settings.node_heartbeat_timeout_seconds,
+            )
+            supervisor_stop_event = asyncio.Event()
+            app.state.supervisor = supervisor
+            app.state.supervisor_stop_event = supervisor_stop_event
+            supervisor_task = asyncio.create_task(
+                supervisor.run_loop(
+                    interval_seconds=settings.node_supervision_interval_seconds,
+                    heartbeat_timeout_seconds=settings.node_heartbeat_timeout_seconds,
+                    stop_event=supervisor_stop_event,
+                )
+            )
+            app.state.supervisor_task = supervisor_task
+            logger.info(
+                "node_supervisor_daemon_started",
+                interval=settings.node_supervision_interval_seconds,
+                timeout=settings.node_heartbeat_timeout_seconds,
+            )
+
+        try:
+            yield
+        finally:
+            if supervisor_stop_event is not None and supervisor_task is not None:
+                logger.info("stopping_node_supervisor_daemon")
+                supervisor_stop_event.set()
+                supervisor_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await supervisor_task
+                logger.info("node_supervisor_daemon_stopped")
+
+            if owns_engine and engine is not None:
+                logger.info("disposing_database_engine")
+                await engine.dispose()
 
     app = FastAPI(
         title="PersonaOS Control Plane",

@@ -18,6 +18,7 @@ from personaos.db.models import Task as TaskModel
 from personaos.domain.errors import DependencyArtifactResolutionError
 from personaos.domain.task import Task
 from personaos.execution.context import WorkerExecutionContext
+from personaos.memory.service import MemoryService
 from personaos.registry.profile import ProfileRegistry
 
 _EXACT_DEP_REF = re.compile(r"^\$dep:([a-zA-Z0-9_\-]+)(?:\.([a-zA-Z0-9_\.\-]+))?$")
@@ -31,9 +32,11 @@ class ExecutionContextAssembler:
         self,
         session: AsyncSession,
         registry: ProfileRegistry | None = None,
+        memory_service: MemoryService | None = None,
     ) -> None:
         self._session = session
         self._registry = registry
+        self._memory_service = memory_service
 
     async def enrich(
         self,
@@ -96,12 +99,29 @@ class ExecutionContextAssembler:
                     }
                 )
 
+        # 4. Gather scoped memory across 5 scopes
+        memory = dict(context.memory)
+        if not memory and self._memory_service is not None and context.worker.id:
+            project_id = None
+            if isinstance(effective_task.input, dict):
+                p_val = effective_task.input.get("project_id")
+                project_id = str(p_val) if p_val is not None else None
+            query = effective_task.objective or effective_task.title
+            memory = await self._memory_service.recall_five_scopes(
+                worker_id=context.worker.id,
+                persona_id=context.worker.role,
+                project_id=project_id,
+                task_id=effective_task.id,
+                query=query,
+            )
+
         return WorkerExecutionContext(
             worker=context.worker,
             profile=context.profile,
             task=effective_task,
             upstream_results=upstream_results,
             recent_experience=recent_experience,
+            memory=memory,
         )
 
     async def assemble(

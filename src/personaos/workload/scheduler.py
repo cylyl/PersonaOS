@@ -40,6 +40,17 @@ _CANDIDATE_SELECTION_SQL = text(
           WHERE w.id = :worker_id
             AND w.status NOT IN ('quarantined', 'retired')
       )
+      -- 1c. Worker Capacity Gate: active in_progress tasks < worker.max_concurrent_tasks
+      AND (
+          SELECT COUNT(*)
+          FROM tasks active_t
+          WHERE active_t.assigned_worker = :worker_id
+            AND active_t.status = 'in_progress'
+      ) < (
+          SELECT COALESCE(w.max_concurrent_tasks, 1)
+          FROM workers w
+          WHERE w.id = :worker_id
+      )
       -- 2. Node Affinity: unassigned OR pre-assigned to this node
       AND (
           CAST(:node_id AS text) IS NULL

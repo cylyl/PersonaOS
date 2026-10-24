@@ -48,6 +48,7 @@ class WorkerRunner:
         worker_id: str,
         node_id: str = "node-default",
         heartbeat_interval: float = 30.0,
+        drain_timeout: float = 30.0,
     ) -> None:
         self._orchestrator = orchestrator
         self._session_factory = session_factory
@@ -57,7 +58,10 @@ class WorkerRunner:
             self._orchestrator._worker_id = worker_id
         if getattr(self._orchestrator, "_node_id", None) is None:
             self._orchestrator._node_id = node_id
+        if getattr(self._orchestrator, "_session_factory", None) is None:
+            self._orchestrator._session_factory = session_factory
         self._heartbeat_interval = heartbeat_interval
+        self._drain_timeout = drain_timeout
         self._stop_requested = asyncio.Event()
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._binding_id: str | None = None
@@ -67,6 +71,11 @@ class WorkerRunner:
     def is_running(self) -> bool:
         """True if runner is currently running."""
         return self._is_running
+
+    @property
+    def is_draining(self) -> bool:
+        """True if runner has received stop/drain request and is winding down."""
+        return self._stop_requested.is_set()
 
     @property
     def binding_id(self) -> str | None:
@@ -103,6 +112,7 @@ class WorkerRunner:
         self._binding_id = str(uuid.uuid4())
 
         async with self._session_factory() as session:
+            now = datetime.now(UTC)
             # Drain any prior active bindings for this worker left over from ungraceful termination
             await session.execute(
                 update(WorkerNode)
@@ -111,7 +121,7 @@ class WorkerRunner:
                     WorkerNode.unbound_at.is_(None),
                 )
                 .values(
-                    unbound_at=datetime.now(UTC),
+                    unbound_at=now,
                     reason="stale_binding_superseded",
                 )
             )
@@ -119,9 +129,14 @@ class WorkerRunner:
                 id=self._binding_id,
                 worker_id=self._worker_id,
                 node_id=self._node_id,
-                bound_at=datetime.now(UTC),
+                bound_at=now,
             )
             session.add(binding)
+            await session.execute(
+                update(WorkerModel)
+                .where(WorkerModel.id == self._worker_id)
+                .values(last_seen_at=now)
+            )
             await session.commit()
 
         logger.info(
@@ -156,22 +171,49 @@ class WorkerRunner:
                 )
 
     async def _shutdown(self) -> None:
-        """Cancel heartbeat task and unbind worker from node."""
+        """Drain in-flight tasks, cancel heartbeats, and unbind worker from node."""
+        # 1. If stopping/draining, wait up to drain_timeout for active concurrent tasks
+        active_tasks = getattr(self._orchestrator, "_active_tasks", None)
+        if active_tasks:
+            logger.info(
+                "worker_runner_draining_active_tasks",
+                count=len(active_tasks),
+                drain_timeout=self._drain_timeout,
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*list(active_tasks), return_exceptions=True),
+                    timeout=self._drain_timeout,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "worker_runner_drain_timeout_exceeded",
+                    timeout=self._drain_timeout,
+                    remaining_tasks=len(active_tasks),
+                )
+
+        # 2. Cancel heartbeat task and await cancellation
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat_task
 
+        # 3. Unbind worker node binding
+        unbind_reason = "graceful_drain" if self._stop_requested.is_set() else "runner_shutdown"
         if self._binding_id:
             try:
                 async with self._session_factory() as session:
                     await session.execute(
                         update(WorkerNode)
                         .where(WorkerNode.id == self._binding_id)
-                        .values(unbound_at=datetime.now(UTC), reason="runner_shutdown")
+                        .values(unbound_at=datetime.now(UTC), reason=unbind_reason)
                     )
                     await session.commit()
-                logger.info("worker_node_unbound", binding_id=self._binding_id)
+                logger.info(
+                    "worker_node_unbound",
+                    binding_id=self._binding_id,
+                    reason=unbind_reason,
+                )
             except Exception as exc:
                 logger.error("worker_node_drain_failed", error=str(exc))
 

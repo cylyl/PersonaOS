@@ -20,3 +20,19 @@ Static invariants (enforced by tests/integration/test_worker_orchestrator.py):
      ``rebalance``) in worker.py — deferred to v0.2 per ADR 0008 future
      evolution.
 """
+
+from personaos.orchestrator.metrics import OrchestratorMetrics
+from personaos.orchestrator.supervisor import (
+    DeadNodeInfo,
+    NodeSupervisor,
+    SupervisionCycleResult,
+)
+from personaos.orchestrator.worker import WorkerOrchestrator
+
+__all__ = [
+    "DeadNodeInfo",
+    "NodeSupervisor",
+    "OrchestratorMetrics",
+    "SupervisionCycleResult",
+    "WorkerOrchestrator",
+]

@@ -46,6 +46,7 @@ from personaos.execution.checkpoint import load as checkpoint_load
 from personaos.execution.checkpoint import write as checkpoint_write
 from personaos.execution.context import WorkerExecutionContext
 from personaos.execution.result import Result
+from personaos.memory.service import MemoryService
 from personaos.registry.profile import ProfileRegistry
 from personaos.security.approval import request_approval
 from personaos.security.policy import PolicyEngine, get_default_policy_engine
@@ -85,6 +86,7 @@ class WorkerExecutionKernel:
         tool_policy: ToolPolicy | None = None,
         secrets_manager: SecretsManager | None = None,
         enforce_policy: bool = True,
+        memory_service: MemoryService | None = None,
     ) -> None:
         self._session = session
         self._session_factory = session_factory
@@ -97,6 +99,7 @@ class WorkerExecutionKernel:
         self._tool_policy = tool_policy or ToolPolicy(engine=self._policy_engine)
         self._secrets_manager = secrets_manager or get_default_secrets_manager()
         self._enforce_policy = enforce_policy
+        self._memory_service = memory_service
         if resolve_context is not None:
             self._resolve_context = resolve_context
         elif profiles_dir is not None:
@@ -209,7 +212,7 @@ class WorkerExecutionKernel:
             raise
 
         # Enrich execution context with upstream results, resolved $dep references, and experience
-        assembler = ExecutionContextAssembler(self._session)
+        assembler = ExecutionContextAssembler(self._session, memory_service=self._memory_service)
         try:
             context = await assembler.enrich(context)
         except DependencyArtifactResolutionError as e:
@@ -676,7 +679,9 @@ class WorkerExecutionKernel:
             context = None
             if self._resolve_context is not None:
                 context = await self._resolve_context(task)
-                assembler = ExecutionContextAssembler(self._session)
+                assembler = ExecutionContextAssembler(
+                    self._session, memory_service=self._memory_service
+                )
                 context = await assembler.enrich(context)
                 resolved_input = self._secrets_manager.resolve_references(context.task.input)
                 adapter_task = dataclasses.replace(context.task, input=resolved_input)

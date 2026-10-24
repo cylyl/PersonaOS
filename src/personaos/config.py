@@ -42,5 +42,15 @@ class Settings(BaseSettings):
     # Runtime adapter (v0.1 ships OpenClaw only)
     runtime_adapter: str = "openclaw"
 
+    # Node Supervision
+    enable_node_supervision: bool = True
+    node_supervision_interval_seconds: float = 10.0
+    node_heartbeat_timeout_seconds: float = 60.0
+
+    # Memory Subsystem (Phase 2)
+    memory_adapter: str = "in_memory"
+    mem0_api_key: str | None = None
+    mem0_base_url: str = "https://api.mem0.ai/v1"
+
 
 settings = Settings()

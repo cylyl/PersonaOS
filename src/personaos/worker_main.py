@@ -63,6 +63,26 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=settings.runtime_adapter,
         help="Runtime adapter (openclaw, simulation)",
     )
+    parser.add_argument(
+        "--concurrency",
+        "--max-concurrency",
+        dest="concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent tasks (default: worker.max_concurrent_tasks)",
+    )
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=30.0,
+        help="Worker heartbeat interval in seconds (default: 30.0)",
+    )
+    parser.add_argument(
+        "--drain-timeout",
+        type=float,
+        default=30.0,
+        help="Graceful drain timeout in seconds when shutting down (default: 30.0)",
+    )
     return parser.parse_args(args)
 
 
@@ -74,6 +94,9 @@ async def async_main(args: argparse.Namespace) -> None:
         node_id=args.node_id,
         adapter=args.adapter,
         poll_interval=args.poll_interval,
+        concurrency=args.concurrency,
+        heartbeat_interval=args.heartbeat_interval,
+        drain_timeout=args.drain_timeout,
     )
 
     engine = make_engine(settings.database_url)
@@ -87,17 +110,24 @@ async def async_main(args: argparse.Namespace) -> None:
             session=orchestrator_session,
             adapter=adapter,
             worker_id=args.worker_id,
+            node_id=args.node_id,
         )
         orchestrator = WorkerOrchestrator(
             session=orchestrator_session,
             kernel=kernel,
             poll_interval=args.poll_interval,
+            worker_id=args.worker_id,
+            node_id=args.node_id,
+            session_factory=session_factory,
+            max_concurrency=args.concurrency,
         )
         runner = WorkerRunner(
             orchestrator=orchestrator,
             session_factory=session_factory,
             worker_id=args.worker_id,
             node_id=args.node_id,
+            heartbeat_interval=args.heartbeat_interval,
+            drain_timeout=args.drain_timeout,
         )
 
         try:

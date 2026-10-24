@@ -39,17 +39,23 @@ Stop semantics:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 
+import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from personaos.db.models import Task as TaskModel
+from personaos.db.models import Worker as WorkerModel
+from personaos.domain.task import Task
 from personaos.execution.kernel import TaskStatusError, WorkerExecutionKernel
 from personaos.execution.result import Result
 from personaos.orchestrator.metrics import OrchestratorMetrics
 from personaos.workload.scheduler import WorkloadScheduler
 from personaos.workload.service import WorkloadService
+
+logger = structlog.get_logger(__name__)
 
 
 class WorkerOrchestrator:
@@ -72,6 +78,8 @@ class WorkerOrchestrator:
         poll_interval: float = 0.1,
         worker_id: str | None = None,
         node_id: str | None = None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
+        max_concurrency: int | None = None,
     ) -> None:
         """Build the orchestrator.
 
@@ -87,37 +95,157 @@ class WorkerOrchestrator:
                 misconfigured orchestrator can't spin a CPU.
             worker_id: Optional worker identity for skill/capability scheduling.
             node_id: Optional node identity for node-affinity scheduling.
+            session_factory: Optional session factory for isolated concurrent executions.
+            max_concurrency: Max concurrent tasks (defaults to worker.max_concurrent_tasks).
         """
         self._session = session
         self._kernel = kernel
         self._poll_interval = poll_interval
         self._worker_id = worker_id
         self._node_id = node_id
+        self._session_factory = session_factory
+        self._max_concurrency = max_concurrency
         self._stop_requested = False
         self._running = False
         self._metrics = OrchestratorMetrics()
+        self._active_tasks: set[asyncio.Task[None]] = set()
+        self._in_flight_task_ids: set[str] = set()
+
+    def _prune_active_tasks(self) -> None:
+        """Discard completed tasks from active task set."""
+        self._active_tasks = {t for t in self._active_tasks if not t.done()}
+
+    async def _resolve_max_concurrency(self) -> int:
+        """Determine maximum concurrent tasks for this worker."""
+        if self._max_concurrency is not None and self._max_concurrency >= 1:
+            return self._max_concurrency
+        effective_worker_id = self._worker_id or getattr(self._kernel, "_worker_id", None)
+        if effective_worker_id:
+            worker_row = await self._session.get(WorkerModel, effective_worker_id)
+            if (
+                worker_row
+                and worker_row.max_concurrent_tasks
+                and worker_row.max_concurrent_tasks >= 1
+            ):
+                return worker_row.max_concurrent_tasks
+        return 1
 
     async def run(self) -> None:
         """Poll until ``stop()`` is called.
 
-        Tight loop when work exists, sleeps ``poll_interval`` when the
-        queue is empty. Returns when ``stop()`` has been called AND the
-        current iteration (process_one + optional sleep) completes.
-
-        Exceptions from ``kernel.execute()`` other than ``TaskStatusError``
-        propagate to the caller. ``TaskStatusError`` is the concurrency
-        boundary — caught inside ``process_one()`` and recorded as
-        ``claim_conflicts``, NOT as a failure.
+        Supports concurrent task execution up to worker capacity when session_factory is present.
+        Falls back to serial execution when max_concurrency == 1 or session_factory is unset.
         """
         self._running = True
         try:
-            while not self._stop_requested:
-                self._metrics.poll_iterations += 1
-                processed = await self.process_one()
-                if not processed and not self._stop_requested:
-                    await asyncio.sleep(self._poll_interval)
+            effective_concurrency = await self._resolve_max_concurrency()
+            if self._session_factory is None:
+                while not self._stop_requested:
+                    self._metrics.poll_iterations += 1
+                    processed = await self.process_one()
+                    if not processed and not self._stop_requested:
+                        await asyncio.sleep(self._poll_interval)
+            else:
+                while not self._stop_requested:
+                    self._prune_active_tasks()
+
+                    if len(self._active_tasks) >= effective_concurrency:
+                        await asyncio.wait(self._active_tasks, return_when=asyncio.FIRST_COMPLETED)
+                        self._prune_active_tasks()
+                        continue
+
+                    self._metrics.poll_iterations += 1
+                    dispatched = await self._dispatch_one_concurrent()
+                    if not dispatched and not self._stop_requested:
+                        if self._active_tasks:
+                            with contextlib.suppress(TimeoutError):
+                                await asyncio.wait(
+                                    self._active_tasks,
+                                    timeout=self._poll_interval,
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                            self._prune_active_tasks()
+                        else:
+                            await asyncio.sleep(self._poll_interval)
         finally:
+            if self._active_tasks:
+                await asyncio.gather(*self._active_tasks, return_exceptions=True)
+                self._active_tasks.clear()
+            self._in_flight_task_ids.clear()
             self._running = False
+
+    async def _dispatch_one_concurrent(self) -> bool:
+        """Finds candidate and launches concurrent execution with isolated session."""
+        assert self._session_factory is not None
+        effective_worker_id = self._worker_id or getattr(self._kernel, "_worker_id", None)
+        effective_node_id = self._node_id or getattr(self._kernel, "_node_id", None)
+
+        async with self._session_factory() as session:
+            workload = WorkloadService(session)
+            candidates: list[Task] = []
+            if effective_worker_id:
+                scheduler = WorkloadScheduler(session)
+                limit = max(5, len(self._in_flight_task_ids) + 2)
+                candidates = await scheduler.find_candidates(
+                    worker_id=effective_worker_id,
+                    node_id=effective_node_id,
+                    limit=limit,
+                )
+            else:
+                c = await workload.next_runnable()
+                if c:
+                    candidates = [c]
+
+            target_task: Task | None = None
+            for cand in candidates:
+                if cand.id not in self._in_flight_task_ids:
+                    target_task = cand
+                    break
+
+            if target_task is None:
+                return False
+
+            self._in_flight_task_ids.add(target_task.id)
+            task_handle = asyncio.create_task(
+                self._execute_concurrent_task(target_task, effective_worker_id, effective_node_id)
+            )
+            self._active_tasks.add(task_handle)
+            return True
+
+    async def _execute_concurrent_task(
+        self,
+        task: Task,
+        effective_worker_id: str | None,
+        effective_node_id: str | None,
+    ) -> None:
+        """Executes a single task in its own session and kernel."""
+        assert self._session_factory is not None
+        try:
+            async with self._session_factory() as session:
+                kernel = WorkerExecutionKernel(
+                    session=session,
+                    adapter=self._kernel._adapter,
+                    resolve_context=getattr(self._kernel, "_resolve_context", None),
+                    worker_id=effective_worker_id,
+                    node_id=effective_node_id,
+                    lease_ttl=self._kernel._lease_ttl,
+                    session_factory=self._session_factory,
+                    heartbeat_interval=self._kernel._heartbeat_interval,
+                    policy_engine=self._kernel._policy_engine,
+                    tool_policy=self._kernel._tool_policy,
+                    secrets_manager=self._kernel._secrets_manager,
+                    enforce_policy=self._kernel._enforce_policy,
+                    memory_service=getattr(self._kernel, "_memory_service", None),
+                )
+                try:
+                    await kernel.execute(task)
+                    self._metrics.tasks_processed += 1
+                except TaskStatusError:
+                    self._metrics.claim_conflicts += 1
+                except Exception as e:
+                    logger.error("concurrent_task_execution_error", task_id=task.id, error=str(e))
+        finally:
+            self._in_flight_task_ids.discard(task.id)
 
     async def process_one(self) -> bool:
         """One iteration: find + invoke + handle the concurrency boundary.

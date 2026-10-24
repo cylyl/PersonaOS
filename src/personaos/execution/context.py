@@ -36,3 +36,4 @@ class WorkerExecutionContext:
     task: Task
     upstream_results: dict[str, dict[str, Any]] = field(default_factory=dict)
     recent_experience: list[dict[str, Any]] = field(default_factory=list)
+    memory: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
