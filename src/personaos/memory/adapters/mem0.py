@@ -1,6 +1,6 @@
 """Mem0 REST API adapter for the MemoryAdapter protocol.
 
-Per ADR 0007 and ADR 0025:
+Per ADR 0007, ADR 0025, and ADR 0026:
 Provides seamless communication with Mem0 managed API or self-hosted Mem0 instance
 via HTTP REST endpoints without requiring third-party library runtime lock-in.
 """
@@ -16,7 +16,13 @@ import httpx
 import structlog
 
 from personaos.memory.protocol import MemoryAdapter
-from personaos.memory.scopes import Category, MemoryRef, Scope
+from personaos.memory.scopes import (
+    Category,
+    DecayPolicy,
+    MemoryProvenance,
+    MemoryRef,
+    Scope,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -99,6 +105,19 @@ class Mem0Adapter(MemoryAdapter):
         except ValueError:
             entry_cat = category
 
+        # Extract provenance, confidence, and decay from metadata with graceful defaults
+        prov_raw = meta.get("provenance")
+        prov = MemoryProvenance.from_dict(prov_raw if isinstance(prov_raw, dict) else None)
+
+        try:
+            raw_conf = float(meta.get("confidence", 1.0))
+            conf = max(0.0, min(1.0, raw_conf))
+        except (ValueError, TypeError):
+            conf = 1.0
+
+        decay_raw = meta.get("decay_policy")
+        decay = DecayPolicy.from_dict(decay_raw if isinstance(decay_raw, dict) else None)
+
         created_at_raw = item.get("created_at")
         created_at = datetime.now(UTC)
         if created_at_raw:
@@ -112,6 +131,9 @@ class Mem0Adapter(MemoryAdapter):
             category=entry_cat,
             content=content,
             metadata=meta,
+            provenance=prov,
+            confidence=conf,
+            decay_policy=decay,
             created_at=created_at,
         )
 
@@ -123,18 +145,38 @@ class Mem0Adapter(MemoryAdapter):
         category: Category,
         content: str,
         metadata: dict[str, Any] | None = None,
+        provenance: MemoryProvenance | dict[str, Any] | None = None,
+        confidence: float = 1.0,
+        decay_policy: DecayPolicy | dict[str, Any] | None = None,
     ) -> MemoryRef:
         """Store a new memory in Mem0."""
         client = self._get_client()
         scope_params = self._map_scope_params(scope, owner_id)
+
+        prov = (
+            provenance
+            if isinstance(provenance, MemoryProvenance)
+            else MemoryProvenance.from_dict(provenance)
+        )
+        decay = (
+            decay_policy
+            if isinstance(decay_policy, DecayPolicy)
+            else DecayPolicy.from_dict(decay_policy)
+        )
+
+        full_meta = {
+            **(metadata or {}),
+            "scope": scope.value,
+            "category": category.value,
+            "owner_id": owner_id,
+            "provenance": prov.to_dict(),
+            "confidence": confidence,
+            "decay_policy": decay.to_dict() if decay else None,
+        }
+
         payload: dict[str, Any] = {
             "messages": [{"role": "user", "content": content}],
-            "metadata": {
-                **(metadata or {}),
-                "scope": scope.value,
-                "category": category.value,
-                "owner_id": owner_id,
-            },
+            "metadata": full_meta,
             **scope_params,
         }
 
@@ -155,6 +197,9 @@ class Mem0Adapter(MemoryAdapter):
                 category=category,
                 content=content,
                 metadata=dict(metadata or {}),
+                provenance=prov,
+                confidence=confidence,
+                decay_policy=decay,
             )
         except httpx.HTTPError as exc:
             logger.warning("mem0_remember_failed", error=str(exc), scope=scope.value)
@@ -168,6 +213,7 @@ class Mem0Adapter(MemoryAdapter):
         query: str,
         category: Category | None = None,
         limit: int = 10,
+        min_confidence: float | None = None,
         at_time: datetime | None = None,
     ) -> list[MemoryRef]:
         """Search memories in Mem0."""
@@ -188,6 +234,12 @@ class Mem0Adapter(MemoryAdapter):
             refs = [self._parse_entry(item, scope, owner_id, default_cat) for item in items]
             if category is not None:
                 refs = [r for r in refs if r.category == category]
+            if min_confidence is not None:
+                refs = [r for r in refs if r.effective_confidence(at_time) >= min_confidence]
+            refs.sort(
+                key=lambda m: (m.effective_confidence(at_time), m.created_at),
+                reverse=True,
+            )
             return refs[:limit]
         except httpx.HTTPError as exc:
             logger.warning("mem0_recall_failed", error=str(exc), scope=scope.value)
@@ -199,12 +251,16 @@ class Mem0Adapter(MemoryAdapter):
         ref_id: str,
         content: str,
         metadata: dict[str, Any] | None = None,
+        confidence: float | None = None,
     ) -> MemoryRef:
         """Update an existing memory in Mem0."""
         client = self._get_client()
         payload: dict[str, Any] = {"text": content}
-        if metadata:
-            payload["metadata"] = metadata
+        meta_update = dict(metadata or {})
+        if confidence is not None:
+            meta_update["confidence"] = confidence
+        if meta_update:
+            payload["metadata"] = meta_update
 
         try:
             response = await client.put(f"/memories/{ref_id}/", json=payload)
@@ -238,6 +294,7 @@ class Mem0Adapter(MemoryAdapter):
         owner_id: str,
         category: Category | None = None,
         limit: int = 50,
+        min_confidence: float | None = None,
     ) -> list[MemoryRef]:
         """List memories matching scope and owner from Mem0."""
         client = self._get_client()
@@ -253,6 +310,12 @@ class Mem0Adapter(MemoryAdapter):
             refs = [self._parse_entry(item, scope, owner_id, default_cat) for item in items]
             if category is not None:
                 refs = [r for r in refs if r.category == category]
+            if min_confidence is not None:
+                refs = [r for r in refs if r.effective_confidence() >= min_confidence]
+            refs.sort(
+                key=lambda m: (m.effective_confidence(), m.created_at),
+                reverse=True,
+            )
             return refs[:limit]
         except httpx.HTTPError as exc:
             logger.warning("mem0_list_failed", error=str(exc), scope=scope.value)

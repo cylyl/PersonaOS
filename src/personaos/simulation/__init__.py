@@ -16,6 +16,13 @@ Static invariant: this package must NOT import or reference
 """
 
 from personaos.simulation.adapter import SimulationAdapter
+from personaos.simulation.calibration import (
+    CalibratedEstimate,
+    CalibrationProfile,
+    CalibrationSample,
+    EstimationCalibrationEngine,
+    EstimationMetrics,
+)
 from personaos.simulation.service import (
     ReplayResult,
     ReplayService,
@@ -24,13 +31,30 @@ from personaos.simulation.service import (
     SourceTaskNotFoundError,
     TaskNotFoundError,
 )
+from personaos.simulation.team_comparison import (
+    AssignmentScenario,
+    OptimizationGoal,
+    ScenarioEvaluation,
+    TeamComparisonReport,
+    TeamComparisonSimulator,
+)
 
 __all__ = [
+    "AssignmentScenario",
+    "CalibratedEstimate",
+    "CalibrationProfile",
+    "CalibrationSample",
+    "EstimationCalibrationEngine",
+    "EstimationMetrics",
+    "OptimizationGoal",
     "ReplayResult",
     "ReplayService",
+    "ScenarioEvaluation",
     "SimulationAdapter",
     "SimulationResult",
     "SimulationService",
     "SourceTaskNotFoundError",
     "TaskNotFoundError",
+    "TeamComparisonReport",
+    "TeamComparisonSimulator",
 ]

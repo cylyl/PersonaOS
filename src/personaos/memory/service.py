@@ -1,6 +1,6 @@
 """MemoryService facade — scope validation, isolation enforcement, and safe degradation.
 
-Per ADR 0007 and ADR 0025:
+Per ADR 0007, ADR 0025, and ADR 0026:
 Enforces per-worker memory privacy boundaries and provides safe degradation
 when external memory providers experience outages or latency spikes.
 """
@@ -14,7 +14,13 @@ from typing import Any
 import structlog
 
 from personaos.memory.protocol import MemoryAdapter
-from personaos.memory.scopes import Category, MemoryRef, Scope
+from personaos.memory.scopes import (
+    Category,
+    DecayPolicy,
+    MemoryProvenance,
+    MemoryRef,
+    Scope,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -31,9 +37,11 @@ class MemoryService:
         adapter: MemoryAdapter,
         *,
         default_limit_per_scope: int = 5,
+        default_min_confidence: float = 0.0,
     ) -> None:
         self._adapter = adapter
         self._default_limit_per_scope = default_limit_per_scope
+        self._default_min_confidence = default_min_confidence
 
     @property
     def adapter(self) -> MemoryAdapter:
@@ -61,6 +69,9 @@ class MemoryService:
         category: Category,
         content: str,
         metadata: dict[str, Any] | None = None,
+        provenance: MemoryProvenance | dict[str, Any] | None = None,
+        confidence: float = 1.0,
+        decay_policy: DecayPolicy | dict[str, Any] | None = None,
         caller_worker_id: str | None = None,
     ) -> MemoryRef | None:
         """Store a memory entry with isolation enforcement and safe degradation."""
@@ -72,6 +83,9 @@ class MemoryService:
                 category=category,
                 content=content,
                 metadata=metadata,
+                provenance=provenance,
+                confidence=confidence,
+                decay_policy=decay_policy,
             )
         except Exception as exc:
             logger.warning(
@@ -90,12 +104,16 @@ class MemoryService:
         query: str,
         category: Category | None = None,
         limit: int | None = None,
+        min_confidence: float | None = None,
         at_time: datetime | None = None,
         caller_worker_id: str | None = None,
     ) -> list[MemoryRef]:
         """Recall memories with isolation enforcement and safe fallback on errors."""
         self._verify_worker_isolation(scope, owner_id, caller_worker_id)
         effective_limit = limit if limit is not None else self._default_limit_per_scope
+        effective_min_conf = (
+            min_confidence if min_confidence is not None else self._default_min_confidence
+        )
         try:
             return await self._adapter.recall(
                 scope=scope,
@@ -103,6 +121,7 @@ class MemoryService:
                 query=query,
                 category=category,
                 limit=effective_limit,
+                min_confidence=effective_min_conf,
                 at_time=at_time,
             )
         except Exception as exc:
@@ -123,6 +142,8 @@ class MemoryService:
         task_id: str,
         query: str,
         limit_per_scope: int | None = None,
+        min_confidence: float | None = None,
+        at_time: datetime | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         """Query all five memory scopes concurrently and return structured memory dictionary.
 
@@ -134,6 +155,9 @@ class MemoryService:
         - knowledge: shared organizational knowledge
         """
         lim = limit_per_scope if limit_per_scope is not None else self._default_limit_per_scope
+        effective_min_conf = (
+            min_confidence if min_confidence is not None else self._default_min_confidence
+        )
         persona_owner = persona_id or "default"
         project_owner = project_id or "default"
 
@@ -143,6 +167,8 @@ class MemoryService:
                 owner_id=owner,
                 query=query,
                 limit=lim,
+                min_confidence=effective_min_conf,
+                at_time=at_time,
                 caller_worker_id=worker_id,
             )
             return scope.value, [r.to_dict() for r in refs]

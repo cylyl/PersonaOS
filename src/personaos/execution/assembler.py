@@ -103,9 +103,13 @@ class ExecutionContextAssembler:
         memory = dict(context.memory)
         if not memory and self._memory_service is not None and context.worker.id:
             project_id = None
+            min_conf = None
             if isinstance(effective_task.input, dict):
                 p_val = effective_task.input.get("project_id")
                 project_id = str(p_val) if p_val is not None else None
+                conf_val = effective_task.input.get("min_memory_confidence")
+                if conf_val is not None:
+                    min_conf = float(conf_val)
             query = effective_task.objective or effective_task.title
             memory = await self._memory_service.recall_five_scopes(
                 worker_id=context.worker.id,
@@ -113,6 +117,7 @@ class ExecutionContextAssembler:
                 project_id=project_id,
                 task_id=effective_task.id,
                 query=query,
+                min_confidence=min_conf,
             )
 
         return WorkerExecutionContext(

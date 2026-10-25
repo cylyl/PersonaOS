@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     memory_adapter: str = "in_memory"
     mem0_api_key: str | None = None
     mem0_base_url: str = "https://api.mem0.ai/v1"
+    memory_min_confidence: float = 0.0
 
 
 settings = Settings()

@@ -8,6 +8,7 @@ v0.1 surface:
   /events                       — read event log
 """
 
+from personaos.api.routes.dashboard import router as dashboard_router
 from personaos.api.routes.events import router as events_router
 from personaos.api.routes.health import router as health_router
 from personaos.api.routes.nodes import router as nodes_router
@@ -15,6 +16,7 @@ from personaos.api.routes.tasks import router as tasks_router
 from personaos.api.routes.workers import router as workers_router
 
 __all__ = [
+    "dashboard_router",
     "events_router",
     "health_router",
     "nodes_router",

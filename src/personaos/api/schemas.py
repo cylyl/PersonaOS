@@ -323,3 +323,61 @@ class EventResponse(BaseModel):
     actor_id: str
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
+
+
+class WorkerDashboardItem(BaseModel):
+    """Worker operational summary for dashboard."""
+
+    worker_id: str
+    name: str
+    role: str
+    status: str
+    current_profile_version: int
+    active_tasks_count: int = 0
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkerDashboardResponse(BaseModel):
+    """Workforce overview list."""
+
+    workers: list[WorkerDashboardItem]
+    total_workers: int
+
+
+class WorkloadDashboardResponse(BaseModel):
+    """Workload performance and queue metrics overview."""
+
+    total_tasks: int
+    completed_tasks: int
+    failed_tasks: int
+    queued_tasks: int
+    in_progress_tasks: int
+    review_tasks: int
+    avg_queue_wait_ms: float
+    avg_execution_ms: float
+    retry_rate: float
+    total_tokens: int
+    total_cost_usd: float
+    status_breakdown: dict[str, int] = Field(default_factory=dict)
+    priority_breakdown: dict[str, int] = Field(default_factory=dict)
+
+
+class TaskTelemetryResponse(BaseModel):
+    """Task execution telemetry metrics."""
+
+    task_id: str
+    worker_id: str | None = None
+    node_id: str | None = None
+    model_name: str | None = None
+    status: str
+    quality_score: float
+    queue_wait_ms: float
+    execution_duration_ms: float
+    total_latency_ms: float
+    retry_count: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cost_usd: float
+    recorded_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
