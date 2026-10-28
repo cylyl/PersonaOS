@@ -63,6 +63,7 @@ class WorkerRunner:
         self._heartbeat_interval = heartbeat_interval
         self._drain_timeout = drain_timeout
         self._stop_requested = asyncio.Event()
+        self._drained_active_tasks = False
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._binding_id: str | None = None
         self._is_running = False
@@ -92,6 +93,10 @@ class WorkerRunner:
             worker_id=self._worker_id,
             node_id=self._node_id,
         )
+        active_tasks = getattr(self._orchestrator, "_active_tasks", None)
+        in_flight = getattr(self._orchestrator, "_in_flight_task_ids", None)
+        if active_tasks or in_flight:
+            self._drained_active_tasks = True
         self._stop_requested.set()
         self._orchestrator.stop()
 
@@ -174,6 +179,9 @@ class WorkerRunner:
         """Drain in-flight tasks, cancel heartbeats, and unbind worker from node."""
         # 1. If stopping/draining, wait up to drain_timeout for active concurrent tasks
         active_tasks = getattr(self._orchestrator, "_active_tasks", None)
+        in_flight = getattr(self._orchestrator, "_in_flight_task_ids", None)
+        if active_tasks or in_flight:
+            self._drained_active_tasks = True
         if active_tasks:
             logger.info(
                 "worker_runner_draining_active_tasks",
@@ -199,7 +207,11 @@ class WorkerRunner:
                 await self._heartbeat_task
 
         # 3. Unbind worker node binding
-        unbind_reason = "graceful_drain" if self._stop_requested.is_set() else "runner_shutdown"
+        unbind_reason = (
+            "graceful_drain"
+            if (self._stop_requested.is_set() and self._drained_active_tasks)
+            else "runner_shutdown"
+        )
         if self._binding_id:
             try:
                 async with self._session_factory() as session:
