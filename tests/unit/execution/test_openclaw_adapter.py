@@ -65,7 +65,7 @@ def _make_context(
 
 # Mock OpenClaw stdio process script for unit/contract tests
 MOCK_OPENCLAW_SCRIPT = """
-import sys, json, time
+import os, sys, json, time
 
 for line in sys.stdin:
     line = line.strip()
@@ -80,6 +80,19 @@ for line in sys.stdin:
     req_id = req.get("id")
 
     if method == "initialize":
+        if os.environ.get("MOCK_BEHAVIOR") == "INIT_ERROR":
+            res = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32000,
+                    "message": "Protocol initialization rejected",
+                },
+            }
+            sys.stdout.write(json.dumps(res) + "\\n")
+            sys.stdout.flush()
+            continue
+
         res = {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -95,6 +108,19 @@ for line in sys.stdin:
         sys.stdout.flush()
 
     elif method == "session/new":
+        if os.environ.get("MOCK_BEHAVIOR") == "SESSION_ERROR":
+            res = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32001,
+                    "message": "Session creation rejected by agent",
+                },
+            }
+            sys.stdout.write(json.dumps(res) + "\\n")
+            sys.stdout.flush()
+            continue
+
         params = req.get("params", {})
         if "mcpServers" not in params:
             res = {
@@ -494,15 +520,76 @@ async def test_openclaw_adapter_interleaved_streaming_notifications(
 
 
 @pytest.mark.asyncio
+async def test_openclaw_adapter_handles_initialization_failure(
+    mock_openclaw_script: Path,
+) -> None:
+    """AC: Initialization failure returns failed Result and safely cleans up resources."""
+    config = OpenClawConfig(
+        command=(sys.executable, str(mock_openclaw_script)),
+        gateway_url="",
+        timeout_seconds=5.0,
+        env={"MOCK_BEHAVIOR": "INIT_ERROR"},
+    )
+    adapter = OpenClawAdapter(config=config)
+    context = _make_context()
+
+    result = await adapter.execute(context=context)
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "Initialize failed: Protocol initialization rejected" in result.error
+    assert result.output is None
+
+
+@pytest.mark.asyncio
+async def test_openclaw_adapter_handles_session_creation_failure(
+    mock_openclaw_script: Path,
+) -> None:
+    """AC: Session creation failure returns failed Result and safely cleans up resources."""
+    config = OpenClawConfig(
+        command=(sys.executable, str(mock_openclaw_script)),
+        gateway_url="",
+        timeout_seconds=5.0,
+        env={"MOCK_BEHAVIOR": "SESSION_ERROR"},
+    )
+    adapter = OpenClawAdapter(config=config)
+    context = _make_context()
+
+    result = await adapter.execute(context=context)
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "session/new failed: Session creation rejected by agent" in result.error
+    assert result.output is None
+
+
+@pytest.mark.asyncio
 async def test_openclaw_live_execution() -> None:
     """Step 14b Milestone 3: Live OpenClaw gateway validation on port 18789.
 
     Connects to the local running gateway, authenticates via temporary --token-file,
     executes a harmless disposable probe task, and asserts clean end-turn completion.
-    Skips if gateway is not currently listening.
+
+    To ensure routine unit tests remain deterministic and do not block on external
+    or busy local daemons, this test is gated by PERSONAOS_RUN_LIVE_OPENCLAW_TESTS=1.
+
+    Run deliberately with:
+        PERSONAOS_RUN_LIVE_OPENCLAW_TESTS=1 pytest \\
+            tests/unit/execution/test_openclaw_adapter.py -k test_openclaw_live_execution -v
     """
     import json
+    import os
     import socket
+
+    if os.environ.get("PERSONAOS_RUN_LIVE_OPENCLAW_TESTS", "").lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        pytest.skip(
+            "Live OpenClaw gateway test skipped (opt-in). "
+            "Set PERSONAOS_RUN_LIVE_OPENCLAW_TESTS=1 to run against a live gateway."
+        )
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.5)
@@ -516,17 +603,18 @@ async def test_openclaw_live_execution() -> None:
     try:
         conf_data = json.loads(conf_path.read_text(encoding="utf-8"))
         token = conf_data.get("gateway", {}).get("auth", {}).get("token")
-    except Exception:
-        pytest.skip("Could not read auth token from openclaw.json")
+    except Exception as exc:
+        pytest.skip(f"Could not read auth token from openclaw.json: {exc}")
 
     if not token:
         pytest.skip("No token present in openclaw.json")
 
+    timeout_sec = float(os.environ.get("PERSONAOS_LIVE_OPENCLAW_TIMEOUT", "30.0"))
     config = OpenClawConfig(
         command=("openclaw", "acp", "--session", "agent:devops:main"),
         gateway_url="ws://127.0.0.1:18789",
         token=token,
-        timeout_seconds=60.0,
+        timeout_seconds=timeout_sec,
     )
     adapter = OpenClawAdapter(config=config)
     context = _make_context()
@@ -534,7 +622,7 @@ async def test_openclaw_live_execution() -> None:
 
     result = await adapter.execute(context=context)
 
-    assert result.status == "completed"
+    assert result.status == "completed", f"Live OpenClaw execution failed: {result.error}"
     assert result.error is None
     assert result.output is not None
     assert "PONG" in result.output.get("text", "")
