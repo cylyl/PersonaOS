@@ -46,7 +46,7 @@ from personaos.execution.checkpoint import load as checkpoint_load
 from personaos.execution.checkpoint import write as checkpoint_write
 from personaos.execution.context import WorkerExecutionContext
 from personaos.execution.result import Result
-from personaos.memory.service import MemoryService
+from personaos.memory.service import MemoryService, get_default_memory_service
 from personaos.registry.profile import ProfileRegistry
 from personaos.security.approval import request_approval
 from personaos.security.policy import PolicyEngine, get_default_policy_engine
@@ -99,7 +99,7 @@ class WorkerExecutionKernel:
         self._tool_policy = tool_policy or ToolPolicy(engine=self._policy_engine)
         self._secrets_manager = secrets_manager or get_default_secrets_manager()
         self._enforce_policy = enforce_policy
-        self._memory_service = memory_service
+        self._memory_service = memory_service or get_default_memory_service()
         if resolve_context is not None:
             self._resolve_context = resolve_context
         elif profiles_dir is not None:

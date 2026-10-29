@@ -11,7 +11,13 @@ from personaos.memory.scopes import (
     MemoryRef,
     Scope,
 )
-from personaos.memory.service import MemoryAccessDeniedError, MemoryService
+from personaos.memory.service import (
+    MemoryAccessDeniedError,
+    MemoryConfigurationError,
+    MemoryService,
+    get_default_memory_adapter,
+    get_default_memory_service,
+)
 
 __all__ = [
     "Category",
@@ -21,9 +27,12 @@ __all__ = [
     "Mem0Adapter",
     "MemoryAccessDeniedError",
     "MemoryAdapter",
+    "MemoryConfigurationError",
     "MemoryProvenance",
     "MemoryProviderError",
     "MemoryRef",
     "MemoryService",
     "Scope",
+    "get_default_memory_adapter",
+    "get_default_memory_service",
 ]

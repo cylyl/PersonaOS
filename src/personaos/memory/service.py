@@ -29,6 +29,10 @@ class MemoryAccessDeniedError(PermissionError):
     """Raised when a worker attempts to access another worker's private memory scope."""
 
 
+class MemoryConfigurationError(ValueError):
+    """Raised when memory adapter configuration is invalid or missing required credentials."""
+
+
 class MemoryService:
     """Service facade managing memory operations and context assembly."""
 
@@ -198,3 +202,43 @@ class MemoryService:
                 logger.warning("scoped_memory_gather_error", error=str(item))
 
         return scoped_memory
+
+
+def get_default_memory_adapter() -> MemoryAdapter:
+    """Instantiate the configured MemoryAdapter based on application settings."""
+    from personaos.config import settings
+    from personaos.memory.adapters.in_memory import InMemoryMemoryAdapter
+    from personaos.memory.adapters.mem0 import Mem0Adapter
+
+    adapter_type = settings.memory_adapter.lower().strip()
+    if adapter_type in ("in_memory", "test"):
+        return InMemoryMemoryAdapter()
+
+    if adapter_type == "mem0":
+        if not settings.mem0_api_key and "api.mem0.ai" in settings.mem0_base_url:
+            msg = (
+                "PERSONAOS_MEM0_API_KEY is required when PERSONAOS_MEMORY_ADAPTER='mem0' "
+                "using public cloud endpoint (https://api.mem0.ai/v1)."
+            )
+            raise MemoryConfigurationError(msg)
+        return Mem0Adapter(
+            api_key=settings.mem0_api_key,
+            base_url=settings.mem0_base_url,
+        )
+
+    raise MemoryConfigurationError(
+        f"Unsupported memory adapter '{settings.memory_adapter}'. Must be 'in_memory' or 'mem0'."
+    )
+
+
+def get_default_memory_service(
+    adapter: MemoryAdapter | None = None,
+) -> MemoryService:
+    """Get the default MemoryService instance configured from settings."""
+    from personaos.config import settings
+
+    actual_adapter = adapter or get_default_memory_adapter()
+    return MemoryService(
+        adapter=actual_adapter,
+        default_min_confidence=settings.memory_min_confidence,
+    )
