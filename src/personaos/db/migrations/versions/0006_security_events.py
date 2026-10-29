@@ -34,6 +34,14 @@ def upgrade() -> None:
         "'policy.allowed', 'policy.denied', 'approval.requested')",
     )
 
+    # 3. Restore any previously downgraded security events
+    op.execute(
+        "UPDATE task_events "
+        "SET type = payload->>'original_type', "
+        "    payload = payload - 'original_type' "
+        "WHERE type = 'task.failed' AND payload->>'original_type' IN ('policy.allowed', 'policy.denied', 'approval.requested')"
+    )
+
 
 def downgrade() -> None:
     # 1. Preserve historical data: map security events -> task.failed with payload marker

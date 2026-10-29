@@ -527,7 +527,77 @@ async def test_migration_0005_upgrade_downgrade_data_preservation(database_url):
             assert row[1]["original_type"] == "task.requeued"
             assert row[1]["reason"] == "re-queued"
 
-        # Upgrade back to head (0005)
+        # Upgrade back to head (0006)
         await asyncio.to_thread(command.upgrade, cfg, "head")
+
+        # Verify historical data was fully restored back to task.requeued with original payload
+        async with engine.begin() as conn:
+            row_restored = (
+                await conn.execute(
+                    text("SELECT type, payload FROM task_events WHERE task_id = 't1'")
+                )
+            ).first()
+            assert row_restored is not None
+            assert row_restored[0] == "task.requeued"
+            assert "original_type" not in row_restored[1]
+            assert row_restored[1]["reason"] == "re-queued"
+    finally:
+        await engine.dispose()
+
+
+async def test_migration_0006_upgrade_downgrade_data_preservation(database_url):
+    """Migration 0006: security events roundtrip cleanly across downgrade to 0005 and upgrade."""
+    cfg = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("INSERT INTO workers (id, name, role) VALUES ('w2', 'W2', 'devops')")
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO tasks (id, title, objective, assigned_worker, input) "
+                    "VALUES ('t2', 'T2', 'O2', 'w2', '{}'::jsonb)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO task_events (task_id, type, actor_id, payload) "
+                    "VALUES ('t2', 'policy.denied', 'security:policy', "
+                    "'{\"rule_id\": \"r1\"}'::jsonb)"
+                )
+            )
+
+        # Downgrade to 0005
+        await asyncio.to_thread(command.downgrade, cfg, "0005")
+
+        # Verify preserved as task.failed with marker
+        async with engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT type, payload FROM task_events WHERE task_id = 't2'")
+                )
+            ).first()
+            assert row is not None
+            assert row[0] == "task.failed"
+            assert row[1]["original_type"] == "policy.denied"
+            assert row[1]["rule_id"] == "r1"
+
+        # Upgrade back to head
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+
+        # Verify fully restored back to policy.denied
+        async with engine.begin() as conn:
+            row_restored = (
+                await conn.execute(
+                    text("SELECT type, payload FROM task_events WHERE task_id = 't2'")
+                )
+            ).first()
+            assert row_restored is not None
+            assert row_restored[0] == "policy.denied"
+            assert "original_type" not in row_restored[1]
+            assert row_restored[1]["rule_id"] == "r1"
     finally:
         await engine.dispose()

@@ -33,6 +33,14 @@ def upgrade() -> None:
         "'task.completed', 'task.failed', 'task.requeued')",
     )
 
+    # 3. Restore any previously downgraded task.requeued events
+    op.execute(
+        "UPDATE task_events "
+        "SET type = 'task.requeued', "
+        "    payload = payload - 'original_type' "
+        "WHERE type = 'task.created' AND payload->>'original_type' = 'task.requeued'"
+    )
+
 
 def downgrade() -> None:
     # 1. Preserve historical data: map task.requeued -> task.created with payload marker
