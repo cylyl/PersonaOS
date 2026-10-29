@@ -27,6 +27,7 @@ from personaos.api.routes import (
     events_router,
     health_router,
     nodes_router,
+    protocol_ws_router,
     tasks_router,
     workers_router,
 )
@@ -51,10 +52,15 @@ def create_app(
 ) -> FastAPI:
     """Create and configure the FastAPI control plane application."""
     owns_engine = False
-    if session_factory is None or engine is None:
-        engine = make_engine(settings.database_url)
+    if engine is None:
+        factory_bind = getattr(session_factory, "kw", {}).get("bind")
+        if session_factory is not None and factory_bind is not None:
+            engine = factory_bind
+        else:
+            engine = make_engine(settings.database_url)
+            owns_engine = True
+    if session_factory is None:
         session_factory = make_session_factory(engine)
-        owns_engine = True
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -188,6 +194,7 @@ def create_app(
     app.include_router(events_router)
     app.include_router(dashboard_router)
     app.include_router(cluster_router)
+    app.include_router(protocol_ws_router)
 
     return app
 

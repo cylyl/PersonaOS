@@ -39,10 +39,17 @@ def postgres_container():
     """
     try:
         from testcontainers.community.postgres import PostgresContainer
+        from testcontainers.core.config import testcontainers_config
+
+        testcontainers_config.ryuk_disabled = True
+        testcontainers_config.max_tries = 300
     except ImportError as exc:
         pytest.skip(f"testcontainers[postgres] not installed: {exc}")
 
-    container = PostgresContainer("postgres:16-alpine")
+    container = PostgresContainer(
+        "postgres:16-alpine",
+        docker_client_kw={"timeout": 300},
+    ).with_command("postgres -c fsync=off -c synchronous_commit=off -c full_page_writes=off")
     container.start()
     yield container
     container.stop()
