@@ -87,6 +87,7 @@ class WorkerExecutionKernel:
         secrets_manager: SecretsManager | None = None,
         enforce_policy: bool = True,
         memory_service: MemoryService | None = None,
+        claimed_by_cp_id: str | None = None,
     ) -> None:
         self._session = session
         self._session_factory = session_factory
@@ -100,6 +101,7 @@ class WorkerExecutionKernel:
         self._secrets_manager = secrets_manager or get_default_secrets_manager()
         self._enforce_policy = enforce_policy
         self._memory_service = memory_service or get_default_memory_service()
+        self._claimed_by_cp_id = claimed_by_cp_id
         if resolve_context is not None:
             self._resolve_context = resolve_context
         elif profiles_dir is not None:
@@ -172,6 +174,8 @@ class WorkerExecutionKernel:
             update_vals["assigned_node"] = self._node_id
         if effective_task.profile_version != task.profile_version:
             update_vals["profile_version"] = effective_task.profile_version
+        if self._claimed_by_cp_id:
+            update_vals["claimed_by_cp_id"] = self._claimed_by_cp_id
 
         where_conditions = [TaskModel.id == task.id, TaskModel.status == "queued"]
         if self._worker_id:
@@ -637,12 +641,14 @@ class WorkerExecutionKernel:
 
         checkpoint_clause = "" if resume_from_checkpoint else "checkpoint_ref = NULL,"
         node_clause = ", assigned_node = :node_id" if self._node_id else ""
+        cp_clause = ", claimed_by_cp_id = :cp_id" if self._claimed_by_cp_id else ""
         reclaim_sql = text(
             f"""
             UPDATE tasks
             SET status = 'in_progress',
                 assigned_worker = :worker_id
-                {node_clause},
+                {node_clause}
+                {cp_clause},
                 lock_expires_at = NOW() + interval '{ttl_seconds} seconds',
                 generation = generation + 1,
                 {checkpoint_clause}
@@ -664,6 +670,8 @@ class WorkerExecutionKernel:
         }
         if self._node_id:
             params["node_id"] = self._node_id
+        if self._claimed_by_cp_id:
+            params["cp_id"] = self._claimed_by_cp_id
 
         res = await self._session.execute(reclaim_sql, params)
         claimed_row = res.first()

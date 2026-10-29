@@ -282,6 +282,90 @@ class WorkloadService:
             return True
         return False
 
+    async def claim_atomic(
+        self,
+        worker_id: str,
+        node_id: str | None = None,
+        cp_id: str | None = None,
+        lease_ttl_seconds: int = 30,
+    ) -> Task | None:
+        """Atomically claim the next runnable task using PostgreSQL FOR UPDATE SKIP LOCKED.
+
+        Per ADR 0033: Guarantees zero duplicate claims across concurrent control-plane instances.
+        """
+        sql = text(
+            """
+            WITH candidate AS (
+                SELECT t.id
+                FROM tasks t
+                WHERE t.status = 'queued'
+                  AND (t.assigned_worker IS NULL OR t.assigned_worker = :worker_id)
+                  AND (t.deadline IS NULL OR t.deadline > NOW())
+                  AND (
+                      t.dependencies IS NULL
+                      OR jsonb_array_length(t.dependencies) = 0
+                      OR NOT EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements_text(t.dependencies) AS dep_id
+                          LEFT JOIN tasks dep ON dep.id = dep_id
+                          WHERE dep.id IS NULL OR dep.status <> 'completed'
+                      )
+                  )
+                ORDER BY
+                    CASE t.priority
+                        WHEN 'critical' THEN 4
+                        WHEN 'high' THEN 3
+                        WHEN 'medium' THEN 2
+                        WHEN 'low' THEN 1
+                        ELSE 2
+                    END DESC,
+                    t.created_at ASC,
+                    t.id ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE tasks
+            SET status = 'in_progress',
+                assigned_worker = :worker_id,
+                assigned_node = COALESCE(:node_id, tasks.assigned_node),
+                claimed_by_cp_id = :cp_id,
+                lock_expires_at = NOW() + (:lease_ttl || ' seconds')::interval,
+                generation = tasks.generation + 1,
+                started_at = NOW()
+            FROM candidate
+            WHERE tasks.id = candidate.id
+            RETURNING tasks.id, tasks.title, tasks.objective, tasks.status,
+                      tasks.priority, tasks.type, tasks.required_skills,
+                      tasks.required_capabilities, tasks.assigned_worker, tasks.assigned_node,
+                      tasks.dependencies, tasks.input, tasks.checkpoint_ref, tasks.result,
+                      tasks.retry_count, tasks.max_retries, tasks.last_error,
+                      tasks.deadline, tasks.created_at, tasks.started_at, tasks.completed_at,
+                      tasks.profile_version, tasks.lock_expires_at, tasks.generation,
+                      tasks.side_effect_classification, tasks.exhaustion_reason,
+                      tasks.claimed_by_cp_id
+            """
+        )
+        result = await self._session.execute(
+            sql,
+            {
+                "worker_id": worker_id,
+                "node_id": node_id,
+                "cp_id": cp_id,
+                "lease_ttl": str(lease_ttl_seconds),
+            },
+        )
+        row = result.first()
+        if row is None:
+            return None
+        await emit_task_event(
+            self._session,
+            task_id=row.id,
+            event_type="task.claimed",
+            actor_id=worker_id,
+        )
+        await self._session.commit()
+        return self._row_to_task(row)
+
     @staticmethod
     def _row_to_task(row: Any) -> Task:
         return Task(

@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from personaos.api.routes import (
+    cluster_router,
     dashboard_router,
     events_router,
     health_router,
@@ -186,6 +187,7 @@ def create_app(
     app.include_router(tasks_router)
     app.include_router(events_router)
     app.include_router(dashboard_router)
+    app.include_router(cluster_router)
 
     return app
 

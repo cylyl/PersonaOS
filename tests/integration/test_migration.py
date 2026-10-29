@@ -89,7 +89,6 @@ async def test_all_six_tables_exist(database_url):
     finally:
         await engine.dispose()
 
-
 # ---------- 3. CHECK constraints enforced ---------- #
 
 
@@ -113,7 +112,6 @@ async def test_workers_status_check_constraint(database_url):
                 )
     finally:
         await engine.dispose()
-
 
 async def test_tasks_status_and_priority_check_constraints(database_url):
     """tasks.status and tasks.priority CHECK constraints reject unknown values."""
@@ -148,7 +146,6 @@ async def test_tasks_status_and_priority_check_constraints(database_url):
                 )
     finally:
         await engine.dispose()
-
 
 async def test_task_events_type_check_constraint(database_url):
     """task_events.type CHECK constraint rejects v0.2 event types."""
@@ -211,7 +208,6 @@ async def test_task_events_type_check_constraint(database_url):
     finally:
         await engine.dispose()
 
-
 # ---------- 4. JSONB defaults work ---------- #
 
 
@@ -239,7 +235,6 @@ async def test_workers_jsonb_defaults(database_url):
             assert row[2] == {}
     finally:
         await engine.dispose()
-
 
 # ---------- 5. Foreign keys work ---------- #
 
@@ -283,7 +278,6 @@ async def test_tasks_assigned_worker_fk_set_null(database_url):
     finally:
         await engine.dispose()
 
-
 async def test_worker_skills_fk_cascade(database_url):
     """Deleting a worker CASCADEs worker_skills rows."""
     engine = create_async_engine(database_url)
@@ -316,7 +310,6 @@ async def test_worker_skills_fk_cascade(database_url):
             assert count == 0
     finally:
         await engine.dispose()
-
 
 # ---------- 6. Circular FK between tasks ↔ task_checkpoints ---------- #
 
@@ -365,7 +358,6 @@ async def test_tasks_to_task_checkpoints_fk_set_null(database_url):
     finally:
         await engine.dispose()
 
-
 async def test_task_checkpoints_to_tasks_fk_cascade(database_url):
     """Deleting a task CASCADEs its checkpoints."""
     engine = create_async_engine(database_url)
@@ -400,7 +392,6 @@ async def test_task_checkpoints_to_tasks_fk_cascade(database_url):
             assert count == 0
     finally:
         await engine.dispose()
-
 
 # ---------- 7. Indexes are present ---------- #
 
@@ -442,7 +433,6 @@ async def test_all_indexes_present(database_url):
     finally:
         await engine.dispose()
 
-
 # ---------- 8. Downgrade drops everything cleanly ---------- #
 
 
@@ -475,7 +465,6 @@ async def test_downgrade_drops_all_tables(database_url):
             await conn.run_sync(check)
     finally:
         await engine.dispose()
-
 
 def test_upgrade_after_downgrade_is_idempotent(database_url):
     """Up → down → up works (no stale state)."""
@@ -544,7 +533,6 @@ async def test_migration_0005_upgrade_downgrade_data_preservation(database_url):
     finally:
         await engine.dispose()
 
-
 async def test_migration_0006_upgrade_downgrade_data_preservation(database_url):
     """Migration 0006: security events roundtrip cleanly across downgrade to 0005 and upgrade."""
     cfg = _alembic_config(database_url)
@@ -599,5 +587,82 @@ async def test_migration_0006_upgrade_downgrade_data_preservation(database_url):
             assert row_restored[0] == "policy.denied"
             assert "original_type" not in row_restored[1]
             assert row_restored[1]["rule_id"] == "r1"
+    finally:
+        await engine.dispose()
+
+@pytest.mark.asyncio
+async def test_migration_0007_upgrade_downgrade(database_url):
+    """Test 0007 migration: control_plane_nodes table and tasks.claimed_by_cp_id roundtrip."""
+    cfg = _alembic_config(database_url)
+    await asyncio.to_thread(command.upgrade, cfg, "head")
+
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as conn:
+            # 1. Verify control_plane_nodes can be inserted into
+            await conn.execute(
+                text(
+                    "INSERT INTO control_plane_nodes "
+                    "(id, hostname, ip_address, port, api_endpoint, version, status, metadata) "
+                    "VALUES ('cp-node-1', 'host1.internal', '10.0.0.1', 8000, "
+                    "'https://host1.internal:8000', '0.2.0', 'active', '{\"rack\": \"r1\"}'::jsonb)"
+                )
+            )
+            # 2. Verify tasks.claimed_by_cp_id column
+            await conn.execute(
+                text("INSERT INTO workers (id, name, role) VALUES ('w3', 'W3', 'devops')")
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO tasks (id, title, objective, assigned_worker, claimed_by_cp_id, input) "
+                    "VALUES ('t3', 'T3', 'O3', 'w3', 'cp-node-1', '{}'::jsonb)"
+                )
+            )
+
+        # Query back
+        async with engine.begin() as conn:
+            cp_row = (
+                await conn.execute(
+                    text("SELECT hostname, status, metadata FROM control_plane_nodes WHERE id = 'cp-node-1'")
+                )
+            ).first()
+            assert cp_row is not None
+            assert cp_row[0] == "host1.internal"
+            assert cp_row[1] == "active"
+            assert cp_row[2]["rack"] == "r1"
+
+            task_row = (
+                await conn.execute(
+                    text("SELECT claimed_by_cp_id FROM tasks WHERE id = 't3'")
+                )
+            ).first()
+            assert task_row is not None
+            assert task_row[0] == "cp-node-1"
+
+        # Downgrade to 0006
+        await asyncio.to_thread(command.downgrade, cfg, "0006")
+
+        async with engine.connect() as conn:
+            def check_downgraded(sync_conn):
+                insp = inspect(sync_conn)
+                tables = set(insp.get_table_names())
+                assert "control_plane_nodes" not in tables
+                task_cols = {c["name"] for c in insp.get_columns("tasks")}
+                assert "claimed_by_cp_id" not in task_cols
+
+            await conn.run_sync(check_downgraded)
+
+        # Upgrade back to head
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+
+        async with engine.connect() as conn:
+            def check_upgraded(sync_conn):
+                insp = inspect(sync_conn)
+                tables = set(insp.get_table_names())
+                assert "control_plane_nodes" in tables
+                task_cols = {c["name"] for c in insp.get_columns("tasks")}
+                assert "claimed_by_cp_id" in task_cols
+
+            await conn.run_sync(check_upgraded)
     finally:
         await engine.dispose()

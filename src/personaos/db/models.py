@@ -204,6 +204,7 @@ class Task(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     profile_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    claimed_by_cp_id: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -235,6 +236,7 @@ class Task(Base):
             "created_at",
             postgresql_where=text("status = 'review'"),
         ),
+        Index("ix_tasks_claimed_by_cp_id", "claimed_by_cp_id"),
     )
 
 
@@ -296,4 +298,38 @@ class TaskEvent(Base):
             name="task_events_type_check",
         ),
         Index("ix_task_events_task_created", "task_id", "created_at"),
+    )
+
+
+class ControlPlaneNode(Base):
+    """Control-plane cluster instance registration and heartbeat tracking.
+
+    Per ADR 0033: Active-Active leaderless control-plane nodes.
+    """
+
+    __tablename__ = "control_plane_nodes"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    hostname: Mapped[str] = mapped_column(Text, nullable=False)
+    ip_address: Mapped[str] = mapped_column(Text, nullable=False)
+    port: Mapped[int] = mapped_column(Integer, nullable=False)
+    api_endpoint: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'active'"))
+    version: Mapped[str] = mapped_column(Text, nullable=False)
+    last_heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    node_metadata: Mapped[dict[str, Any]] = mapped_column(
+        "metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'draining', 'offline')",
+            name="control_plane_nodes_status_check",
+        ),
+        Index("ix_control_plane_nodes_status_heartbeat", "status", "last_heartbeat_at"),
     )
