@@ -296,31 +296,39 @@ async def test_healthy_slow_worker_is_not_reclaimed_prematurely(
         # Worker A claims: sets lock_expires_at to now + 15 min
         kernel = _build_kernel(s1, SlowAdapter(delay=60), persona)
         exec_task = asyncio.create_task(kernel.execute(task))
-        await asyncio.sleep(0.2)
 
-    # Within TTL window: not stale
-    async with session_factory() as s2:
-        # Verify lock_expires_at is in the future
-        row = await _task_row(s2, task_id)
+        # Await atomic claim transition into in_progress
+        row = None
+        for _ in range(40):
+            await asyncio.sleep(0.05)
+            async with session_factory() as s_poll:
+                row = await _task_row(s_poll, task_id)
+                if row.status == "in_progress" and row.lock_expires_at is not None:
+                    break
+
+        assert row is not None
+        assert row.status == "in_progress"
         assert row.lock_expires_at is not None
         assert row.lock_expires_at > datetime.now(timezone.utc)
 
-        stale = await s2.execute(
-            select(TaskModel.id).where(
-                TaskModel.status == "in_progress",
-                TaskModel.lock_expires_at < datetime.now(timezone.utc),
+        # Within TTL window: not stale
+        async with session_factory() as s2:
+            stale = await s2.execute(
+                select(TaskModel.id).where(
+                    TaskModel.status == "in_progress",
+                    TaskModel.lock_expires_at < datetime.now(timezone.utc),
+                )
             )
-        )
-        stale_ids = [row[0] for row in stale.fetchall()]
-        assert task_id not in stale_ids, (
-            "Healthy worker must not be reclaimed before lock_expires_at"
-        )
+            stale_ids = [r[0] for r in stale.fetchall()]
+            assert task_id not in stale_ids, (
+                "Healthy worker must not be reclaimed before lock_expires_at"
+            )
 
-    exec_task.cancel()
-    try:
-        await exec_task
-    except asyncio.CancelledError:
-        pass
+        exec_task.cancel()
+        try:
+            await exec_task
+        except asyncio.CancelledError:
+            pass
 
 
 # ---------- AC #3: stale worker cannot overwrite newer result (complete) ----------

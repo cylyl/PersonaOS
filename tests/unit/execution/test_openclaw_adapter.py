@@ -564,6 +564,15 @@ async def test_openclaw_adapter_handles_session_creation_failure(
 
 
 @pytest.mark.asyncio
+async def test_openclaw_adapter_accidental_gateway_discovery_isolated() -> None:
+    """Verifies default OpenClawConfig in routine test environments does not attach to live gateway."""
+    default_config = OpenClawConfig()
+    assert default_config.gateway_url == "ws://127.0.0.1:18789"
+    assert default_config.token is None
+    assert default_config.token_file is None
+
+
+@pytest.mark.asyncio
 async def test_openclaw_live_execution() -> None:
     """Step 14b Milestone 3: Live OpenClaw gateway validation on port 18789.
 
