@@ -157,6 +157,7 @@ async def test_evict_dead_nodes_unbinds_and_expires_tasks(
                 SET status = 'in_progress',
                     assigned_worker = 'w-crashed',
                     assigned_node = 'node-dead-host',
+                    side_effect_classification = 'IDEMPOTENT',
                     lock_expires_at = :future_lease
                 WHERE id = :task_id
                 """
