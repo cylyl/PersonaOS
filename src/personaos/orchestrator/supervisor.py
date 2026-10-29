@@ -36,8 +36,10 @@ class SupervisionCycleResult:
 
     dead_nodes_evicted: int = 0
     tasks_expired: int = 0
+    tasks_quarantined: int = 0
     evicted_bindings: list[DeadNodeInfo] = field(default_factory=list)
     expired_task_ids: list[str] = field(default_factory=list)
+    quarantined_task_ids: list[str] = field(default_factory=list)
 
 
 class NodeSupervisor:
@@ -145,6 +147,7 @@ class NodeSupervisor:
             past = now - timedelta(seconds=1)
             evicted: list[DeadNodeInfo] = []
             all_expired_task_ids: list[str] = []
+            all_quarantined_task_ids: list[str] = []
 
             for dead in dead_nodes:
                 # 1. Unbind worker_nodes record
@@ -160,13 +163,34 @@ class NodeSupervisor:
                     {"binding_id": dead.binding_id, "now": now, "reason": reason},
                 )
 
-                # 2. Fast-expire stranded in_progress tasks assigned to this node
+                # 2a. Quarantine stranded NON-IDEMPOTENT tasks assigned to this dead node
+                quarantine_tasks_sql = text(
+                    """
+                    UPDATE tasks
+                    SET status = 'review',
+                        exhaustion_reason = 'unhandled_runtime_error',
+                        lock_expires_at = NULL
+                    WHERE status = 'in_progress'
+                      AND assigned_node = :node_id
+                      AND side_effect_classification IN ('UNKNOWN', 'HAS_SIDE_EFFECTS')
+                    RETURNING id
+                    """
+                )
+                quarantine_res = await s.execute(
+                    quarantine_tasks_sql,
+                    {"node_id": dead.node_id},
+                )
+                quarantined_ids = [r[0] for r in quarantine_res.fetchall()]
+                all_quarantined_task_ids.extend(quarantined_ids)
+
+                # 2b. Fast-expire stranded IDEMPOTENT tasks assigned to this node
                 expire_tasks_sql = text(
                     """
                     UPDATE tasks
                     SET lock_expires_at = :past
                     WHERE status = 'in_progress'
                       AND assigned_node = :node_id
+                      AND side_effect_classification = 'IDEMPOTENT'
                       AND (lock_expires_at IS NULL OR lock_expires_at > :now)
                     RETURNING id
                     """
@@ -186,6 +210,8 @@ class NodeSupervisor:
                     node_id=dead.node_id,
                     tasks_expired_count=len(expired_ids),
                     expired_task_ids=expired_ids,
+                    tasks_quarantined_count=len(quarantined_ids),
+                    quarantined_task_ids=quarantined_ids,
                     reason=reason,
                 )
 
@@ -193,8 +219,10 @@ class NodeSupervisor:
             return SupervisionCycleResult(
                 dead_nodes_evicted=len(evicted),
                 tasks_expired=len(all_expired_task_ids),
+                tasks_quarantined=len(all_quarantined_task_ids),
                 evicted_bindings=evicted,
                 expired_task_ids=all_expired_task_ids,
+                quarantined_task_ids=all_quarantined_task_ids,
             )
 
         if session is not None:

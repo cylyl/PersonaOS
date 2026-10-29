@@ -64,6 +64,10 @@ class StaleWorkerError(Exception):
     """
 
 
+class StaleGenerationConflictError(StaleWorkerError):
+    """Raised when an operation is rejected due to a task generation fencing mismatch."""
+
+
 ResolveContext = Callable[[Task], Awaitable[WorkerExecutionContext]]
 
 
