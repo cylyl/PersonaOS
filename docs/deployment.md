@@ -65,6 +65,9 @@ flowchart TD
    - **PostgreSQL 16+**: High-availability cluster (Patroni / AWS RDS / GCP Cloud SQL) with connection pooling (PgBouncer).
    - **Control Plane Cluster**: 2+ stateless `personaos-api` instances behind a load balancer with WebSocket support, utilizing PostgreSQL transactional advisory locks (`advisory_xact_lock`) for singleton supervisory loops.
    - **Distributed Worker Fleet**: Heterogeneous remote worker machines running `personaos-worker-daemon` connecting over PMAEP (Persistent WebSocket with HMAC token validation and real-time checkpoint streaming).
+3. **Kubernetes / K3s GitOps Deployment (Homelab / Hybrid Cloud):**
+   - Runs directly on multi-node K3s clusters (such as `cyl-dc` on PVE2) using Longhorn distributed persistent storage, Traefik ingress with WebSocket forwarding, Jenkins CI/CD automation, and ArgoCD GitOps reconciliation.
+
 
 ---
 
@@ -485,11 +488,192 @@ if __name__ == "__main__":
 
 ---
 
-## 7. Database Migrations & Zero-Downtime Upgrades
+## 7. Method 4: K3s Cluster Deployment with Infra CI/CD & ArgoCD on PVE2 (`cyl-dc`)
+
+PersonaOS integrates seamlessly with existing Kubernetes infrastructure such as the dual-site K3s cluster managed in `cyl-dc`. In this architecture:
+- **Site 1 (PVE1):** Hosts cluster management and primary nodes (`k3s01`, `k3s02`).
+- **Site 2 (PVE2):** Hosts dedicated compute and execution nodes (`k3s03`, `k3s04`), labeled `site: site2`.
+- **Target Node Pinning:** All PersonaOS workloads (control plane, worker daemon, and database) use `nodeSelector: site: site2` to guarantee execution strictly on the PVE2 hypervisor.
+- **Storage Subsystem:** Backed by Longhorn distributed block storage (`storageClassName: longhorn`).
+- **Local Insecure Registry:** `192.168.1.239:5000/personaos` provides high-speed, local container image distribution.
+- **GitOps & CI/CD:** Continuous delivery is driven by Jenkins (`Jenkinsfile`) and reconciled declaratively by ArgoCD (`argoproj.io/v1alpha1 Application`).
+
+```mermaid
+flowchart TD
+    subgraph GitRepo["Git Repository & Jenkins CI"]
+        GIT["Git Commit\n(joseph118789-max/yabby)"]
+        JENK["Jenkins Pipeline\n(port 8084)"]
+        REG[("Local Registry\n192.168.1.239:5000")]
+        GIT -->|Webhook / Poll| JENK
+        JENK -->|docker build| JENK
+        JENK -->|docker push| REG
+    end
+
+    subgraph Cluster["K3s Cluster (cyl-dc)"]
+        subgraph PVE1["Site 1 / PVE1 (Cluster Control)"]
+            K1["k3s01 (Master)"]
+            ARGO["ArgoCD Controller"]
+        end
+
+        subgraph PVE2["Site 2 / PVE2 (PersonaOS Compute: site=site2)"]
+            subgraph K3s03["Node: k3s03"]
+                CP1["personaos-api Pod 1\n(port 8000)"]
+                W1["personaos-worker Pod 1"]
+                PG["PostgreSQL 16 StatefulSet"]
+            end
+            subgraph K3s04["Node: k3s04"]
+                CP2["personaos-api Pod 2\n(port 8000)"]
+                W2["personaos-worker Pod 2"]
+            end
+            LH[("Longhorn Distributed Storage\n(PVC: personaos-db-data)")]
+        end
+
+        TRF["Traefik Ingress Controller\n(HTTP & WebSocket Upgrade)"]
+    end
+
+    JENK -->|kubectl apply / rollout restart| K1
+    ARGO -->|Sync Manifests| PVE2
+    PG --> LH
+    TRF -->|/api/v1/cluster/ws (WebSocket)| CP1
+    TRF -->|/api/v1/cluster/ws (WebSocket)| CP2
+    TRF -->|/dashboard & REST| CP1
+    TRF -->|/dashboard & REST| CP2
+    CP1 --> PG
+    CP2 --> PG
+    W1 --> PG
+    W2 --> PG
+```
+
+### 7.1 Kubernetes Manifest Architecture (`deploy/k8s/`)
+
+The Kubernetes manifests are organized for modular management via Kustomize:
+
+| Manifest | Kind | Purpose |
+|---|---|---|
+| `00-namespace.yaml` | `Namespace` | Creates `personaos` namespace labeled `site: site2`. |
+| `01-secret.yaml` | `Secret` | Stores database credentials and HMAC `CLUSTER_SECRET_KEY`. |
+| `02-configmap.yaml` | `ConfigMap` | Runtime configuration (`API_PORT`, supervision, memory settings). |
+| `03-postgres-pvc.yaml` | `PersistentVolumeClaim` | 20Gi volume using `storageClassName: longhorn`. |
+| `04-postgres.yaml` | `StatefulSet` + `Service` | PostgreSQL 16 pinned to `site: site2` with healthcheck probes. |
+| `05-control-plane.yaml` | `Deployment` + `Service` | 2-replica `personaos-api` with Alembic migration `initContainer` and rolling updates. |
+| `06-worker.yaml` | `Deployment` | 2-replica `personaos-worker` using Downward API for pod identity. |
+| `07-ingress.yaml` | `Ingress` | Traefik ingress routing `/`, `/dashboard`, `/health`, and `/api/v1/cluster/ws`. |
+| `08-network-policy.yaml` | `NetworkPolicy` | Restricts database access strictly to pods in `personaos` namespace. |
+| `10-argocd-application.yaml` | `Application` (ArgoCD) | Declarative GitOps synchronization with auto-prune and self-healing. |
+| `kustomization.yaml` | `Kustomization` | Bundles resources and applies standard `app.kubernetes.io` metadata. |
+
+### 7.2 Infra CI/CD Pipeline (`Jenkinsfile`)
+
+The declarative Jenkins pipeline automates the full build, publish, and rollout lifecycle:
+
+```groovy
+pipeline {
+    agent any
+    environment {
+        REGISTRY = '192.168.1.239:5000'
+        IMAGE_NAME = 'personaos'
+        IMAGE_FULL = "${REGISTRY}/${IMAGE_NAME}"
+        K3S_MASTER = '192.168.1.150'
+    }
+    stages {
+        stage('Compute Image Tag') {
+            steps {
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+        stage('Build Docker Image') {
+            steps {
+                sh "docker build -t ${IMAGE_FULL}:${IMAGE_TAG} -t ${IMAGE_FULL}:latest -f Dockerfile ."
+            }
+        }
+        stage('Push Docker Image to Local Registry') {
+            steps {
+                sh "docker push ${IMAGE_FULL}:${IMAGE_TAG} && docker push ${IMAGE_FULL}:latest"
+            }
+        }
+        stage('Deploy to K3s Cluster (Site 2 / PVE2)') {
+            steps {
+                sh """
+                    ssh -o StrictHostKeyChecking=no user@${K3S_MASTER} "\
+                        sudo kubectl apply -f - << 'EOF'
+$(cat deploy/k8s/00-namespace.yaml)
+---
+$(cat deploy/k8s/01-secret.yaml)
+---
+$(cat deploy/k8s/02-configmap.yaml)
+---
+$(cat deploy/k8s/03-postgres-pvc.yaml)
+---
+$(cat deploy/k8s/04-postgres.yaml)
+---
+$(cat deploy/k8s/05-control-plane.yaml)
+---
+$(cat deploy/k8s/06-worker.yaml)
+---
+$(cat deploy/k8s/07-ingress.yaml)
+---
+$(cat deploy/k8s/08-network-policy.yaml)
+EOF
+                    "
+                    ssh -o StrictHostKeyChecking=no user@${K3S_MASTER} "\
+                        sudo kubectl rollout restart -n personaos deployment/personaos-api && \
+                        sudo kubectl rollout restart -n personaos deployment/personaos-worker"
+                """
+            }
+        }
+        stage('Trigger ArgoCD Sync') {
+            steps {
+                sh """
+                    ssh -o StrictHostKeyChecking=no user@${K3S_MASTER} "\
+                        sudo kubectl patch application -n argocd personaos --type merge \
+                        -p '{\\"metadata\\":{\\"annotations\\":{\\"argocd.argoproj.io/refresh\\":\\"hard\\"}}}' 2>/dev/null || true"
+                """
+            }
+        }
+        stage('Verify Deployment Health') {
+            steps {
+                sh """
+                    ssh -o StrictHostKeyChecking=no user@${K3S_MASTER} "\
+                        sudo kubectl rollout status -n personaos deployment/personaos-api --timeout=120s"
+                """
+            }
+        }
+    }
+}
+```
+
+### 7.3 Manual Deployment & Verification Commands
+
+To deploy or verify manually against the K3s cluster:
+
+```bash
+# 1. Validate manifests via client-side dry run
+kubectl apply -k deploy/k8s --dry-run=client
+
+# 2. Deploy all resources to the cluster
+kubectl apply -k deploy/k8s
+
+# 3. Register the ArgoCD Application (optional if using GitOps sync)
+kubectl apply -f deploy/k8s/10-argocd-application.yaml
+
+# 4. Verify pod placement on Site 2 (PVE2 nodes k3s03 / k3s04)
+kubectl get pods -n personaos -o wide
+
+# 5. Check API rollout status and health endpoint
+kubectl rollout status -n personaos deployment/personaos-api
+curl -s http://192.168.1.150/health | jq
+```
+
+---
+
+## 8. Database Migrations & Zero-Downtime Upgrades
 
 All database changes in PersonaOS are governed by Alembic. Historical migrations must remain lossless and backward-compatible.
 
-### 7.1 Applying Migrations
+### 8.1 Applying Migrations
 
 Before launching or upgrading control plane containers, execute Alembic migrations:
 
@@ -502,7 +686,7 @@ alembic current
 alembic history --verbose
 ```
 
-### 7.2 Zero-Downtime Rolling Update Strategy
+### 8.2 Zero-Downtime Rolling Update Strategy
 
 1. **Pre-Deployment:** Run non-destructive database migrations (e.g. adding nullable columns or new tables like `control_plane_nodes`). Existing running control plane instances will ignore unknown columns.
 2. **Rolling Replace API Nodes:** Incrementally update `personaos-api` instances behind the load balancer one node at a time. The health check (`GET /health`) guarantees readiness before traffic is routed.
@@ -516,9 +700,9 @@ alembic history --verbose
 
 ---
 
-## 8. Backup & Disaster Recovery
+## 9. Backup & Disaster Recovery
 
-### 8.1 PostgreSQL Backup Procedure
+### 9.1 PostgreSQL Backup Procedure
 
 State in PersonaOS is authoritative in PostgreSQL; `task_events` is an immutable append-only ledger that preserves full execution provenance.
 
@@ -541,7 +725,7 @@ PGPASSWORD="$POSTGRES_PASSWORD" pg_dump \
 find "$BACKUP_DIR" -type f -name "*.dump" -mtime +30 -delete
 ```
 
-### 8.2 Disaster Recovery & Database Restoration
+### 9.2 Disaster Recovery & Database Restoration
 
 ```bash
 # Restore to a clean database
@@ -558,9 +742,9 @@ alembic current
 
 ---
 
-## 9. Observability, Health Checks & Day-2 Operations
+## 10. Observability, Health Checks & Day-2 Operations
 
-### 9.1 Health Check Endpoints
+### 10.1 Health Check Endpoints
 
 | Endpoint | Method | Purpose | Response |
 |---|---|---|---|
@@ -570,7 +754,7 @@ alembic current
 | `/api/v1/telemetry/quality` | `GET` | Task quality scores | Aggregated benchmark quality |
 | `/api/v1/telemetry/cost` | `GET` | Token expenditure & pricing | Cost per model and task type |
 
-### 9.2 Operator Incident Response Playbook
+### 10.2 Operator Incident Response Playbook
 
 #### Incident 1: Worker Process Crashes Mid-Execution
 - **Behavior:** The task lease (`lock_expires_at`) lapses after `TASK_LEASE_TTL_SECONDS`.

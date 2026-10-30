@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: personaos-network-policy
+  namespace: personaos
+  labels:
+    app.kubernetes.io/name: personaos
+    site: site2
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow intra-namespace communication
+    - from:
+        - podSelector: {}
+    # Allow ingress traffic to Control Plane API from any namespace (e.g. Traefik ingress)
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    # Allow all egress (DNS, Database, External LLMs, Vector Stores)
+    - {}

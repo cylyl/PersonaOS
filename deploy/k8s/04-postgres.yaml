@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: personaos-db
+  namespace: personaos
+  labels:
+    app.kubernetes.io/name: personaos-db
+    app.kubernetes.io/component: database
+    site: site2
+spec:
+  serviceName: personaos-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: personaos-db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: personaos-db
+        app.kubernetes.io/component: database
+        site: site2
+    spec:
+      nodeSelector:
+        site: site2
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: personaos-secrets
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: personaos-secrets
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: personaos-secrets
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgresql
+              containerPort: 5432
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - exec pg_isready -U personaos -d personaos -h 127.0.0.1 -p 5432
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - exec pg_isready -U personaos -d personaos -h 127.0.0.1 -p 5432
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: personaos-db-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: personaos-db
+  namespace: personaos
+  labels:
+    app.kubernetes.io/name: personaos-db
+    app.kubernetes.io/component: database
+    site: site2
+spec:
+  type: ClusterIP
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: 5432
+  selector:
+    app.kubernetes.io/name: personaos-db
