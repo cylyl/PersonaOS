@@ -23,6 +23,7 @@ import structlog
 from personaos.config import settings
 from personaos.db.session import make_engine, make_session_factory
 from personaos.execution.adapters.base import Adapter
+from personaos.execution.adapters.litellm import LiteLLMAdapter, LiteLLMConfig
 from personaos.execution.adapters.openclaw import OpenClawAdapter
 from personaos.execution.adapters.simulation import SimulationAdapter
 from personaos.execution.kernel import WorkerExecutionKernel
@@ -61,7 +62,25 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         "--adapter",
         type=str,
         default=settings.runtime_adapter,
-        help="Runtime adapter (openclaw, simulation)",
+        help="Runtime adapter (openclaw, simulation, litellm)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=settings.litellm_model,
+        help=f"Model name for litellm adapter (default: {settings.litellm_model})",
+    )
+    parser.add_argument(
+        "--api-base",
+        type=str,
+        default=settings.litellm_api_base,
+        help=f"API base URL for litellm adapter (default: {settings.litellm_api_base})",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=settings.litellm_api_key,
+        help="API key for litellm adapter (default: from settings or env)",
     )
     parser.add_argument(
         "--concurrency",
@@ -103,7 +122,17 @@ async def async_main(args: argparse.Namespace) -> None:
     session_factory = make_session_factory(engine)
 
     # Initialize runtime adapter
-    adapter: Adapter = SimulationAdapter() if args.adapter == "simulation" else OpenClawAdapter()
+    adapter: Adapter
+    if args.adapter == "simulation":
+        adapter = SimulationAdapter()
+    elif args.adapter == "litellm":
+        adapter = LiteLLMAdapter(
+            api_base=args.api_base,
+            api_key=args.api_key,
+            model=args.model,
+        )
+    else:
+        adapter = OpenClawAdapter()
 
     async with session_factory() as orchestrator_session:
         kernel = WorkerExecutionKernel(

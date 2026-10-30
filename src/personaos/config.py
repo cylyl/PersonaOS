@@ -39,8 +39,13 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"
 
-    # Runtime adapter (v0.1 ships OpenClaw only)
+    # Runtime adapter (v0.1 ships OpenClaw, simulation, litellm)
     runtime_adapter: str = "openclaw"
+
+    # LiteLLM / LLM Adapter Settings
+    litellm_api_base: str = "http://localhost:4000/v1"
+    litellm_api_key: str = "sk-master-dev-key"
+    litellm_model: str = "qwen2.5-coder-14b"
 
     # Node Supervision
     enable_node_supervision: bool = True

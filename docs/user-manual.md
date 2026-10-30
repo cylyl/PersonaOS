@@ -110,9 +110,19 @@ flowchart TD
    - Health Probe: `http://localhost:8000/health`
 
 5. **Start a Worker Execution Process:**
-   In a separate terminal:
+   In a separate terminal, launch a worker runner with the desired adapter:
    ```bash
-   uv run personaos-worker --worker-id worker-developer-001 --node-id node-local-01
+   # Option A: Real LLM execution via project LiteLLM proxy (Default working model: qwen2.5-coder-14b)
+   uv run personaos-worker \
+     --worker-id se \
+     --node-id node-se-01 \
+     --adapter litellm \
+     --model qwen2.5-coder-14b \
+     --api-base http://localhost:4000/v1 \
+     --api-key sk-master-dev-key
+
+   # Option B: Fast deterministic simulation (for testing queues and state machines)
+   uv run personaos-worker --worker-id worker-dev-01 --node-id node-local-01 --adapter simulation
    ```
 
 ---

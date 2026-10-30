@@ -118,6 +118,16 @@ alembic -c src/personaos/db/migrations/alembic.ini upgrade head
 ### C. Start Worker Runner(s)
 In another terminal, start a worker runner process that executes tasks for a worker:
 ```bash
+# 1. Real LLM execution (LiteLLM proxy routing to Qwen 2.5 Coder 14B AWQ):
+.venv/bin/personaos-worker \
+  --worker-id se \
+  --node-id node-se-01 \
+  --adapter litellm \
+  --model qwen2.5-coder-14b \
+  --api-base http://localhost:4000/v1 \
+  --api-key sk-master-dev-key
+
+# 2. Simulated execution (50ms fast mocks for workflow/queue unit testing):
 .venv/bin/personaos-worker --worker-id worker-dev-01 --node-id node-local-01 --adapter simulation
 ```
 *(You can run multiple workers simultaneously for different workers or skills).*
