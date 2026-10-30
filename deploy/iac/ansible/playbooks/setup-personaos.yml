@@ -1,0 +1,132 @@
+---
+# Deploy and Configure PersonaOS Application on PVE2
+
+- name: Setup PersonaOS virtualenv and configuration
+  hosts: personaos_cluster
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Create Python 3.12 virtual environment
+      ansible.builtin.command:
+        cmd: python3.12 -m venv /opt/personaos/venv
+        creates: /opt/personaos/venv/bin/activate
+      become_user: personaos
+
+    - name: Upgrade pip and wheel in virtualenv
+      ansible.builtin.pip:
+        name:
+          - pip>=24.0
+          - wheel
+        virtualenv: /opt/personaos/venv
+      become_user: personaos
+
+    - name: Deploy PersonaOS environment configuration
+      ansible.builtin.template:
+        src: ../templates/personaos.env.j2
+        dest: /etc/personaos/personaos.env
+        owner: personaos
+        group: personaos
+        mode: "0600"
+
+    - name: Copy PersonaOS project repository to remote host
+      ansible.builtin.synchronize:
+        src: "{{ playbook_dir }}/../../../../"
+        dest: /opt/personaos/src/
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=.venv"
+          - "--exclude=.pytest_cache"
+          - "--exclude=.mypy_cache"
+          - "--exclude=.ruff_cache"
+          - "--exclude=__pycache__"
+      become_user: personaos
+
+    - name: Install PersonaOS package into virtualenv
+      ansible.builtin.pip:
+        name: /opt/personaos/src/
+        virtualenv: /opt/personaos/venv
+        extra_args: "--no-build-isolation"
+      become_user: personaos
+
+- name: Run Alembic migrations and start Control Plane API
+  hosts: control_plane
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Apply Alembic database migrations up to head
+      ansible.builtin.command:
+        cmd: /opt/personaos/venv/bin/alembic upgrade head
+        chdir: /opt/personaos/src
+      environment:
+        DATABASE_URL: "postgresql+asyncpg://{{ database_user }}:{{ database_password }}@{{ database_host }}:{{ database_port }}/{{ database_name }}"
+      become_user: personaos
+      register: alembic_result
+      changed_when: "'Running upgrade' in alembic_result.stdout or 'Running upgrade' in alembic_result.stderr"
+
+    - name: Deploy Control Plane systemd service
+      ansible.builtin.template:
+        src: ../templates/personaos-api.service.j2
+        dest: /etc/systemd/system/personaos-api.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart personaos-api
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start personaos-api
+      ansible.builtin.systemd:
+        name: personaos-api
+        state: started
+        enabled: true
+
+    - name: Wait for Control Plane API to become healthy
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ control_plane_port }}/health"
+        method: GET
+        status_code: 200
+      register: health_check
+      until: health_check.status == 200
+      retries: 12
+      delay: 5
+
+  handlers:
+    - name: Restart personaos-api
+      ansible.builtin.systemd:
+        name: personaos-api
+        state: restarted
+
+- name: Start PersonaOS Worker Runners
+  hosts: workers
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Deploy Worker Runner systemd service
+      ansible.builtin.template:
+        src: ../templates/personaos-worker.service.j2
+        dest: /etc/systemd/system/personaos-worker.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart personaos-worker
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start personaos-worker
+      ansible.builtin.systemd:
+        name: personaos-worker
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Restart personaos-worker
+      ansible.builtin.systemd:
+        name: personaos-worker
+        state: restarted

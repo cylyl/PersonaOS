@@ -1,0 +1,28 @@
+[Unit]
+Description=PersonaOS Worker Execution Runner Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=personaos
+Group=personaos
+WorkingDirectory=/opt/personaos
+EnvironmentFile=/etc/personaos/personaos.env
+ExecStart=/opt/personaos/venv/bin/personaos-worker --worker-id {{ worker_id | default('worker-' + inventory_hostname) }} --node-id node-{{ inventory_hostname }}
+Restart=always
+RestartSec=5s
+
+# Process Sandbox Lifecycle Hardening
+KillMode=mixed
+TimeoutStopSec=60s
+NoNewPrivileges=true
+PrivateTmp=true
+ReadWritePaths=/var/log/personaos /opt/personaos
+
+# Process Limits
+LimitNOFILE=65535
+MemoryMax=8G
+
+[Install]
+WantedBy=multi-user.target

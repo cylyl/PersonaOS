@@ -1,0 +1,30 @@
+# Example terraform.tfvars for PersonaOS on PVE2
+
+proxmox_endpoint  = "https://192.168.11.252:8006/"
+proxmox_api_token = "root@pam!oc1=460a8e5b-2556-46e7-8e2b-f3808593d04b"
+proxmox_insecure  = true
+
+target_node   = "pve2"
+datastore_id  = "local1"
+bridge        = "vmbr0"
+template_vmid = 104
+gateway_ipv4  = "192.168.11.2"
+
+ssh_username    = "user"
+ssh_public_keys = [
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB5HDZjLiZygMdm2pJHzDm+AgD82j4q9PL0kXgBJEeK9 root@openclaw01"
+]
+
+deploy_distributed = true
+
+# Control Plane VM specs
+cp_vmid      = 250
+cp_ip        = "192.168.11.246/24"
+cp_cores     = 4
+cp_memory_mb = 8192
+
+# Worker VM specs
+worker_vmid      = 251
+worker_ip        = "192.168.11.247/24"
+worker_cores     = 4
+worker_memory_mb = 8192

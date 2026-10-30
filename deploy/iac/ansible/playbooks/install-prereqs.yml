@@ -1,0 +1,67 @@
+---
+# Install System Prerequisites for PersonaOS Nodes on PVE2
+
+- name: Install system dependencies and runtime tools
+  hosts: personaos_cluster
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Update apt cache and install base packages
+      ansible.builtin.apt:
+        name:
+          - curl
+          - git
+          - jq
+          - build-essential
+          - software-properties-common
+          - ca-certificates
+          - python3.12
+          - python3.12-venv
+          - python3.12-dev
+          - python3-pip
+          - libpq-dev
+        state: present
+        update_cache: true
+
+    - name: Create dedicated unprivileged system user for PersonaOS
+      ansible.builtin.user:
+        name: personaos
+        system: true
+        shell: /bin/bash
+        home: /opt/personaos
+        create_home: true
+
+    - name: Create PersonaOS configuration and log directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: personaos
+        group: personaos
+        mode: "0750"
+      loop:
+        - /opt/personaos
+        - /etc/personaos
+        - /etc/personaos/policies
+        - /etc/personaos/profiles
+        - /var/log/personaos
+
+- name: Install PostgreSQL 16 on database host
+  hosts: database
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Install PostgreSQL 16 packages
+      ansible.builtin.apt:
+        name:
+          - postgresql-16
+          - postgresql-contrib-16
+        state: present
+        update_cache: false
+
+    - name: Ensure PostgreSQL service is enabled and running
+      ansible.builtin.systemd:
+        name: postgresql
+        state: started
+        enabled: true

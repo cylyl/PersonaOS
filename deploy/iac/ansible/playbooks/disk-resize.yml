@@ -1,0 +1,50 @@
+---
+# Disk Resize Playbook for PersonaOS Nodes on PVE2
+# Expands root disk partition and LVM after cloning from template 104
+# Standard practice adapted from cyl-dc
+
+- name: Resize root disk and extend LVM on cloned VMs
+  hosts: personaos_cluster
+  become: true
+  gather_facts: true
+  vars:
+    root_disk_device: /dev/sda
+    root_partition_num: "3"
+    root_partition: "{{ root_disk_device }}{{ root_partition_num }}"
+    lvm_vg: ubuntu-vg
+    lvm_lv: ubuntu-lv
+
+  tasks:
+    - name: Ensure cloud-guest-utils is installed for growpart
+      ansible.builtin.apt:
+        name: cloud-guest-utils
+        state: present
+        update_cache: false
+
+    - name: Resize partition to fill root disk
+      ansible.builtin.shell:
+        cmd: growpart {{ root_disk_device }} {{ root_partition_num }}
+      register: growpart_result
+      changed_when: "'CHANGED:' in growpart_result.stdout"
+      failed_when: false
+
+    - name: Expand LVM physical volume on root partition
+      ansible.builtin.shell:
+        cmd: pvresize {{ root_partition }}
+      register: pvresize_result
+      changed_when: "'Physical volume' in pvresize_result.stdout and 'changed' in pvresize_result.stdout"
+      failed_when: false
+
+    - name: Extend root logical volume to use 100% of available free space
+      ansible.builtin.shell:
+        cmd: lvextend -l +100%FREE /dev/{{ lvm_vg }}/{{ lvm_lv }}
+      register: lvextend_result
+      changed_when: "'Logical volume' in lvextend_result.stdout and 'changed' in lvextend_result.stdout"
+      failed_when: false
+
+    - name: Resize filesystem to fill extended logical volume
+      ansible.builtin.shell:
+        cmd: resize2fs /dev/{{ lvm_vg }}/{{ lvm_lv }}
+      register: resize2fs_result
+      changed_when: "'The filesystem on' in resize2fs_result.stdout and 'blocks long' in resize2fs_result.stdout"
+      failed_when: false

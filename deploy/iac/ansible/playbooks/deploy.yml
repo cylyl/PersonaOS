@@ -1,0 +1,19 @@
+---
+# Master Deployment Playbook for PersonaOS on PVE2
+# Executes end-to-end VM bootstrapping, disk expansion, database setup,
+# Alembic schema migrations, and systemd service orchestration.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini playbooks/deploy.yml
+
+- name: Step 1 - Expand root disk partition and LVM
+  ansible.builtin.import_playbook: disk-resize.yml
+
+- name: Step 2 - Install OS dependencies and system packages
+  ansible.builtin.import_playbook: install-prereqs.yml
+
+- name: Step 3 - Configure PostgreSQL 16 database and access permissions
+  ansible.builtin.import_playbook: setup-database.yml
+
+- name: Step 4 - Deploy PersonaOS runtime, apply migrations, and start services
+  ansible.builtin.import_playbook: setup-personaos.yml

@@ -1,0 +1,59 @@
+---
+# Setup PostgreSQL 16 Database for PersonaOS
+
+- name: Configure PostgreSQL 16 instance and credentials
+  hosts: database
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Configure PostgreSQL to listen on all interfaces
+      ansible.builtin.lineinfile:
+        path: /etc/postgresql/16/main/postgresql.conf
+        regexp: "^#?listen_addresses\\s*="
+        line: "listen_addresses = '*'"
+        state: present
+      notify: Restart PostgreSQL
+
+    - name: Configure pg_hba.conf for PersonaOS cluster network
+      ansible.builtin.blockinfile:
+        path: /etc/postgresql/16/main/pg_hba.conf
+        block: |
+          # PersonaOS cluster nodes access
+          host    all             all             192.168.11.0/24         scram-sha-256
+          host    all             all             127.0.0.1/32            scram-sha-256
+        marker: "# {mark} ANSIBLE MANAGED BLOCK FOR PERSONAOS"
+        state: present
+      notify: Restart PostgreSQL
+
+    - name: Flush handlers to ensure PostgreSQL is listening before user creation
+      ansible.builtin.meta: flush_handlers
+
+    - name: Create database user for PersonaOS
+      ansible.builtin.shell:
+        cmd: |
+          sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='{{ database_user }}'" | grep -q 1 || \
+          sudo -u postgres psql -c "CREATE USER {{ database_user }} WITH ENCRYPTED PASSWORD '{{ database_password }}' CREATEDB;"
+      register: db_user_created
+      changed_when: "'CREATE ROLE' in db_user_created.stdout"
+
+    - name: Create database for PersonaOS
+      ansible.builtin.shell:
+        cmd: |
+          sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='{{ database_name }}'" | grep -q 1 || \
+          sudo -u postgres psql -c "CREATE DATABASE {{ database_name }} OWNER {{ database_user }};"
+      register: db_created
+      changed_when: "'CREATE DATABASE' in db_created.stdout"
+
+    - name: Grant privileges on database to PersonaOS user
+      ansible.builtin.shell:
+        cmd: |
+          sudo -u postgres psql -d {{ database_name }} -c "GRANT ALL PRIVILEGES ON DATABASE {{ database_name }} TO {{ database_user }};"
+          sudo -u postgres psql -d {{ database_name }} -c "GRANT ALL ON SCHEMA public TO {{ database_user }};"
+      changed_when: false
+
+  handlers:
+    - name: Restart PostgreSQL
+      ansible.builtin.systemd:
+        name: postgresql
+        state: restarted

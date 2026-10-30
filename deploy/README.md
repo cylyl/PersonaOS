@@ -50,4 +50,5 @@ For advanced setups introduced in v0.2:
 - **Active-Active Control Plane Clusters:** See [`docs/specs/multi-node-control-plane-distribution.md`](../docs/specs/multi-node-control-plane-distribution.md).
 - **Remote Worker Daemons & Jittered Heartbeats:** See [`docs/specs/remote-worker-daemon-heartbeat-distribution.md`](../docs/specs/remote-worker-daemon-heartbeat-distribution.md).
 - **Cross-Machine Agent Execution Protocol (PMAEP):** See [`docs/specs/cross-machine-agent-execution-protocol.md`](../docs/specs/cross-machine-agent-execution-protocol.md).
+- **Proxmox VE 2 (PVE2) IaC Deployment:** See [`deploy/iac/README.md`](iac/README.md).
 - **Production Operations & Hardening:** See [`docs/deployment.md`](../docs/deployment.md).

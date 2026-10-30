@@ -1,0 +1,31 @@
+[Unit]
+Description=PersonaOS Control Plane API Service
+After=network.target network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=personaos
+Group=personaos
+WorkingDirectory=/opt/personaos
+EnvironmentFile=/etc/personaos/personaos.env
+ExecStart=/opt/personaos/venv/bin/personaos-api
+Restart=always
+RestartSec=5s
+
+# Security and Sandbox Hardening
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=/var/log/personaos /opt/personaos
+
+# Process Limits
+LimitNOFILE=65535
+MemoryMax=4G
+CPUQuota=400%
+
+[Install]
+WantedBy=multi-user.target
