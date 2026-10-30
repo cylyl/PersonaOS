@@ -143,7 +143,7 @@ curl -X POST http://localhost:8000/workers \
       "style": "methodical",
       "communication": "concise",
       "autonomy": "high",
-      "behavior": "proactive",
+      "behavior": {"initiative": "proactive"},
       "goals": ["Maintain 100% test pass rate", "Zero regressions"],
       "constraints": ["Do not execute destructive production commands"]
     }
@@ -181,7 +181,7 @@ curl -X POST http://localhost:8000/workers/worker-developer-001/profiles \
       "style": "methodical",
       "communication": "concise",
       "autonomy": "high",
-      "behavior": "proactive"
+      "behavior": {"initiative": "proactive"}
     }
   }'
 ```
