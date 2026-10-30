@@ -2,6 +2,9 @@
 
 Local development and operational notes for the kernel.
 
+> [!NOTE]
+> For the comprehensive end-to-end user guide, API cheat sheet, review queue runbook, and dashboard documentation, see the **[User Manual](user-manual.md)**.
+
 ## Local development
 
 ```bash
