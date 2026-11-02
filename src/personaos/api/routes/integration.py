@@ -1032,12 +1032,109 @@ async def publish_gateway_event(
     )
 
 
+STANDALONE_BROWSER_SHIM = """
+<script id="personaos-browser-shim">
+if (typeof window.orca === 'undefined') {
+  window.orca = {
+    host: {
+      call: async function(method, args) {
+        if (method === 'plugin.messageWorker') {
+          const action = args.action;
+          const payload = args.payload || {};
+          let endpoint = '';
+          let httpMethod = 'GET';
+          let body = null;
+
+          switch (action) {
+            case 'getHealth':
+              endpoint = '/integration/health';
+              break;
+            case 'getDiagnostics':
+              endpoint = '/integration/diagnostics';
+              break;
+            case 'getWorkers':
+              endpoint = '/integration/workers';
+              break;
+            case 'getDag': {
+              const runId = encodeURIComponent(payload.runId || 'default');
+              endpoint = '/integration/runs/' + runId + '/dag';
+              break;
+            }
+            case 'getReadyWaves': {
+              const runId = encodeURIComponent(payload.runId || 'default');
+              endpoint = '/integration/runs/' + runId + '/ready-waves';
+              break;
+            }
+            case 'getDecisionGates':
+              endpoint = '/integration/decision-gates';
+              break;
+            case 'resolveDecisionGate': {
+              const gateId = encodeURIComponent(payload.gateId);
+              endpoint = '/integration/decision-gates/' + gateId + '/resolve';
+              httpMethod = 'POST';
+              body = JSON.stringify({
+                decision: payload.decision,
+                review_notes: payload.reviewNotes || null,
+                expected_generation: payload.expectedGeneration ?? null,
+              });
+              break;
+            }
+            case 'submitTask': {
+              endpoint = '/integration/tasks';
+              httpMethod = 'POST';
+              body = JSON.stringify({
+                title: payload.title,
+                description: payload.description || '',
+                required_capabilities: payload.requiredCapabilities || [],
+                idempotency_key: payload.idempotencyKey,
+                run_id: payload.runId || 'default',
+                worker_id: payload.workerId || null,
+                side_effect_classification: payload.sideEffectClassification || 'UNKNOWN',
+                profile_version: payload.profileVersion || null,
+              });
+              break;
+            }
+            case 'pollEvents': {
+              const since = encodeURIComponent(payload.since || '');
+              const timeoutMs = encodeURIComponent(payload.timeoutMs || 15000);
+              endpoint = '/integration/events?since=' + since + '&timeout_ms=' + timeoutMs;
+              break;
+            }
+            default:
+              return { ok: false, code: 'unknown_action', error: 'Unknown action: ' + action };
+          }
+
+          try {
+            const headers = { 'Accept': 'application/json' };
+            if (body) headers['Content-Type'] = 'application/json';
+            const res = await fetch(endpoint, { method: httpMethod, headers, body });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({ detail: res.statusText }));
+              return { ok: false, code: 'HTTP_' + res.status, error: typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail) };
+            }
+            const data = await res.json();
+            return { ok: true, value: { ok: true, data } };
+          } catch (err) {
+            return { ok: false, code: 'FETCH_ERROR', error: err.message };
+          }
+        }
+        return { ok: false, code: 'unknown_method', error: 'Unknown method: ' + method };
+      }
+    }
+  };
+}
+</script>
+"""
+
+
 @router.get("/panel", response_class=HTMLResponse, summary="Orca Integration Panel UI")
 @router.get("/panel/", response_class=HTMLResponse, include_in_schema=False)
 async def get_integration_panel() -> HTMLResponse:
     """Serve the embedded PersonaOS Orca ADE Integration Panel UI."""
     if PANEL_HTML_PATH.exists():
         content = PANEL_HTML_PATH.read_text(encoding="utf-8")
+        if "</head>" in content:
+            content = content.replace("</head>", f"{STANDALONE_BROWSER_SHIM}</head>", 1)
         return HTMLResponse(content=content, status_code=status.HTTP_200_OK)
     return HTMLResponse(
         content="<h1>Orca ADE Panel UI not found</h1>",
