@@ -11,6 +11,7 @@ Concrete adapters:
 from personaos.execution.adapters.base import Adapter
 from personaos.execution.adapters.litellm import LiteLLMAdapter, LiteLLMConfig
 from personaos.execution.adapters.openclaw import OpenClawAdapter
+from personaos.execution.adapters.pab import PABExecutionAdapter, PABExecutionConfig
 from personaos.execution.adapters.simulation import SimulationAdapter
 
 __all__ = [
@@ -18,5 +19,7 @@ __all__ = [
     "LiteLLMAdapter",
     "LiteLLMConfig",
     "OpenClawAdapter",
+    "PABExecutionAdapter",
+    "PABExecutionConfig",
     "SimulationAdapter",
 ]

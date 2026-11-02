@@ -103,6 +103,37 @@ class WorkerQuarantineRequest(BaseModel):
     quarantined_by: str | None = Field(None, description="Actor requesting quarantine")
 
 
+class WorkerSyncRequest(BaseModel):
+    """Request payload to synchronize a worker profile to external providers."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    version: int | None = Field(
+        None, description="Profile version to sync (defaults to active version)"
+    )
+    targets: list[str] | None = Field(
+        None, description="Target provider list (e.g. ['openclaw', 'agy'])"
+    )
+    dry_run: bool = Field(False, description="Simulate sync plan without deploying changes")
+
+
+class WorkerSyncResponse(BaseModel):
+    """Response payload containing sync operation results."""
+
+    operation_id: str
+    worker_id: str
+    profile_version: int
+    requested_at: datetime
+    completed_at: datetime
+    overall_status: str
+    dry_run: bool
+    targets: dict[str, Any]
+    exit_code: int
+    stdout_summary: str
+    stderr_summary: str
+    audit_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class TaskCreateRequest(BaseModel):
     """Request payload to enqueue a new task."""
 
@@ -381,3 +412,24 @@ class TaskTelemetryResponse(BaseModel):
     cost_usd: float
     recorded_at: datetime
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# Integration Gateway Schemas (ADR 0041)
+from personaos.integrations.common.gateway_schemas import (
+    ConnectionDiagnosticCode,
+    GatewayDagEdge,
+    GatewayDagNode,
+    GatewayDagProjection,
+    GatewayDecisionGate,
+    GatewayDiagnosticsResponse,
+    GatewayEventMessage,
+    GatewayGateResolveRequest,
+    GatewayGateResolveResponse,
+    GatewayHealthResponse,
+    GatewayReadyTask,
+    GatewayReadyWave,
+    GatewayReadyWavesResponse,
+    GatewayRunCreateRequest,
+    GatewayRunSummary,
+    GatewayWorkerSummary,
+)

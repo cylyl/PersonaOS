@@ -26,6 +26,7 @@ from personaos.api.routes import (
     dashboard_router,
     events_router,
     health_router,
+    integration_router,
     nodes_router,
     protocol_ws_router,
     tasks_router,
@@ -121,13 +122,26 @@ def create_app(
     app.state.session_factory = session_factory
 
     # CORS configuration
+    # Note: allow_credentials MUST be False when allowing all origins (*) or sandboxed iframes (Origin: null)
+    # per W3C CORS spec: Access-Control-Allow-Credentials: true with origin null or * is rejected by browsers.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        allow_private_network=True,
     )
+
+    # Private Network Access (PNA) middleware for local LAN / Electron clients
+    @app.middleware("http")
+    async def add_cors_pna_headers(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        response = await call_next(request)
+        if request.headers.get("origin") or request.headers.get("access-control-request-private-network"):
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
 
     # Structured request logging middleware
     @app.middleware("http")
@@ -187,7 +201,26 @@ def create_app(
         )
 
     # Register routes
+    @app.get("/")
+    async def root_status() -> dict[str, str]:
+        return {
+            "name": "PersonaOS Control Plane",
+            "status": "online",
+            "dashboard": "/dashboard",
+            "health": "/health",
+            "docs": "/docs",
+        }
+
+    @app.get("/api")
+    async def api_root_status() -> dict[str, str]:
+        return {
+            "name": "PersonaOS Control Plane API",
+            "status": "online",
+            "health": "/api/health",
+        }
+
     app.include_router(health_router)
+    app.include_router(integration_router)
     app.include_router(workers_router)
     app.include_router(nodes_router)
     app.include_router(tasks_router)
@@ -195,6 +228,16 @@ def create_app(
     app.include_router(dashboard_router)
     app.include_router(cluster_router)
     app.include_router(protocol_ws_router)
+
+    # Also register routes under /api prefix for API clients and ADE plugins
+    app.include_router(health_router, prefix="/api")
+    app.include_router(integration_router, prefix="/api")
+    app.include_router(workers_router, prefix="/api")
+    app.include_router(nodes_router, prefix="/api")
+    app.include_router(tasks_router, prefix="/api")
+    app.include_router(events_router, prefix="/api")
+    app.include_router(dashboard_router, prefix="/api")
+    app.include_router(cluster_router, prefix="/api")
 
     return app
 

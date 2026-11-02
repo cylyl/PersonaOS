@@ -43,10 +43,10 @@ class LiteLLMConfig:
 
     api_base: str = "http://localhost:4000/v1"
     api_key: str = "sk-master-dev-key"
-    model: str = "qwen2.5-coder-14b"
-    timeout_seconds: float = 120.0
+    model: str = "minimax"
+    timeout_seconds: float = 300.0
     temperature: float = 0.2
-    max_tokens: int = 4096
+    max_tokens: int = 16384
 
 
 class LiteLLMAdapter:
@@ -78,16 +78,21 @@ class LiteLLMAdapter:
         default_model = (
             model
             or os.environ.get("PERSONAOS_LLM_MODEL")
-            or "qwen2.5-coder-14b"
+            or "minimax"
+        )
+        default_max_tokens = (
+            max_tokens
+            if max_tokens is not None
+            else int(os.environ.get("PERSONAOS_MAX_TOKENS", "16384"))
         )
 
         self.config = config or LiteLLMConfig(
             api_base=default_base,
             api_key=default_key,
             model=default_model,
-            timeout_seconds=timeout_seconds if timeout_seconds is not None else 120.0,
+            timeout_seconds=timeout_seconds if timeout_seconds is not None else 300.0,
             temperature=temperature if temperature is not None else 0.2,
-            max_tokens=max_tokens if max_tokens is not None else 4096,
+            max_tokens=default_max_tokens,
         )
 
     def _build_system_prompt(self, context: WorkerExecutionContext) -> str:
@@ -103,7 +108,8 @@ class LiteLLMAdapter:
             f"Behavior Directive: {behavior_str}\n\n"
             "You are assigned to execute real software engineering, devops, and operational tasks.\n"
             "Provide concrete, actionable solutions, code implementations, and reasoning.\n"
-            "If requested to create files or code, provide clean, production-ready code."
+            "When requested to create files or code, always output the complete, functional code inside markdown code blocks (```python ... ```).\n"
+            "Keep your reasoning concise and focused so you produce the complete implementation within the response."
         )
 
     def _build_user_prompt(self, context: WorkerExecutionContext) -> str:
@@ -123,7 +129,21 @@ class LiteLLMAdapter:
             parts.append(f"Contextual Memory:\n{json.dumps(context.memory, indent=2)}")
 
         if context.recent_experience:
-            parts.append(f"Recent Experience:\n{json.dumps(context.recent_experience, indent=2)}")
+            clean_exp: list[dict[str, Any]] = []
+            for item in context.recent_experience:
+                if isinstance(item, dict):
+                    clean_item = {}
+                    for k, v in item.items():
+                        if k == "reasoning":
+                            continue
+                        if isinstance(v, dict):
+                            clean_item[k] = {vk: vv for vk, vv in v.items() if vk != "reasoning"}
+                        else:
+                            clean_item[k] = v
+                    clean_exp.append(clean_item)
+                else:
+                    clean_exp.append(item)
+            parts.append(f"Recent Experience:\n{json.dumps(clean_exp, indent=2)}")
 
         parts.append("\nPlease execute the task and provide your detailed output and results.")
         return "\n\n".join(parts)
@@ -131,7 +151,7 @@ class LiteLLMAdapter:
     def _handle_workspace_artifacts(
         self,
         context: WorkerExecutionContext,
-        response_text: str,
+        response_text: str | None,
     ) -> list[str]:
         """Extract and persist workspace files if requested by task input."""
         written_files: list[str] = []
@@ -143,6 +163,10 @@ class LiteLLMAdapter:
         if not workspace_dir and not target_file:
             return written_files
 
+        text = response_text or ""
+        if not text.strip():
+            return written_files
+
         try:
             base_path = Path(workspace_dir) if workspace_dir else Path.cwd()
             base_path.mkdir(parents=True, exist_ok=True)
@@ -152,8 +176,15 @@ class LiteLLMAdapter:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
 
                 # If code block exists in response, extract content; else write full text
-                code_match = re.search(r"```(?:\w+)?\n([\s\S]*?)```", response_text)
-                file_content = code_match.group(1) if code_match else response_text
+                code_matches = re.findall(r"```(?:\w+)?\n([\s\S]*?)```", text)
+                if code_matches:
+                    file_content = max(code_matches, key=len)
+                else:
+                    unclosed = re.search(r"```(?:\w+)?\n([\s\S]+)", text)
+                    if unclosed:
+                        file_content = unclosed.group(1).rstrip("` \n\r")
+                    else:
+                        file_content = text
 
                 out_path.write_text(file_content, encoding="utf-8")
                 written_files.append(str(out_path))
@@ -193,6 +224,10 @@ class LiteLLMAdapter:
             "max_tokens": self.config.max_tokens,
         }
 
+        # Keep reasoning focused and bounded for reasoning models
+        if "minimax" in self.config.model.lower():
+            payload["thinking"] = {"type": "enabled", "budget_tokens": 2048}
+
         logger.info(
             "litellm_execution_started",
             worker_id=context.worker.id,
@@ -230,13 +265,20 @@ class LiteLLMAdapter:
                     output=None,
                 )
 
-            content = choices[0].get("message", {}).get("content", "")
+            choice = choices[0]
+            message_obj = choice.get("message", {})
+            content = message_obj.get("content") or ""
+            reasoning = message_obj.get("reasoning_content") or ""
+
+            # Effective text: prefer content, fallback to reasoning if content is empty
+            effective_text = content.strip() if content.strip() else reasoning.strip()
+
             usage = data.get("usage", {})
             prompt_tokens = usage.get("prompt_tokens", 0)
             completion_tokens = usage.get("completion_tokens", 0)
             total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
 
-            written_files = self._handle_workspace_artifacts(context, content)
+            written_files = self._handle_workspace_artifacts(context, effective_text)
 
             logger.info(
                 "litellm_execution_completed",
@@ -249,7 +291,9 @@ class LiteLLMAdapter:
             return Result(
                 status="completed",
                 output={
-                    "text": content,
+                    "summary": f"Completed task '{context.task.title}'",
+                    "text": effective_text,
+                    "reasoning": reasoning,
                     "model": self.config.model,
                     "worker_id": context.worker.id,
                     "task_id": context.task.id,

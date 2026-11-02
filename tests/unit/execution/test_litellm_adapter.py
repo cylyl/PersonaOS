@@ -172,15 +172,43 @@ async def test_litellm_adapter_live_call():
         LiteLLMConfig(
             api_base="http://localhost:4000/v1",
             api_key="sk-master-dev-key",
-            model="qwen2.5-coder-14b",
-            timeout_seconds=30.0,
+            model="minimax",
+            timeout_seconds=60.0,
         )
     )
-    context = _make_context(task_input={"instruction": "Return string 'TEST_PASSED'"})
+    worker = Worker(
+        id="se",
+        name="Software Engineer",
+        role="developer",
+        status="active",
+        runtime="litellm",
+        max_concurrent_tasks=1,
+        current_profile_version=1,
+    )
+    profile = WorkerProfile(
+        version=1,
+        role="developer",
+        runtime="litellm",
+        skills=["python"],
+        persona=Persona(autonomy="high", behavior={"initiative": "proactive"}),
+    )
+    task = Task(
+        id="task-live-test",
+        title="Echo Verification Token",
+        objective="Output the verification token VERIFIED_MINIMAX_OK exactly in your response.",
+        input={"token": "VERIFIED_MINIMAX_OK"},
+        profile_version=1,
+        status="queued",
+        priority="high",
+        assigned_worker="se",
+    )
+    context = WorkerExecutionContext(worker=worker, profile=profile, task=task)
 
     res = await adapter.execute(context)
+    if res.status == "failed" and res.error and ("401" in res.error or "AuthenticationError" in res.error or "Connection refused" in res.error):
+        pytest.skip(f"LiteLLM upstream provider authentication unavailable: {res.error}")
     assert res.status == "completed", f"Failed with: {res.error}"
     assert res.output is not None
-    assert "TEST_PASSED" in res.output["text"]
+    assert "VERIFIED_MINIMAX_OK" in res.output["text"]
     assert res.output["tokens"]["total_tokens"] > 0
     assert res.output["latency_ms"] > 0

@@ -58,3 +58,22 @@ async def emit_task_event(
             payload=payload or {},
         )
     )
+
+    try:
+        from personaos.integrations.common.event_bus import gateway_event_bus
+
+        mapped_type = (
+            "gate_created"
+            if event_type == "approval.requested"
+            else "task_status_changed"
+        )
+        evt_payload = dict(payload or {})
+        evt_payload.setdefault("task_id", task_id)
+        evt_payload.setdefault("actor_id", actor_id)
+        evt_payload.setdefault("raw_type", event_type)
+        gateway_event_bus.publish(
+            event_type=mapped_type,
+            payload=evt_payload,
+        )
+    except Exception:
+        pass

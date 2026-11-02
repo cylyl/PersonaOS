@@ -83,6 +83,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help="API key for litellm adapter (default: from settings or env)",
     )
     parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=int(os.environ.get("PERSONAOS_MAX_TOKENS", "16384")),
+        help="Max tokens for completion (default: 16384)",
+    )
+    parser.add_argument(
         "--concurrency",
         "--max-concurrency",
         dest="concurrency",
@@ -130,6 +136,7 @@ async def async_main(args: argparse.Namespace) -> None:
             api_base=args.api_base,
             api_key=args.api_key,
             model=args.model,
+            max_tokens=args.max_tokens,
         )
     else:
         adapter = OpenClawAdapter()

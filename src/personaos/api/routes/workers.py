@@ -2,27 +2,33 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 from sqlalchemy import select, update
 
-from personaos.api.deps import RegistryDep, SessionDep
+from personaos.api.deps import PABAdapterDep, RegistryDep, SessionDep
 from personaos.api.schemas import (
     WorkerCreateRequest,
     WorkerDetailResponse,
     WorkerProfileCreateRequest,
     WorkerQuarantineRequest,
     WorkerResponse,
+    WorkerSyncRequest,
+    WorkerSyncResponse,
 )
 from personaos.db.models import Worker as WorkerModel
 from personaos.domain.worker import Persona, WorkerProfile
+from personaos.registry.pab_adapter import PABSyncAdapter
 from personaos.registry.profile import (
     ProfileError,
     ProfileVersionExistsError,
     ProfileVersionNotFoundError,
     WorkerNotFoundError,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/workers", tags=["workers"])
 
@@ -94,6 +100,14 @@ async def register_worker(
         await session.execute(select(WorkerModel).where(WorkerModel.id == req.id))
     ).scalar_one()
     return worker_orm
+
+
+@router.get("/bridge/readiness")
+async def get_bridge_readiness(
+    pab_adapter: PABAdapterDep,
+) -> dict[str, Any]:
+    """Check readiness of PAB and connected external agent providers."""
+    return await pab_adapter.get_provider_readiness()
 
 
 @router.get("/{worker_id}", response_model=WorkerDetailResponse)
@@ -190,11 +204,38 @@ async def get_worker_profile_version(
     }
 
 
+async def _dispatch_background_sync(
+    worker_id: str,
+    version: int,
+    profile_path: Any,
+    skills: list[str],
+) -> None:
+    """Non-blocking background synchronization hook."""
+    try:
+        adapter = PABSyncAdapter()
+        if adapter.is_available():
+            await adapter.sync_worker_profile(
+                worker_id=worker_id,
+                profile_path=profile_path,
+                profile_version=version,
+                actor_id="system-activation",
+                skills=skills,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Background PAB sync for worker '%s' version %s failed: %s",
+            worker_id,
+            version,
+            exc,
+        )
+
+
 @router.post("/{worker_id}/profiles", status_code=status.HTTP_201_CREATED)
 async def create_profile_version(
     worker_id: str,
     req: WorkerProfileCreateRequest,
     registry: RegistryDep,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     """Create a new immutable profile version for a worker."""
     persona = Persona(
@@ -223,6 +264,13 @@ async def create_profile_version(
         pv = await registry.create_profile_version(worker_id, profile)
         if req.activate:
             await registry.activate_profile_version(worker_id, req.version)
+            background_tasks.add_task(
+                _dispatch_background_sync,
+                worker_id,
+                req.version,
+                pv.path,
+                list(profile.skills),
+            )
         return {
             "worker_id": worker_id,
             "version": pv.version,
@@ -251,12 +299,34 @@ async def activate_profile_version(
     worker_id: str,
     version: int,
     registry: RegistryDep,
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     """Atomically activate an existing profile version."""
     try:
         await registry.activate_profile_version(worker_id, version)
+        try:
+            prof = registry.get_profile_version(worker_id, version)
+            path = registry._profile_path(worker_id, version)
+            background_tasks.add_task(
+                _dispatch_background_sync,
+                worker_id,
+                version,
+                path,
+                list(prof.skills),
+            )
+        except Exception as ex:
+            logger.debug("Could not schedule background sync: %s", ex)
         return {"worker_id": worker_id, "active_version": version}
     except WorkerNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except ProfileVersionNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
@@ -311,3 +381,77 @@ async def unquarantine_worker(
     await session.flush()
     worker.status = "idle"
     return worker
+
+
+@router.post("/{worker_id}/sync", response_model=WorkerSyncResponse)
+async def sync_worker_to_providers(
+    worker_id: str,
+    registry: RegistryDep,
+    pab_adapter: PABAdapterDep,
+    session: SessionDep,
+    req: WorkerSyncRequest | None = None,
+) -> WorkerSyncResponse:
+    """Synchronize a worker profile to external agent providers via PAB."""
+    # 1. Verify worker exists
+    worker = await registry.get_worker(worker_id)
+
+    sync_req = req or WorkerSyncRequest()
+    target_version = sync_req.version or worker.current_profile_version
+
+    # Monotonic version guard: cannot sync older version than currently active version
+    # unless explicitly requested for historical audit inspection in dry_run
+    if target_version < worker.current_profile_version and not sync_req.dry_run:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot sync stale profile version {target_version}; "
+                f"current active version is {worker.current_profile_version}."
+            ),
+        )
+
+    # 2. Resolve profile and file path
+    try:
+        profile = registry.get_profile_version(worker_id, target_version)
+    except ProfileVersionNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+
+    profile_path = registry._profile_path(worker_id, target_version)
+
+    # 3. Execute synchronization via PAB adapter
+    result = await pab_adapter.sync_worker_profile(
+        worker_id=worker_id,
+        profile_path=profile_path,
+        profile_version=target_version,
+        target_providers=sync_req.targets,
+        dry_run=sync_req.dry_run,
+        actor_id="api",
+        skills=list(profile.skills),
+    )
+
+    return WorkerSyncResponse(
+        operation_id=result.operation_id,
+        worker_id=result.worker_id,
+        profile_version=result.profile_version,
+        requested_at=result.requested_at,
+        completed_at=result.completed_at,
+        overall_status=result.overall_status.value,
+        dry_run=result.dry_run,
+        targets={
+            k: {
+                "provider": v.provider,
+                "status": v.status.value,
+                "action": v.action,
+                "details": v.details,
+                "warnings": v.warnings,
+                "error": v.error,
+            }
+            for k, v in result.targets.items()
+        },
+        exit_code=result.exit_code,
+        stdout_summary=result.stdout_summary,
+        stderr_summary=result.stderr_summary,
+        audit_metadata=result.audit_metadata,
+    )

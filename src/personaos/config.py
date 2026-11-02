@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     # LiteLLM / LLM Adapter Settings
     litellm_api_base: str = "http://localhost:4000/v1"
     litellm_api_key: str = "sk-master-dev-key"
-    litellm_model: str = "qwen2.5-coder-14b"
+    litellm_model: str = "minimax"
 
     # Node Supervision
     enable_node_supervision: bool = True

@@ -8,6 +8,7 @@ from typing import Annotated
 from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from personaos.registry.pab_adapter import PABSyncAdapter
 from personaos.registry.profile import ProfileRegistry
 from personaos.workload.service import WorkloadService
 
@@ -56,6 +57,14 @@ def get_workload_service(
 
 
 WorkloadDep = Annotated[WorkloadService, Depends(get_workload_service)]
+
+
+def get_pab_adapter() -> PABSyncAdapter:
+    """Dependency provider for PABSyncAdapter."""
+    return PABSyncAdapter()
+
+
+PABAdapterDep = Annotated[PABSyncAdapter, Depends(get_pab_adapter)]
 
 
 def get_current_worker(

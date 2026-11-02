@@ -1,0 +1,1493 @@
+{
+  "components": {
+    "schemas": {
+      "ConnectionDiagnosticCode": {
+        "description": "Structured diagnostic classification codes for ADE <-> PersonaOS connectivity.",
+        "enum": [
+          "CONNECTED",
+          "NETWORK_UNREACHABLE",
+          "CORS_BLOCKED",
+          "AUTHENTICATION_FAILED",
+          "ENDPOINT_NOT_FOUND",
+          "API_VERSION_MISMATCH",
+          "INVALID_RESPONSE",
+          "SERVICE_UNAVAILABLE"
+        ],
+        "title": "ConnectionDiagnosticCode",
+        "type": "string"
+      },
+      "GatewayDagEdge": {
+        "description": "Directed dependency edge in the task DAG.",
+        "properties": {
+          "from": {
+            "description": "Source task ID (dependency)",
+            "title": "From",
+            "type": "string"
+          },
+          "to": {
+            "description": "Target task ID (dependent)",
+            "title": "To",
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ],
+        "title": "GatewayDagEdge",
+        "type": "object"
+      },
+      "GatewayDagNode": {
+        "description": "Projected task node in the orchestration DAG.",
+        "properties": {
+          "dependencies": {
+            "description": "List of dependency task IDs",
+            "items": {
+              "type": "string"
+            },
+            "title": "Dependencies",
+            "type": "array"
+          },
+          "generation": {
+            "default": 1,
+            "description": "Execution generation fence counter",
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "status": {
+            "description": "Task status: pending | ready | claimed | running | review | completed | failed",
+            "title": "Status",
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Task identifier",
+            "title": "Task Id",
+            "type": "string"
+          },
+          "title": {
+            "description": "Task title",
+            "title": "Title",
+            "type": "string"
+          },
+          "wave": {
+            "default": 1,
+            "description": "Calculated ready wave execution tier",
+            "minimum": 1.0,
+            "title": "Wave",
+            "type": "integer"
+          },
+          "worker_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Assigned worker identifier",
+            "title": "Worker Id"
+          }
+        },
+        "required": [
+          "task_id",
+          "title",
+          "status"
+        ],
+        "title": "GatewayDagNode",
+        "type": "object"
+      },
+      "GatewayDagProjection": {
+        "description": "Pre-evaluated DAG projection returned to Orca ADE.",
+        "properties": {
+          "completed_tasks": {
+            "default": 0,
+            "description": "Completed tasks count",
+            "minimum": 0.0,
+            "title": "Completed Tasks",
+            "type": "integer"
+          },
+          "edges": {
+            "description": "Directed dependency edges",
+            "items": {
+              "$ref": "#/components/schemas/GatewayDagEdge"
+            },
+            "title": "Edges",
+            "type": "array"
+          },
+          "nodes": {
+            "description": "Projected task DAG nodes",
+            "items": {
+              "$ref": "#/components/schemas/GatewayDagNode"
+            },
+            "title": "Nodes",
+            "type": "array"
+          },
+          "ready_tasks": {
+            "default": 0,
+            "description": "Ready tasks count",
+            "minimum": 0.0,
+            "title": "Ready Tasks",
+            "type": "integer"
+          },
+          "run_id": {
+            "description": "Coordination run identifier",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "total_tasks": {
+            "default": 0,
+            "description": "Total tasks in DAG",
+            "minimum": 0.0,
+            "title": "Total Tasks",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "title": "GatewayDagProjection",
+        "type": "object"
+      },
+      "GatewayDecisionGate": {
+        "description": "Interactive decision gate (HITL) mapped from a task in review status.",
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Gate creation timestamp",
+            "title": "Created At"
+          },
+          "execution_generation": {
+            "default": 1,
+            "description": "Task generation fence token",
+            "minimum": 1.0,
+            "title": "Execution Generation",
+            "type": "integer"
+          },
+          "gate_id": {
+            "description": "Unique decision gate identifier",
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "options": {
+            "description": "Available decision choices",
+            "items": {
+              "type": "string"
+            },
+            "title": "Options",
+            "type": "array"
+          },
+          "question": {
+            "description": "Question or decision required from human reviewer",
+            "title": "Question",
+            "type": "string"
+          },
+          "review_context": {
+            "additionalProperties": true,
+            "description": "Diagnostic findings and context",
+            "title": "Review Context",
+            "type": "object"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Associated coordination run ID",
+            "title": "Run Id"
+          },
+          "status": {
+            "default": "pending",
+            "description": "Gate status: pending | approved | rejected",
+            "title": "Status",
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Associated PersonaOS task ID",
+            "title": "Task Id",
+            "type": "string"
+          },
+          "title": {
+            "description": "Gate title",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "gate_id",
+          "task_id",
+          "title",
+          "question"
+        ],
+        "title": "GatewayDecisionGate",
+        "type": "object"
+      },
+      "GatewayDiagnosticsResponse": {
+        "description": "Comprehensive diagnostic probe report for Orca ADE.",
+        "properties": {
+          "api_version_match": {
+            "default": true,
+            "description": "Whether API version is compatible",
+            "title": "Api Version Match",
+            "type": "boolean"
+          },
+          "auth_status": {
+            "default": "authenticated",
+            "description": "Authentication state: authenticated | unauthenticated | invalid",
+            "title": "Auth Status",
+            "type": "string"
+          },
+          "code": {
+            "$ref": "#/components/schemas/ConnectionDiagnosticCode",
+            "description": "Diagnostic error classification code"
+          },
+          "cors_supported": {
+            "default": true,
+            "description": "Whether CORS headers are correctly negotiated",
+            "title": "Cors Supported",
+            "type": "boolean"
+          },
+          "details": {
+            "additionalProperties": true,
+            "description": "Diagnostic telemetry and probe details",
+            "title": "Details",
+            "type": "object"
+          },
+          "latency_ms": {
+            "description": "Roundtrip latency in milliseconds",
+            "minimum": 0.0,
+            "title": "Latency Ms",
+            "type": "number"
+          },
+          "pna_supported": {
+            "default": true,
+            "description": "Whether Private Network Access headers are present",
+            "title": "Pna Supported",
+            "type": "boolean"
+          },
+          "remediation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Actionable troubleshooting instructions if unhealthy",
+            "title": "Remediation"
+          },
+          "status": {
+            "description": "Short status descriptor: ok | degraded | error",
+            "title": "Status",
+            "type": "string"
+          },
+          "upstream_url": {
+            "description": "Target upstream URL probed",
+            "title": "Upstream Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "status",
+          "latency_ms",
+          "upstream_url"
+        ],
+        "title": "GatewayDiagnosticsResponse",
+        "type": "object"
+      },
+      "GatewayEventMessage": {
+        "description": "Server-Sent Event message payload.",
+        "properties": {
+          "event_id": {
+            "description": "Unique event identifier",
+            "title": "Event Id",
+            "type": "string"
+          },
+          "event_type": {
+            "description": "Event type: task_status_changed | ready_wave_advanced | gate_created | gate_resolved | heartbeat",
+            "title": "Event Type",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": true,
+            "description": "Event payload data",
+            "title": "Payload",
+            "type": "object"
+          },
+          "timestamp": {
+            "description": "Event timestamp",
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "event_type"
+        ],
+        "title": "GatewayEventMessage",
+        "type": "object"
+      },
+      "GatewayGateResolveRequest": {
+        "description": "Request payload to resolve an interactive decision gate.",
+        "properties": {
+          "decision": {
+            "description": "Human decision: approve or reject",
+            "enum": [
+              "approve",
+              "reject"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "expected_generation": {
+            "description": "Fencing generation token",
+            "minimum": 1.0,
+            "title": "Expected Generation",
+            "type": "integer"
+          },
+          "review_notes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Review feedback or rationale",
+            "title": "Review Notes"
+          },
+          "selected_option": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Selected option choice",
+            "title": "Selected Option"
+          }
+        },
+        "required": [
+          "decision",
+          "expected_generation"
+        ],
+        "title": "GatewayGateResolveRequest",
+        "type": "object"
+      },
+      "GatewayGateResolveResponse": {
+        "description": "Response returned upon resolving a decision gate.",
+        "properties": {
+          "gate_id": {
+            "description": "Decision gate identifier",
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "new_generation": {
+            "description": "Advanced generation counter",
+            "minimum": 1.0,
+            "title": "New Generation",
+            "type": "integer"
+          },
+          "resolved": {
+            "description": "Whether gate resolution succeeded",
+            "title": "Resolved",
+            "type": "boolean"
+          },
+          "status": {
+            "description": "New task review status: approved | rejected",
+            "title": "Status",
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Task identifier",
+            "title": "Task Id",
+            "type": "string"
+          },
+          "timestamp": {
+            "description": "Resolution timestamp",
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          }
+        },
+        "required": [
+          "gate_id",
+          "task_id",
+          "resolved",
+          "status",
+          "new_generation"
+        ],
+        "title": "GatewayGateResolveResponse",
+        "type": "object"
+      },
+      "GatewayHealthResponse": {
+        "description": "Health check response from Integration Gateway.",
+        "properties": {
+          "gateway_version": {
+            "default": "1.0.0",
+            "description": "Gateway implementation version",
+            "title": "Gateway Version",
+            "type": "string"
+          },
+          "pab_connected": {
+            "description": "Whether PAB execution supervisor is reachable",
+            "title": "Pab Connected",
+            "type": "boolean"
+          },
+          "personaos_connected": {
+            "description": "Whether upstream PersonaOS control plane is reachable",
+            "title": "Personaos Connected",
+            "type": "boolean"
+          },
+          "personaos_url": {
+            "description": "Configured PersonaOS upstream base URL",
+            "title": "Personaos Url",
+            "type": "string"
+          },
+          "status": {
+            "description": "Overall health: healthy | degraded | down",
+            "title": "Status",
+            "type": "string"
+          },
+          "timestamp": {
+            "description": "Health check timestamp",
+            "format": "date-time",
+            "title": "Timestamp",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "personaos_connected",
+          "personaos_url",
+          "pab_connected"
+        ],
+        "title": "GatewayHealthResponse",
+        "type": "object"
+      },
+      "GatewayReadyTask": {
+        "description": "Task ready for execution within a ready wave.",
+        "properties": {
+          "generation": {
+            "default": 1,
+            "description": "Current execution generation",
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "priority": {
+            "default": "medium",
+            "description": "Priority level: low | medium | high | urgent",
+            "title": "Priority",
+            "type": "string"
+          },
+          "task_id": {
+            "description": "Task identifier",
+            "title": "Task Id",
+            "type": "string"
+          },
+          "title": {
+            "description": "Task title",
+            "title": "Title",
+            "type": "string"
+          },
+          "worker_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Assigned worker identifier",
+            "title": "Worker Id"
+          }
+        },
+        "required": [
+          "task_id",
+          "title"
+        ],
+        "title": "GatewayReadyTask",
+        "type": "object"
+      },
+      "GatewayReadyWave": {
+        "description": "Tier of ready tasks whose dependencies are fully resolved.",
+        "properties": {
+          "ready_tasks": {
+            "description": "Tasks ready in this wave",
+            "items": {
+              "$ref": "#/components/schemas/GatewayReadyTask"
+            },
+            "title": "Ready Tasks",
+            "type": "array"
+          },
+          "wave_number": {
+            "description": "Ready wave sequence number",
+            "minimum": 1.0,
+            "title": "Wave Number",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "wave_number"
+        ],
+        "title": "GatewayReadyWave",
+        "type": "object"
+      },
+      "GatewayReadyWavesResponse": {
+        "description": "Evaluated ready waves for an orchestration run.",
+        "properties": {
+          "current_wave": {
+            "default": 1,
+            "description": "Currently executing wave number",
+            "minimum": 1.0,
+            "title": "Current Wave",
+            "type": "integer"
+          },
+          "run_id": {
+            "description": "Coordination run identifier",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "waves": {
+            "description": "All waves with ready tasks",
+            "items": {
+              "$ref": "#/components/schemas/GatewayReadyWave"
+            },
+            "title": "Waves",
+            "type": "array"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "title": "GatewayReadyWavesResponse",
+        "type": "object"
+      },
+      "GatewayRunCreateRequest": {
+        "description": "Request payload to create an external coordination run.",
+        "properties": {
+          "coordinator_handle": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Assigned coordinator worker or handle",
+            "title": "Coordinator Handle"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "description": "Arbitrary coordination metadata",
+            "title": "Metadata",
+            "type": "object"
+          },
+          "objective": {
+            "description": "Overall run objective",
+            "minLength": 1,
+            "title": "Objective",
+            "type": "string"
+          },
+          "run_id": {
+            "description": "External run identifier",
+            "minLength": 1,
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "objective"
+        ],
+        "title": "GatewayRunCreateRequest",
+        "type": "object"
+      },
+      "GatewayRunSummary": {
+        "description": "External coordination run summary.",
+        "properties": {
+          "consumer_generation": {
+            "default": 0,
+            "description": "Coordination consumer generation",
+            "minimum": 0.0,
+            "title": "Consumer Generation",
+            "type": "integer"
+          },
+          "coordinator_handle": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Assigned coordinator worker or handle",
+            "title": "Coordinator Handle"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Creation timestamp",
+            "title": "Created At"
+          },
+          "legacy": {
+            "default": false,
+            "description": "Whether run was migrated from legacy schema",
+            "title": "Legacy",
+            "type": "boolean"
+          },
+          "objective": {
+            "description": "Run objective",
+            "title": "Objective",
+            "type": "string"
+          },
+          "run_id": {
+            "description": "External run identifier",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "default": "active",
+            "description": "Run status: active | completed | failed",
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Last update timestamp",
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "run_id",
+          "objective"
+        ],
+        "title": "GatewayRunSummary",
+        "type": "object"
+      },
+      "GatewayWorkerSummary": {
+        "description": "Persistent worker summary for Orca ADE workforce roster.",
+        "properties": {
+          "capabilities": {
+            "description": "Worker skills and capabilities",
+            "items": {
+              "type": "string"
+            },
+            "title": "Capabilities",
+            "type": "array"
+          },
+          "current_profile_version": {
+            "description": "Active worker profile version",
+            "minimum": 1.0,
+            "title": "Current Profile Version",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Unique worker identifier",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "Human-readable worker name",
+            "title": "Name",
+            "type": "string"
+          },
+          "permissions": {
+            "description": "Worker permissions",
+            "items": {
+              "type": "string"
+            },
+            "title": "Permissions",
+            "type": "array"
+          },
+          "role": {
+            "description": "Worker role/specialization",
+            "title": "Role",
+            "type": "string"
+          },
+          "status": {
+            "description": "Operational status: idle | running | quarantined | paused",
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Last update timestamp",
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "role",
+          "status",
+          "current_profile_version"
+        ],
+        "title": "GatewayWorkerSummary",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Standardized API contract for the PersonaOS Integration Gateway (ADR 0041). Mediates communication between Orca ADE workspace coordination and the PersonaOS workforce kernel.",
+    "title": "PersonaOS Integration Gateway API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/integration/decision-gates": {
+      "get": {
+        "description": "Return tasks in review status requiring human-in-the-loop decisions.",
+        "operationId": "list_decision_gates_integration_decision_gates_get",
+        "parameters": [
+          {
+            "description": "Filter by coordination run identifier",
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by coordination run identifier",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/GatewayDecisionGate"
+                  },
+                  "title": "Response List Decision Gates Integration Decision Gates Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Interactive Decision Gates",
+        "tags": [
+          "integration"
+        ]
+      }
+    },
+    "/integration/decision-gates/{gate_id}": {
+      "get": {
+        "description": "Retrieve diagnostic context and question for a single decision gate.",
+        "operationId": "get_decision_gate_integration_decision_gates__gate_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "gate_id",
+            "required": true,
+            "schema": {
+              "title": "Gate Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GatewayDecisionGate"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Decision Gate Detail",
+        "tags": [
+          "integration"
+        ]
+      }
+    },
+    "/integration/decision-gates/{gate_id}/resolve": {
+      "post": {
+        "description": "Submit generation-fenced approval or rejection for a decision gate.",
+        "operationId": "resolve_decision_gate_integration_decision_gates__gate_id__resolve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "gate_id",
+            "required": true,
+            "schema": {
+              "title": "Gate Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GatewayGateResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GatewayGateResolveResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Decision Gate",
+        "tags": [
+          "integration"
+        ]
+      }
+    },
+    "/integration/diagnostics": {
+      "get": {
+        "description": "Deep diagnostic probe returning structured connectivity classification and latency.",
+        "operationId": "get_integration_diagnostics_integration_diagnostics_get",
+        "parameters": [
+          {
+            "description": "Optional target URL to probe",
+            "in": "query",
+            "name": "target_url",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional target URL to probe",
+              "title": "Target Url"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Origin",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Origin"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Access-Control-Request-Private-Network",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Access-Control-Request-Private-Network"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GatewayDiagnosticsResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Connection Diagnostics Probe",
+        "tags": [
+          "integration"
+        ]
+      }
+    },
+    "/integration/events": {
+      "get": {
+        "description": "Persistent Server-Sent Events (SSE) stream for real-time task lifecycle, ready waves, and decision gates.",
+        "operationId": "stream_integration_events_integration_events_get",
+        "parameters": [
+          {
+            "description": "Reconnection token fallback",
+            "in": "query",
+            "name": "last_event_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Reconnection token fallback",
+              "title": "Last Event Id"
+            }
+          },
+          {
+            "description": "Filter events for specific coordination run",
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter events for specific coordination run",
+              "title": "Run Id"
+            }
+          },
+          {
+            "description": "Keepalive heartbeat interval in seconds",
+            "in": "query",
+            "name": "heartbeat_interval",
+            "required": false,
+            "schema": {
+              "default": 15.0,
+              "description": "Keepalive heartbeat interval in seconds",
+              "maximum": 300.0,
+              "minimum": 0.05,
+              "title": "Heartbeat Interval",
+              "type": "number"
+            }
+          },
+          {
+            "description": "Max events to stream before closing, useful for testing",
+            "in": "query",
+            "name": "max_events",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Max events to stream before closing, useful for testing",
+              "title": "Max Events"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Last-Event-ID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Last-Event-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Integration Event Stream",
+        "tags": [
+          "integration"
+        ]
+      }
+    },
+    "/integration/events/publish": {
+      "post": {
+        "description": "Publish an event message to the SSE event bus for broadcast.",
+        "operationId": "publish_gateway_event_integration_events_publish_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GatewayEventMessage"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GatewayEventMessage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Publish Gateway Event",
+        "tags": [
+          "integration"
+        ]
+      }
+    },
+    "/integration/health": {
+      "get": {
+        "description": "Check operational health of the Integration Gateway and upstream connectivity.",
+        "operationId": "get_integration_health_integration_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GatewayHealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Integration Gateway Health",
+        "tags": [
+          "integration"
+        ]
+      }
+    },
+    "/integration/runs": {
+      "get": {
+        "description": "List active external coordination runs linked to PersonaOS tasks.",
+        "operationId": "list_integration_runs_integration_runs_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/GatewayRunSummary"
+                  },
+                  "title": "Response List Integration Runs Integration Runs Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Coordination Runs",
+        "tags": [
+          "integration"
+        ]
+      },
+      "post": {
+        "description": "Create or link an external orchestration coordination run.",
+        "operationId": "create_integration_run_integration_runs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GatewayRunCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GatewayRunSummary"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Coordination Run",
+        "tags": [
+          "integration"
+        ]
+      }
+    },
+    "/integration/runs/{run_id}/dag": {
+      "get": {
+        "description": "Return pre-evaluated DAG projection with task nodes, dependencies, and waves.",
+        "operationId": "get_run_dag_integration_runs__run_id__dag_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GatewayDagProjection"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Evaluated Task DAG",
+        "tags": [
+          "integration"
+        ]
+      }
+    },
+    "/integration/runs/{run_id}/ready-waves": {
+      "get": {
+        "description": "Return ready-to-execute tasks grouped by evaluation wave.",
+        "operationId": "get_run_ready_waves_integration_runs__run_id__ready_waves_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GatewayReadyWavesResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Ready Waves",
+        "tags": [
+          "integration"
+        ]
+      }
+    },
+    "/integration/workers": {
+      "get": {
+        "description": "Return persistent workers enriched with active profile versions and capabilities.",
+        "operationId": "list_integration_workers_integration_workers_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "role",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Role"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/GatewayWorkerSummary"
+                  },
+                  "title": "Response List Integration Workers Integration Workers Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Workforce Roster",
+        "tags": [
+          "integration"
+        ]
+      }
+    }
+  }
+}

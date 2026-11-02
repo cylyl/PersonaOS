@@ -347,6 +347,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 """
 
 
+@router.get("", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
 @router.get("/ui", response_class=HTMLResponse)
 async def get_dashboard_ui() -> HTMLResponse:
     """Serve the single-page operator dashboard interface."""

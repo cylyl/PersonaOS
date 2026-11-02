@@ -59,6 +59,7 @@ addopts = ["--strict-markers", "--strict-config"]
 
 [tool.mypy]
 python_version = "3.12"
+plugins = ["pydantic.mypy"]
 strict = true
 warn_return_any = true
 warn_unused_configs = true

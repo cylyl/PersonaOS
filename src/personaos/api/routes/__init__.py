@@ -12,6 +12,7 @@ from personaos.api.routes.cluster import router as cluster_router
 from personaos.api.routes.dashboard import router as dashboard_router
 from personaos.api.routes.events import router as events_router
 from personaos.api.routes.health import router as health_router
+from personaos.api.routes.integration import router as integration_router
 from personaos.api.routes.nodes import router as nodes_router
 from personaos.api.routes.protocol_ws import router as protocol_ws_router
 from personaos.api.routes.tasks import router as tasks_router
@@ -22,6 +23,7 @@ __all__ = [
     "dashboard_router",
     "events_router",
     "health_router",
+    "integration_router",
     "nodes_router",
     "protocol_ws_router",
     "tasks_router",
