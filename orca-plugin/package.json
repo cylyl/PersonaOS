@@ -1,0 +1,23 @@
+{
+  "name": "@personaos/orca-plugin",
+  "version": "1.1.0",
+  "description": "Visual ADE bridge for persistent AI workforce management, task delegation, and review",
+  "main": "index.ts",
+  "types": "contracts.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "npm run build && node --test dist/tests/**/*.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joseph118789-max/personaos-orca-plugin.git"
+  },
+  "author": "PersonaOS Team",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  },
+  "type": "module"
+}

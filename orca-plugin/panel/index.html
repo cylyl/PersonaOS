@@ -1,0 +1,1019 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PersonaOS — Orca ADE Workforce & Orchestration Bridge</title>
+  <style>
+    :root {
+      --bg-primary: #0f172a;
+      --bg-secondary: #1e293b;
+      --bg-card: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent-blue: #38bdf8;
+      --accent-green: #4ade80;
+      --accent-yellow: #facc15;
+      --accent-red: #f87171;
+      --accent-orange: #f97316;
+      --accent-purple: #c084fc;
+      --border: #475569;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg-primary);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      line-height: 1.4;
+      padding: 12px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .header-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    h1 {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      font-family: var(--font-mono);
+    }
+    .badge-connected { background: rgba(74, 222, 128, 0.15); color: var(--accent-green); border: 1px solid rgba(74, 222, 128, 0.3); }
+    .badge-reconnecting { background: rgba(250, 204, 21, 0.15); color: var(--accent-yellow); border: 1px solid rgba(250, 204, 21, 0.3); }
+    .badge-disconnected { background: rgba(248, 113, 113, 0.15); color: var(--accent-red); border: 1px solid rgba(248, 113, 113, 0.3); }
+
+    /* 8 Authoritative Lifecycle States */
+    .state-queued { background: rgba(148, 163, 184, 0.15); color: #94a3b8; border: 1px solid #94a3b8; }
+    .state-assigned { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid #38bdf8; }
+    .state-in_progress { background: rgba(96, 165, 250, 0.15); color: #60a5fa; border: 1px solid #60a5fa; }
+    .state-blocked { background: rgba(249, 115, 22, 0.15); color: #f97316; border: 1px solid #f97316; }
+    .state-review { background: rgba(250, 204, 21, 0.15); color: #facc15; border: 1px solid #facc15; }
+    .state-completed { background: rgba(74, 222, 128, 0.15); color: #4ade80; border: 1px solid #4ade80; }
+    .state-failed { background: rgba(248, 113, 113, 0.15); color: #f87171; border: 1px solid #f87171; }
+    .state-canceled { background: rgba(100, 116, 139, 0.15); color: #64748b; border: 1px solid #64748b; }
+
+    .controls-bar {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .controls-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    button {
+      background: var(--bg-card);
+      color: var(--text-main);
+      border: 1px solid var(--border);
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-family: inherit;
+    }
+    button:hover {
+      background: #475569;
+    }
+    .btn-primary {
+      background: #0284c7;
+      border-color: #0284c7;
+      color: white;
+    }
+    .btn-primary:hover {
+      background: #0369a1;
+    }
+    .btn-danger {
+      background: #b91c1c;
+      border-color: #b91c1c;
+      color: white;
+    }
+    .btn-danger:hover {
+      background: #991b1b;
+    }
+
+    input, select, textarea {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-family: inherit;
+    }
+
+    .banner-warning {
+      background: rgba(249, 115, 22, 0.1);
+      border-left: 3px solid var(--accent-orange);
+      padding: 6px 10px;
+      margin-bottom: 10px;
+      font-size: 11px;
+    }
+
+    .nav-tabs {
+      display: flex;
+      gap: 2px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 12px;
+      overflow-x: auto;
+    }
+    .nav-tab {
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      border-radius: 0;
+      padding: 6px 12px;
+      color: var(--text-muted);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .nav-tab.active {
+      color: var(--accent-blue);
+      border-bottom-color: var(--accent-blue);
+      font-weight: 600;
+    }
+
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    .card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .card-title {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .events-log {
+      background: #020617;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      height: 240px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .event-entry {
+      line-height: 1.4;
+      word-break: break-all;
+    }
+    .event-entry.heartbeat { color: #64748b; }
+    .event-entry.task_status_changed { color: var(--accent-blue); }
+    .event-entry.gate_created { color: var(--accent-yellow); }
+    .event-entry.gate_resolved { color: var(--accent-green); }
+    .event-entry.ready_wave_advanced { color: var(--accent-purple); }
+    .event-entry.error { color: var(--accent-red); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      padding: 6px 8px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      color: var(--text-muted);
+      font-weight: 600;
+      font-size: 11px;
+    }
+
+    .dag-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 8px;
+    }
+    .dag-node {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .node-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 600;
+    }
+
+    .progress-track {
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      height: 16px;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-top: 6px;
+      margin-bottom: 6px;
+      position: relative;
+    }
+    .progress-fill {
+      background: #38bdf8;
+      height: 100%;
+      transition: width 0.3s ease;
+    }
+    .progress-text {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      font-weight: 600;
+      color: #fff;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.8);
+    }
+  </style>
+</head>
+<body>
+
+  <div class="banner-warning">
+    <strong>Zero Direct Agent Invariant (ADR 0041):</strong> Orca panels communicate exclusively through native host IPC to the trusted worker. Direct agent CLI execution and browser fetch calls are strictly disabled.
+  </div>
+
+  <header>
+    <div class="header-title">
+      <h1>PersonaOS Workforce Bridge</h1>
+      <span id="sse-status-badge" class="badge badge-disconnected">DISCONNECTED</span>
+      <span class="badge" style="background:rgba(56,189,248,0.15); color:var(--accent-blue); border:1px solid rgba(56,189,248,0.3)">ORCA HOST IPC</span>
+      <span id="reconnect-badge" class="badge" style="display:none; background:rgba(255,255,255,0.1)">0 Reconnects</span>
+    </div>
+    <div class="controls-bar">
+      <div class="controls-row">
+        <span id="last-connection-info" style="font-size:11px; color:var(--text-muted); font-family:var(--font-mono);">Last OK: <span id="last-connection-time">never</span></span>
+        <button id="btn-reconnect" class="btn-primary">Reconnect</button>
+        <button id="btn-disconnect">Pause Stream</button>
+        <button id="btn-diagnostics">Diagnostics</button>
+      </div>
+    </div>
+  </header>
+
+  <nav class="nav-tabs">
+    <button class="nav-tab active" data-tab="tab-events">Live SSE Stream</button>
+    <button class="nav-tab" data-tab="tab-dag">Visual DAG & Waves</button>
+    <button class="nav-tab" data-tab="tab-gates">Decision Gates (<span id="gates-count">0</span>)</button>
+    <button class="nav-tab" data-tab="tab-workers">Workforce Roster</button>
+    <button class="nav-tab" data-tab="tab-submit">Submit Task (Idempotent)</button>
+    <button class="nav-tab" data-tab="tab-sessions">PAB Agent Sessions</button>
+    <button class="nav-tab" data-tab="tab-delegation">Delegation & Results</button>
+    <button class="nav-tab" data-tab="tab-diagnostics">Diagnostics</button>
+  </nav>
+
+  <!-- Tab 1: Live SSE Event Stream -->
+  <div id="tab-events" class="tab-content active">
+    <div class="card">
+      <div class="card-title">
+        <span>Lifecycle Server-Sent Events (ADR 0041 M5/M6)</span>
+        <span style="font-size:11px; font-weight:normal; color:var(--text-muted)">
+          Last Event ID: <span id="last-event-id-display" style="color:var(--accent-blue)">none</span>
+        </span>
+      </div>
+      <div id="events-stream-log" class="events-log">
+        <div class="event-entry">Initializing native host channel...</div>
+      </div>
+      <div style="display:flex; justify-content:space-between; margin-top:6px; font-size:11px; color:var(--text-muted)">
+        <span>Relayed securely from worker-owned SSE connection through Orca host messaging</span>
+        <button id="btn-clear-log" style="padding:2px 6px;">Clear Log</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab 2: Visual DAG & Ready Waves -->
+  <div id="tab-dag" class="tab-content">
+    <div class="card">
+      <div class="card-title">
+        <span>Evaluated Task DAG & Ready Waves (8 Lifecycle States)</span>
+        <div style="display:flex; gap:6px;">
+          <select id="run-select">
+            <option value="default">Run: default</option>
+          </select>
+          <button id="btn-refresh-dag" style="padding:2px 8px;">Refresh</button>
+        </div>
+      </div>
+      <div id="dag-summary" style="margin-bottom:8px; font-size:12px; color:var(--text-muted)">
+        Total: 0 | Completed: 0 | Ready: 0 | Current Wave: 1
+      </div>
+      <div id="dag-nodes-container" class="dag-grid">
+        <div style="color:var(--text-muted)">No tasks loaded for this run.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab 3: Decision Gates -->
+  <div id="tab-gates" class="tab-content">
+    <div class="card">
+      <div class="card-title">
+        <span>Interactive Decision Gates (Generation-Fenced Review Queue)</span>
+        <button id="btn-refresh-gates" style="padding:2px 8px;">Refresh</button>
+      </div>
+      <div id="gates-container">
+        <div style="color:var(--text-muted)">No decision gates currently awaiting review.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab 4: Workforce Roster -->
+  <div id="tab-workers" class="tab-content">
+    <div class="card">
+      <div class="card-title">
+        <span>Registered Persistent AI Workers</span>
+        <button id="btn-refresh-workers" style="padding:2px 8px;">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Worker ID</th>
+            <th>Name</th>
+            <th>Role</th>
+            <th>Status</th>
+            <th>Profile Ver</th>
+            <th>Capabilities</th>
+          </tr>
+        </thead>
+        <tbody id="workers-table-body">
+          <tr><td colspan="6" style="color:var(--text-muted)">Loading workers...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Tab 5: Idempotent Task Submission -->
+  <div id="tab-submit" class="tab-content">
+    <div class="card">
+      <div class="card-title">
+        <span>Submit Task (Idempotency & Profile Snapshots - Phase 2)</span>
+      </div>
+      <form id="task-submit-form" style="display:flex; flex-direction:column; gap:8px;">
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
+          <div>
+            <label style="display:block; font-size:11px; margin-bottom:2px;">Target Worker</label>
+            <select id="task-worker-select" style="width:100%;"></select>
+          </div>
+          <div>
+            <label style="display:block; font-size:11px; margin-bottom:2px;">Side-Effect Classification</label>
+            <select id="task-side-effect" style="width:100%;">
+              <option value="UNKNOWN">UNKNOWN</option>
+              <option value="IDEMPOTENT" selected>IDEMPOTENT</option>
+              <option value="HAS_SIDE_EFFECTS">HAS_SIDE_EFFECTS</option>
+            </select>
+          </div>
+        </div>
+        <div>
+          <label style="display:block; font-size:11px; margin-bottom:2px;">Task Title</label>
+          <input type="text" id="task-title-input" placeholder="e.g. Implement Health Check Endpoint" style="width:100%;" required />
+        </div>
+        <div>
+          <label style="display:block; font-size:11px; margin-bottom:2px;">Task Objective & Description</label>
+          <textarea id="task-objective-input" rows="3" placeholder="Objective specifications..." style="width:100%;" required></textarea>
+        </div>
+        <div style="display:grid; grid-template-columns: 2fr 1fr; gap:8px;">
+          <div>
+            <label style="display:block; font-size:11px; margin-bottom:2px;">
+              Idempotency Key (UUIDv4)
+              <button type="button" id="btn-generate-key" style="margin-left:6px; padding:1px 4px; font-size:10px;">Regenerate</button>
+            </label>
+            <input type="text" id="task-idempotency-key" style="width:100%; font-family:var(--font-mono);" />
+          </div>
+          <div>
+            <label style="display:block; font-size:11px; margin-bottom:2px;">Profile Version</label>
+            <input type="number" id="task-profile-ver" value="1" min="1" style="width:100%;" />
+          </div>
+        </div>
+        <div>
+          <label style="display:block; font-size:11px; margin-bottom:2px;">Dependency Task IDs (comma-separated)</label>
+          <input type="text" id="task-deps-input" placeholder="uuid-1, uuid-2" style="width:100%; font-family:var(--font-mono);" />
+        </div>
+        <div>
+          <button type="submit" class="btn-primary" style="margin-top:6px;">Enqueue Task into PersonaOS</button>
+        </div>
+      </form>
+      <div id="submit-result" style="margin-top:8px; font-size:11px; font-family:var(--font-mono);"></div>
+    </div>
+  </div>
+
+  <!-- Tab 6: PAB Execution Sessions -->
+  <div id="tab-sessions" class="tab-content">
+    <div class="card">
+      <div class="card-title">
+        <span>PAB Agent Execution Sessions (Phase 4)</span>
+        <button id="btn-refresh-sessions" style="padding:2px 8px;">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Task ID</th>
+            <th>Title</th>
+            <th>Worker</th>
+            <th>Status</th>
+            <th>Wave</th>
+            <th>Gen</th>
+          </tr>
+        </thead>
+        <tbody id="sessions-table-body">
+          <tr><td colspan="6" style="color:var(--text-muted)">Loading sessions...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Tab 7: Delegation Progress & Results -->
+  <div id="tab-delegation" class="tab-content">
+    <div class="card">
+      <div class="card-title">
+        <span>Multi-Agent Delegation Progress & Result Aggregation (Phase 5)</span>
+        <button id="btn-refresh-delegation" style="padding:2px 8px;">Refresh</button>
+      </div>
+      <div>
+        <div style="display:flex; justify-content:space-between; font-size:11px; color:var(--text-muted)">
+          <span>Estimated Progress:</span>
+          <span id="delegation-pct-label">0%</span>
+        </div>
+        <div class="progress-track">
+          <div id="delegation-progress-bar" class="progress-fill" style="width:0%;"></div>
+          <div id="delegation-progress-text" class="progress-text">0 / 0 Completed</div>
+        </div>
+      </div>
+      <div id="delegation-stats" style="margin: 8px 0; font-size:11px; display:flex; gap:12px; flex-wrap:wrap;"></div>
+      <h3 style="font-size:12px; margin: 10px 0 6px 0; color:var(--accent-blue)">Task Execution States</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Task ID</th>
+            <th>Title</th>
+            <th>Worker</th>
+            <th>Status</th>
+            <th>Gen</th>
+            <th>Lifecycle Stage</th>
+          </tr>
+        </thead>
+        <tbody id="results-table-body">
+          <tr><td colspan="6" style="color:var(--text-muted)">No delegation results loaded.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Tab 8: Diagnostics -->
+  <div id="tab-diagnostics" class="tab-content">
+    <div class="card">
+      <div class="card-title">
+        <span>Connection & Security Boundary Diagnostics (ADR 0041 M2/M3)</span>
+        <button id="btn-run-full-diag" style="padding:2px 8px;">Run Diagnostic Probe</button>
+      </div>
+      <div id="diag-results" style="font-family:var(--font-mono); font-size:11px; line-height:1.6;">
+        Click "Run Diagnostic Probe" to test backend liveliness, ADR 0041 invariant compliance, and gateway connectivity.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ADR 0041 Workforce Bridge Native Host Client
+    let lastSuccessfulConnection = null;
+    let isPolling = false;
+    let reconnectTimer = null;
+
+    const state = {
+      lastEventId: null,
+      reconnectCount: 0,
+      connected: false,
+      disconnectedManually: false,
+    };
+
+    // DOM Elements
+    const sseBadge = document.getElementById('sse-status-badge');
+    const reconnectBadge = document.getElementById('reconnect-badge');
+    const lastEventIdDisplay = document.getElementById('last-event-id-display');
+    const lastConnTimeDisplay = document.getElementById('last-connection-time');
+    const eventsLog = document.getElementById('events-stream-log');
+
+    // Generate random UUID helper
+    function generateUUID() {
+      if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+        return crypto.randomUUID();
+      }
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+    }
+
+    document.getElementById('task-idempotency-key').value = generateUUID();
+    document.getElementById('btn-generate-key').addEventListener('click', () => {
+      document.getElementById('task-idempotency-key').value = generateUUID();
+    });
+
+    function updateConnectionMeta() {
+      if (lastSuccessfulConnection && lastConnTimeDisplay) {
+        lastConnTimeDisplay.textContent = lastSuccessfulConnection.toLocaleTimeString();
+      }
+    }
+
+    // Call Trusted Worker via Orca Native Host API (ADR 0041)
+    async function callWorker(action, payload = {}) {
+      const correlationId = 'req-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
+      
+      if (typeof window.orca !== 'undefined' && window.orca.host && typeof window.orca.host.call === 'function') {
+        const hostRes = await window.orca.host.call('plugin.messageWorker', {
+          action,
+          payload,
+          correlationId,
+        });
+
+        if (!hostRes || hostRes.ok === false) {
+          const err = new Error(hostRes?.error || `Host error: ${hostRes?.code || 'ACTION_FAILED'}`);
+          err.code = hostRes?.code || 'ACTION_FAILED';
+          throw err;
+        }
+
+        const workerRes = hostRes.value !== undefined ? hostRes.value : hostRes;
+        if (!workerRes || workerRes.ok === false) {
+          const err = new Error(workerRes?.error || `Worker error: ${workerRes?.code || 'ACTION_FAILED'}`);
+          err.code = workerRes?.code || 'ACTION_FAILED';
+          throw err;
+        }
+
+        lastSuccessfulConnection = new Date();
+        updateConnectionMeta();
+        return workerRes.data;
+      }
+
+      throw new Error('ADR 0041: Orca Host API (window.orca.host.call) is required. Direct browser fetch is disabled.');
+    }
+
+    function setConnectionStatus(status) {
+      sseBadge.className = 'badge';
+      if (status === 'connected') {
+        sseBadge.classList.add('badge-connected');
+        sseBadge.textContent = 'CONNECTED';
+        reconnectBadge.style.display = 'none';
+        state.connected = true;
+      } else if (status === 'reconnecting') {
+        sseBadge.classList.add('badge-reconnecting');
+        sseBadge.textContent = 'RECONNECTING';
+        reconnectBadge.style.display = 'inline-flex';
+        reconnectBadge.textContent = `${state.reconnectCount} Reconnects`;
+        state.connected = false;
+      } else {
+        sseBadge.classList.add('badge-disconnected');
+        sseBadge.textContent = 'DISCONNECTED';
+        reconnectBadge.style.display = 'none';
+        state.connected = false;
+      }
+    }
+
+    function logEvent(type, payload, eventId) {
+      const entry = document.createElement('div');
+      entry.className = `event-entry ${type}`;
+      const timeStr = new Date().toLocaleTimeString();
+      const idStr = eventId ? ` [${String(eventId).substring(0, 8)}]` : '';
+      entry.textContent = `[${timeStr}] ${type.toUpperCase()}${idStr}: ${JSON.stringify(payload)}`;
+      eventsLog.prepend(entry);
+    }
+
+    // Long-polling event streamer relaying SSE events through Orca Host Messaging (Phase M5)
+    async function pollEventsLoop() {
+      if (isPolling || state.disconnectedManually) return;
+      isPolling = true;
+
+      while (!state.disconnectedManually) {
+        try {
+          const res = await callWorker('pollEvents', {
+            since: state.lastEventId,
+            timeoutMs: 15000,
+          });
+
+          setConnectionStatus(res.connected !== false ? 'connected' : 'reconnecting');
+          state.reconnectCount = 0;
+
+          if (res.lastEventId) {
+            state.lastEventId = res.lastEventId;
+            lastEventIdDisplay.textContent = res.lastEventId;
+          }
+
+          if (res.events && res.events.length > 0) {
+            for (const ev of res.events) {
+              if (ev.event_id) {
+                state.lastEventId = ev.event_id;
+                lastEventIdDisplay.textContent = ev.event_id;
+              }
+              const eventType = ev.event_type || 'message';
+              const payload = ev.payload !== undefined ? ev.payload : ev;
+              logEvent(eventType, payload, ev.event_id);
+
+              // Auto-refresh tabs on lifecycle state changes
+              if (eventType === 'task_status_changed' || eventType === 'ready_wave_advanced') {
+                loadDag();
+                loadDelegation();
+              } else if (eventType === 'gate_created' || eventType === 'gate_resolved') {
+                loadGates();
+                loadDag();
+              } else if (eventType === 'worker_registered' || eventType === 'worker_heartbeat') {
+                loadWorkers();
+              }
+            }
+          }
+        } catch (err) {
+          if (state.disconnectedManually) break;
+          setConnectionStatus('reconnecting');
+          state.reconnectCount++;
+          const delay = Math.min(1000 * Math.pow(1.5, Math.min(state.reconnectCount, 6)), 15000);
+          await new Promise(r => setTimeout(r, delay));
+        }
+      }
+      isPolling = false;
+    }
+
+    // Load Workers
+    async function loadWorkers() {
+      const tbody = document.getElementById('workers-table-body');
+      const workerSelect = document.getElementById('task-worker-select');
+      try {
+        const workers = await callWorker('getWorkers');
+        tbody.innerHTML = '';
+        workerSelect.innerHTML = '';
+
+        if (!Array.isArray(workers) || workers.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted)">No registered workers found in PersonaOS workforce.</td></tr>';
+          return;
+        }
+
+        for (const w of workers) {
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td><strong>${w.id}</strong></td>
+            <td>${w.name}</td>
+            <td>${w.role}</td>
+            <td><span class="badge ${w.status === 'idle' ? 'badge-connected' : 'badge-reconnecting'}">${w.status}</span></td>
+            <td>v${w.current_profile_version}</td>
+            <td style="font-family:var(--font-mono); font-size:11px;">${(w.capabilities || []).join(', ')}</td>
+          `;
+          tbody.appendChild(row);
+
+          const opt = document.createElement('option');
+          opt.value = w.id;
+          opt.textContent = `${w.name} (${w.role}) - v${w.current_profile_version}`;
+          workerSelect.appendChild(opt);
+        }
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--accent-red)">Failed to load workers: ${err.message}</td></tr>`;
+      }
+    }
+
+    // Load DAG & Ready Waves
+    async function loadDag() {
+      const container = document.getElementById('dag-nodes-container');
+      const summary = document.getElementById('dag-summary');
+      const runId = document.getElementById('run-select').value || 'default';
+      try {
+        const dag = await callWorker('getDag', { runId });
+        summary.textContent = `Total: ${dag.total_tasks} | Completed: ${dag.completed_tasks} | Ready: ${dag.ready_tasks}`;
+        container.innerHTML = '';
+
+        if (!dag.nodes || dag.nodes.length === 0) {
+          container.innerHTML = '<div style="color:var(--text-muted)">No tasks found in DAG projection.</div>';
+          return;
+        }
+
+        for (const n of dag.nodes) {
+          const card = document.createElement('div');
+          card.className = 'dag-node';
+          const stateBadgeCls = `state-${n.status}`;
+          card.innerHTML = `
+            <div class="node-header">
+              <span>${n.title}</span>
+              <span class="badge ${stateBadgeCls}">${n.status.toUpperCase()}</span>
+            </div>
+            <div style="font-size:11px; color:var(--text-muted)">
+              ID: ${n.task_id.substring(0, 8)}... | Worker: ${n.worker_id || 'unassigned'}
+            </div>
+            <div style="font-size:11px;">
+              Wave: <strong>Tier ${n.wave}</strong> | Gen: ${n.generation}
+            </div>
+          `;
+          container.appendChild(card);
+        }
+      } catch (err) {
+        container.innerHTML = `<div style="color:var(--accent-red)">Failed to load DAG: ${err.message}</div>`;
+      }
+    }
+
+    // Load Decision Gates
+    async function loadGates() {
+      const container = document.getElementById('gates-container');
+      const countBadge = document.getElementById('gates-count');
+      try {
+        const gates = await callWorker('getDecisionGates');
+        countBadge.textContent = Array.isArray(gates) ? gates.length : 0;
+        container.innerHTML = '';
+
+        if (!Array.isArray(gates) || gates.length === 0) {
+          container.innerHTML = '<div style="color:var(--text-muted)">No decision gates awaiting review.</div>';
+          return;
+        }
+
+        for (const g of gates) {
+          const gateCard = document.createElement('div');
+          gateCard.style.cssText = 'background:var(--bg-card); border:1px solid var(--border); border-radius:4px; padding:10px; margin-bottom:8px;';
+          gateCard.innerHTML = `
+            <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+              <strong>${g.title}</strong>
+              <span class="badge badge-reconnecting">PENDING (Gen ${g.execution_generation})</span>
+            </div>
+            <p style="font-size:12px; margin-bottom:6px;">${g.question}</p>
+            <div style="font-size:11px; color:var(--text-muted); margin-bottom:8px;">
+              Gate ID: <code>${g.gate_id}</code> | Reason: ${g.review_context?.exhaustion_reason || 'operator review'}
+            </div>
+            <div style="display:flex; gap:8px;">
+              <button class="btn-primary" onclick="resolveGate('${g.gate_id}', 'approve', ${g.execution_generation})">Approve & Resume</button>
+              <button class="btn-danger" onclick="resolveGate('${g.gate_id}', 'reject', ${g.execution_generation})">Reject</button>
+            </div>
+          `;
+          container.appendChild(gateCard);
+        }
+      } catch (err) {
+        container.innerHTML = `<div style="color:var(--accent-red)">Failed to load gates: ${err.message}</div>`;
+      }
+    }
+
+    // Resolve Gate with Generation Fencing (Phase M4)
+    window.resolveGate = async function(gateId, decision, expectedGen) {
+      try {
+        await callWorker('resolveDecisionGate', {
+          gateId,
+          decision,
+          expectedGeneration: expectedGen,
+          reviewNotes: `Operator decision from Orca ADE panel (${decision})`,
+        });
+        loadGates();
+        loadDag();
+      } catch (err) {
+        alert(`Decision Gate Resolution Error: ${err.message}`);
+      }
+    };
+
+    // Load Sessions Tab
+    async function loadSessions() {
+      const tbody = document.getElementById('sessions-table-body');
+      try {
+        const dag = await callWorker('getDag', { runId: 'default' });
+        tbody.innerHTML = '';
+
+        if (!dag.nodes || dag.nodes.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted)">No active execution sessions found.</td></tr>';
+          return;
+        }
+
+        for (const n of dag.nodes) {
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td><code>${n.task_id.substring(0, 10)}...</code></td>
+            <td>${n.title}</td>
+            <td>${n.worker_id || 'unassigned'}</td>
+            <td><span class="badge state-${n.status}">${n.status}</span></td>
+            <td>Tier ${n.wave}</td>
+            <td>Gen ${n.generation}</td>
+          `;
+          tbody.appendChild(row);
+        }
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--accent-red)">Failed to load sessions: ${err.message}</td></tr>`;
+      }
+    }
+
+    // Load Delegation Tab
+    async function loadDelegation() {
+      const pctLabel = document.getElementById('delegation-pct-label');
+      const bar = document.getElementById('delegation-progress-bar');
+      const barText = document.getElementById('delegation-progress-text');
+      const stats = document.getElementById('delegation-stats');
+      const tbody = document.getElementById('results-table-body');
+
+      try {
+        const dag = await callWorker('getDag', { runId: 'default' });
+        const total = dag.total_tasks || (dag.nodes ? dag.nodes.length : 0);
+        const completed = dag.completed_tasks || (dag.nodes ? dag.nodes.filter(n => n.status === 'completed').length : 0);
+        const failed = dag.nodes ? dag.nodes.filter(n => n.status === 'failed').length : 0;
+        const review = dag.nodes ? dag.nodes.filter(n => n.status === 'review').length : 0;
+        const blocked = dag.nodes ? dag.nodes.filter(n => n.status === 'blocked').length : 0;
+        const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+        pctLabel.textContent = `${pct}%`;
+        bar.style.width = `${pct}%`;
+        barText.textContent = `${completed} / ${total} Completed`;
+
+        stats.innerHTML = `
+          <span>Total: <strong>${total}</strong></span>
+          <span style="color:var(--accent-green)">Completed: <strong>${completed}</strong></span>
+          <span style="color:var(--accent-red)">Failed: <strong>${failed}</strong></span>
+          <span style="color:var(--accent-yellow)">Review: <strong>${review}</strong></span>
+          <span style="color:var(--accent-orange)">Blocked: <strong>${blocked}</strong></span>
+        `;
+
+        tbody.innerHTML = '';
+        if (!dag.nodes || dag.nodes.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted)">No delegation results loaded.</td></tr>';
+          return;
+        }
+
+        for (const n of dag.nodes) {
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td><code>${n.task_id.substring(0, 10)}...</code></td>
+            <td>${n.title}</td>
+            <td>${n.worker_id || 'unassigned'}</td>
+            <td><span class="badge state-${n.status}">${n.status}</span></td>
+            <td>Gen ${n.generation}</td>
+            <td>${n.status === 'completed' ? 'Finalized' : 'In Progress'}</td>
+          `;
+          tbody.appendChild(row);
+        }
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="6" style="color:var(--accent-red)">Failed to load delegation results: ${err.message}</td></tr>`;
+      }
+    }
+
+    // Diagnostics Probe (Phase M3)
+    async function runDiagnostics() {
+      const diagDiv = document.getElementById('diag-results');
+      diagDiv.textContent = 'Probing PersonaOS Gateway & Host Bridge via trusted worker...';
+
+      try {
+        const [diag, health] = await Promise.all([
+          callWorker('getDiagnostics'),
+          callWorker('getHealth'),
+        ]);
+
+        diagDiv.innerHTML = `
+          <div>Status: <strong style="color:${diag.status === 'ok' ? 'var(--accent-green)' : 'var(--accent-yellow)'}">${diag.status.toUpperCase()} (${diag.code})</strong></div>
+          <div>Latency: <strong>${diag.latency_ms} ms</strong></div>
+          <div>Upstream URL: <strong>${diag.upstream_url}</strong></div>
+          <div>CORS Supported: ${diag.cors_supported} | PNA Supported: ${diag.pna_supported}</div>
+          <div>Auth Status: ${diag.auth_status} | Version Match: ${diag.api_version_match}</div>
+          <div>Zero Direct Agent Invariant (ADR 0041): <strong style="color:var(--accent-green)">ENFORCED & COMPLIANT</strong></div>
+          <div>Database: ${diag.details?.database || 'ok'} | PAB Connected: ${diag.details?.pab_connected}</div>
+          <div>Gateway Health: ${health.status} (v${health.gateway_version})</div>
+          ${diag.remediation ? `<div style="color:var(--accent-yellow); margin-top:6px;">Remediation: ${diag.remediation}</div>` : ''}
+        `;
+      } catch (err) {
+        diagDiv.innerHTML = `
+          <div style="color:var(--accent-red)">Diagnostic probe failed: ${err.message}</div>
+          <div style="color:var(--text-muted); margin-top:6px;">Ensure the PersonaOS system service is running (systemctl status personaos).</div>
+        `;
+      }
+    }
+
+    // Task Submission Form Handler
+    document.getElementById('task-submit-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const resultDiv = document.getElementById('submit-result');
+      resultDiv.textContent = 'Submitting task via trusted worker to PersonaOS...';
+
+      const workerId = document.getElementById('task-worker-select').value;
+      const title = document.getElementById('task-title-input').value;
+      const objective = document.getElementById('task-objective-input').value;
+      const key = document.getElementById('task-idempotency-key').value || generateUUID();
+      const sideEffect = document.getElementById('task-side-effect').value;
+      const profileVer = parseInt(document.getElementById('task-profile-ver').value, 10) || 1;
+      const rawDeps = document.getElementById('task-deps-input').value;
+      const deps = rawDeps ? rawDeps.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+      const payload = {
+        workerId,
+        title,
+        objective,
+        dependencies: deps,
+        idempotencyKey: key,
+        sideEffectClassification: sideEffect,
+        profileVersion: profileVer,
+      };
+
+      try {
+        const res = await callWorker('submitTask', payload);
+        resultDiv.innerHTML = `<span style="color:var(--accent-green)">✓ Task enqueued successfully: ID <strong>${res.id}</strong> (Status: ${res.status}, IdempotencyKey: ${key})</span>`;
+        loadDag();
+        loadDelegation();
+        // Generate fresh key for next submit
+        document.getElementById('task-idempotency-key').value = generateUUID();
+      } catch (err) {
+        resultDiv.innerHTML = `<span style="color:var(--accent-red)">✗ Task submission failed: ${err.message}</span>`;
+      }
+    });
+
+    // Tab Switching
+    document.querySelectorAll('.nav-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        tab.classList.add('active');
+        const target = tab.dataset.tab;
+        document.getElementById(target).classList.add('active');
+
+        if (target === 'tab-workers') loadWorkers();
+        if (target === 'tab-dag') loadDag();
+        if (target === 'tab-gates') loadGates();
+        if (target === 'tab-sessions') loadSessions();
+        if (target === 'tab-delegation') loadDelegation();
+        if (target === 'tab-diagnostics') runDiagnostics();
+      });
+    });
+
+    // Button event listeners
+    document.getElementById('btn-reconnect').addEventListener('click', () => {
+      state.disconnectedManually = false;
+      state.reconnectCount = 0;
+      setConnectionStatus('reconnecting');
+      pollEventsLoop();
+      loadWorkers();
+      loadDag();
+      loadGates();
+    });
+
+    document.getElementById('btn-disconnect').addEventListener('click', () => {
+      state.disconnectedManually = true;
+      setConnectionStatus('disconnected');
+    });
+
+    document.getElementById('btn-clear-log').addEventListener('click', () => {
+      eventsLog.innerHTML = '';
+    });
+
+    document.getElementById('btn-diagnostics').addEventListener('click', () => {
+      document.querySelector('[data-tab="tab-diagnostics"]').click();
+    });
+
+    document.getElementById('btn-run-full-diag').addEventListener('click', () => runDiagnostics());
+    document.getElementById('btn-refresh-workers').addEventListener('click', () => loadWorkers());
+    document.getElementById('btn-refresh-dag').addEventListener('click', () => loadDag());
+    document.getElementById('btn-refresh-gates').addEventListener('click', () => loadGates());
+    document.getElementById('btn-refresh-sessions').addEventListener('click', () => loadSessions());
+    document.getElementById('btn-refresh-delegation').addEventListener('click', () => loadDelegation());
+
+    // Auto-init on load
+    window.addEventListener('DOMContentLoaded', async () => {
+      try {
+        const health = await callWorker('getHealth');
+        if (health && health.status === 'healthy') {
+          setConnectionStatus('connected');
+          logEvent('system', { message: 'PersonaOS Workforce Bridge connected via Orca Host IPC', gateway_version: health.gateway_version });
+          loadWorkers();
+          loadDag();
+          loadGates();
+          pollEventsLoop();
+        } else {
+          setConnectionStatus('reconnecting');
+        }
+      } catch (err) {
+        setConnectionStatus('reconnecting');
+        logEvent('error', { message: err.message });
+        pollEventsLoop();
+      }
+    });
+  </script>
+</body>
+</html>

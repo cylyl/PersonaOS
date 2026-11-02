@@ -1,0 +1,16 @@
+{
+  "name": "PersonaOS Workforce Marketplace",
+  "owner": "joseph118789-max",
+  "plugins": [
+    {
+      "id": "joseph118789-max.personaos-bridge",
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/joseph118789-max/personaos-orca-plugin.git",
+        "ref": "main"
+      },
+      "description": "Visual ADE bridge for persistent AI workforce management, task delegation, and review.",
+      "categories": ["tools"]
+    }
+  ]
+}

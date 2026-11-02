@@ -1,0 +1,35 @@
+{
+  "manifestVersion": 1,
+  "id": "personaos-bridge",
+  "publisher": "joseph118789-max",
+  "name": "PersonaOS Workforce Bridge",
+  "version": "1.1.0",
+  "description": "Visual ADE bridge for persistent AI workforce management, task delegation, and review.",
+  "author": {
+    "name": "PersonaOS Team"
+  },
+  "repository": "https://github.com/joseph118789-max/personaos-orca-plugin",
+  "pluginApi": 1,
+  "execution": "trusted-worker",
+  "main": "dist/index.js",
+  "engines": {
+    "orca": ">=1.0.0"
+  },
+  "contributes": {
+    "panels": [
+      {
+        "id": "personaos",
+        "title": "PersonaOS",
+        "icon": "bot",
+        "entry": "panel/index.html"
+      }
+    ],
+    "commands": [
+      {
+        "id": "personaos.messageWorker",
+        "title": "Message PersonaOS Worker"
+      }
+    ]
+  },
+  "capabilities": []
+}
