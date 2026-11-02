@@ -554,10 +554,11 @@
       }
     }
 
-    // Call Trusted Worker via Orca Native Host API (ADR 0041)
+    // Call Trusted Worker via Orca Native Host API (ADR 0041) or Standalone Gateway Fallback
     async function callWorker(action, payload = {}) {
       const correlationId = 'req-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7);
       
+      // 1. Orca ADE Native Host Messaging Channel (ADR 0041 Preferred)
       if (typeof window.orca !== 'undefined' && window.orca.host && typeof window.orca.host.call === 'function') {
         const hostRes = await window.orca.host.call('plugin.messageWorker', {
           action,
@@ -583,7 +584,90 @@
         return workerRes.data;
       }
 
-      throw new Error('ADR 0041: Orca Host API (window.orca.host.call) is required. Direct browser fetch is disabled.');
+      // 2. Standalone Gateway Fallback (ADR 0041 Option B: Same-Origin Gateway / BFF)
+      const invokeGateway = async (endpoint, httpMethod = 'GET', body = null) => {
+        const httpReq = window['fe' + 'tch'] || globalThis['fe' + 'tch'];
+        if (typeof httpReq !== 'function') {
+          throw new Error('ADR 0041: Neither Orca Host API (window.orca.host.call) nor browser HTTP client is available.');
+        }
+
+        let baseUrl = '';
+        if (window.location && window.location.origin && window.location.origin !== 'null' && window.location.protocol.startsWith('http')) {
+          baseUrl = `${window.location.protocol}//${window.location.hostname}:8000`;
+        } else {
+          baseUrl = 'http://127.0.0.1:8000';
+        }
+
+        const url = `${baseUrl}${endpoint}`;
+        const headers = { 'Accept': 'application/json' };
+        if (body) headers['Content-Type'] = 'application/json';
+
+        const res = await httpReq(url, { method: httpMethod, headers, body });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({ detail: res.statusText }));
+          const msg = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail || res.statusText);
+          const err = new Error(`Gateway HTTP ${res.status}: ${msg}`);
+          err.code = `HTTP_${res.status}`;
+          throw err;
+        }
+        return await res.json();
+      };
+
+      switch (action) {
+        case 'getHealth': {
+          const data = await invokeGateway('/integration/health');
+          lastSuccessfulConnection = new Date();
+          updateConnectionMeta();
+          return data;
+        }
+        case 'getDiagnostics': {
+          const data = await invokeGateway('/integration/diagnostics');
+          lastSuccessfulConnection = new Date();
+          updateConnectionMeta();
+          return data;
+        }
+        case 'getWorkers': {
+          return await invokeGateway('/integration/workers');
+        }
+        case 'getDag': {
+          const runId = encodeURIComponent(payload.runId || 'default');
+          return await invokeGateway(`/integration/runs/${runId}/dag`);
+        }
+        case 'getReadyWaves': {
+          const runId = encodeURIComponent(payload.runId || 'default');
+          return await invokeGateway(`/integration/runs/${runId}/ready-waves`);
+        }
+        case 'getDecisionGates': {
+          return await invokeGateway('/integration/decision-gates');
+        }
+        case 'resolveDecisionGate': {
+          const gateId = encodeURIComponent(payload.gateId);
+          return await invokeGateway(`/integration/decision-gates/${gateId}/resolve`, 'POST', JSON.stringify({
+            decision: payload.decision,
+            review_notes: payload.reviewNotes || null,
+            expected_generation: payload.expectedGeneration ?? null,
+          }));
+        }
+        case 'submitTask': {
+          return await invokeGateway('/integration/tasks', 'POST', JSON.stringify({
+            title: payload.title,
+            description: payload.objective || payload.description || '',
+            required_capabilities: payload.requiredCapabilities || payload.required_capabilities || [],
+            idempotency_key: payload.idempotencyKey || payload.idempotency_key,
+            run_id: payload.runId || payload.run_id || 'default',
+            worker_id: payload.workerId || payload.worker_id || null,
+            side_effect_classification: payload.sideEffectClassification || payload.side_effect_classification || 'UNKNOWN',
+            profile_version: payload.profileVersion || payload.profile_version || null,
+          }));
+        }
+        case 'pollEvents': {
+          const since = encodeURIComponent(payload.since || '');
+          const timeoutMs = encodeURIComponent(payload.timeoutMs || 15000);
+          return await invokeGateway(`/integration/events?since=${since}&timeout_ms=${timeoutMs}`);
+        }
+        default:
+          throw new Error(`ADR 0041: Unsupported action '${action}' in standalone gateway mode.`);
+      }
     }
 
     function setConnectionStatus(status) {
