@@ -6,6 +6,7 @@ __pycache__/
 .eggs/
 build/
 dist/
+!orca-plugin/dist/
 .pyc
 
 # Virtual environments
