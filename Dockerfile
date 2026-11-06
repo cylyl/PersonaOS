@@ -31,6 +31,7 @@ COPY --from=builder /build/dist/*.whl /tmp/
 RUN pip install --no-cache-dir /tmp/*.whl && rm -rf /tmp/*.whl
 
 COPY src/personaos/db/migrations/ /app/src/personaos/db/migrations/
+COPY alembic.ini /app/alembic.ini
 COPY policies/ /app/policies/
 COPY profiles/ /app/profiles/
 
