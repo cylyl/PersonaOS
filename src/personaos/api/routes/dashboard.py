@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import func, select
 
 from personaos.api.deps import SessionDep
@@ -230,8 +230,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       font-weight: 600;
     }
     .status-active { background: rgba(74, 222, 128, 0.2); color: var(--success); }
+    .status-idle { background: rgba(56, 189, 248, 0.2); color: var(--accent); }
+    .status-busy { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
     .status-paused { background: rgba(250, 204, 21, 0.2); color: var(--warning); }
     .status-quarantined { background: rgba(248, 113, 113, 0.2); color: var(--danger); }
+    .status-offline { background: rgba(148, 163, 184, 0.2); color: var(--muted); }
   </style>
 </head>
 <body>
@@ -297,24 +300,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <script>
     async function refreshDashboard() {
       try {
+        const basePath = window.location.pathname.replace(/\/ui\/?$/, '');
         const [wRes, wrkRes] = await Promise.all([
-          fetch('/dashboard/workload'),
-          fetch('/dashboard/workers')
+          fetch(basePath + '/workload'),
+          fetch(basePath + '/workers')
         ]);
         const wData = await wRes.json();
         const wrkData = await wrkRes.json();
 
-        document.getElementById('val-queued').textContent = wData.queued_tasks;
-        document.getElementById('val-running').textContent = wData.in_progress_tasks;
-        document.getElementById('val-completed').textContent = wData.completed_tasks;
-        document.getElementById('val-failed').textContent = wData.failed_tasks;
-        const avgSec = (wData.avg_execution_ms / 1000).toFixed(1);
+        document.getElementById('val-queued').textContent = wData.queued_tasks ?? '-';
+        document.getElementById('val-running').textContent = wData.in_progress_tasks ?? '-';
+        document.getElementById('val-completed').textContent = wData.completed_tasks ?? '-';
+        document.getElementById('val-failed').textContent = wData.failed_tasks ?? '-';
+        const avgMs = wData.avg_execution_ms || 0;
+        const avgSec = (avgMs / 1000).toFixed(1);
         document.getElementById('val-latency').textContent = avgSec + 's';
-        document.getElementById('val-cost').textContent = '$' + wData.total_cost_usd.toFixed(2);
+        const costUsd = wData.total_cost_usd || 0;
+        document.getElementById('val-cost').textContent = '$' + costUsd.toFixed(2);
 
         const tbody = document.getElementById('workers-table-body');
         tbody.innerHTML = '';
-        if (wrkData.workers.length === 0) {
+        if (!wrkData.workers || wrkData.workers.length === 0) {
           tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;">No workers.</td></tr>';
         } else {
           wrkData.workers.forEach(w => {
@@ -347,9 +353,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 """
 
 
-@router.get("", response_class=HTMLResponse)
-@router.get("/", response_class=HTMLResponse)
-@router.get("/ui", response_class=HTMLResponse)
+@router.api_route("/ui", methods=["GET", "HEAD"], response_class=HTMLResponse)
 async def get_dashboard_ui() -> HTMLResponse:
     """Serve the single-page operator dashboard interface."""
     return HTMLResponse(content=DASHBOARD_HTML, status_code=200)
+
+
+@router.api_route("", methods=["GET", "HEAD"])
+@router.api_route("/", methods=["GET", "HEAD"])
+async def redirect_dashboard() -> RedirectResponse:
+    """Redirect /dashboard and /dashboard/ to /dashboard/ui."""
+    return RedirectResponse(url="/dashboard/ui", status_code=status.HTTP_307_TEMPORARY_REDIRECT)

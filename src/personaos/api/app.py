@@ -18,7 +18,7 @@ import structlog
 import uvicorn
 from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from personaos.api.routes import (
@@ -238,6 +238,10 @@ def create_app(
     app.include_router(events_router, prefix="/api")
     app.include_router(dashboard_router, prefix="/api")
     app.include_router(cluster_router, prefix="/api")
+
+    @app.api_route("/", methods=["GET", "HEAD"])
+    async def root_redirect() -> RedirectResponse:
+        return RedirectResponse(url="/dashboard/ui", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
     return app
 

@@ -108,22 +108,42 @@ class _OpenClawProcessRunner:
         self._stdout_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._protocol_error: Exception | None = None
+        self._resolved_token: str | None = None
 
     def _redact(self, text: str) -> str:
-        return _redact_credentials(text, token=self.config.token)
+        return _redact_credentials(text, token=self._resolved_token or self.config.token)
 
     async def _setup_token_file(self) -> None:
         """Sets up token authentication file with restrictive 0600 permissions."""
         if self.config.token_file is not None:
             self._token_path = self.config.token_file
             return
-        if self.config.token:
+        token = self.config.token
+        if not token:
+            token = os.environ.get("OPENCLAW_TOKEN") or os.environ.get("OPENCLAW_GATEWAY_TOKEN")
+        if not token:
+            for candidate in (
+                Path.home() / ".openclaw" / "openclaw.json",
+                Path("/home/devops/.openclaw/openclaw.json"),
+                Path("/etc/openclaw/openclaw.json"),
+            ):
+                if candidate.exists():
+                    try:
+                        data = json.loads(candidate.read_text(encoding="utf-8"))
+                        t = data.get("gateway", {}).get("auth", {}).get("token")
+                        if t:
+                            token = t
+                            break
+                    except Exception:
+                        pass
+        if token:
+            self._resolved_token = token
             temp_dir = Path(tempfile.mkdtemp(prefix="openclaw_token_"))
             os.chmod(temp_dir, 0o700)
             token_file = temp_dir / "gateway.token"
             fd = os.open(token_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
-                os.write(fd, self.config.token.encode("utf-8"))
+                os.write(fd, token.encode("utf-8"))
                 os.fdatasync(fd)
             finally:
                 os.close(fd)
@@ -296,6 +316,8 @@ class _OpenClawProcessRunner:
 
     async def _spawn_process(self) -> None:
         cmd = list(self.config.command)
+        if "--session" not in cmd and self.context.worker and self.context.worker.id:
+            cmd.extend(["--session", f"agent:{self.context.worker.id}:main"])
         if self.config.gateway_url:
             cmd.extend(["--url", self.config.gateway_url])
         if self._token_path:
