@@ -84,10 +84,11 @@ metadata:
     app.kubernetes.io/component: control-plane
     site: site2
 spec:
-  type: ClusterIP
+  type: NodePort
   ports:
     - name: http
       port: 8000
       targetPort: 8000
+      nodePort: 30800
   selector:
     app.kubernetes.io/name: personaos-api

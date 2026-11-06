@@ -7,6 +7,7 @@ personaos.config.settings (or env var override).
 from __future__ import annotations
 
 import asyncio
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -27,10 +28,11 @@ except Exception:  # pragma: no cover
 
 config = context.config
 
-# Override sqlalchemy.url from settings (env var / alembic.ini wins if set)
+# Override sqlalchemy.url: DATABASE_URL env var or settings wins over alembic.ini default
+effective_url = os.environ.get("DATABASE_URL") or _default_url or config.get_main_option("sqlalchemy.url")
 config.set_main_option(
     "sqlalchemy.url",
-    config.get_main_option("sqlalchemy.url") or _default_url,
+    str(effective_url),
 )
 
 if config.config_file_name is not None:

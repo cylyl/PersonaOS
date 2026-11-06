@@ -28,8 +28,10 @@ spec:
           command:
             - "sh"
             - "-c"
-            - "exec personaos-worker --worker-id worker-${POD_NAME} --node-id node-${POD_NAME}"
+            - "exec personaos-worker --worker-id ${PERSONAOS_WORKER_ID:-worker-devops-01} --node-id node-${POD_NAME}"
           env:
+            - name: PERSONAOS_WORKER_ID
+              value: "worker-devops-01"
             - name: POD_NAME
               valueFrom:
                 fieldRef:
